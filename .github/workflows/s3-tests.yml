@@ -1,0 +1,56 @@
+name: s3-tests
+
+# ceph s3-tests take long and their results are recorded on purpose, so this runs only when
+# started by hand. It never commits: compat/ comes back as an artifact to review and commit.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  s3-tests:
+    name: ceph s3-tests on fs, s3 (RustFS), azblob (Azurite) and gcs (fake-gcs-server)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # setup-uv publishes no major-version tag, so it is pinned to a release commit.
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          # scripts/s3tests.sh keeps its own environment under target/s3tests/.
+          enable-cache: false
+      - name: s3-tests on fs
+        run: scripts/s3tests.sh fs
+      - name: s3-tests on s3 (RustFS)
+        if: success() || failure()
+        run: scripts/with-rustfs.sh scripts/s3tests.sh s3-rustfs
+      - name: s3-tests on azblob (Azurite)
+        if: success() || failure()
+        run: scripts/with-azurite.sh scripts/s3tests.sh azblob-azurite
+      - name: s3-tests on gcs (fake-gcs-server)
+        if: success() || failure()
+        run: scripts/with-fake-gcs.sh scripts/s3tests.sh gcs-fake
+      # Regenerated from whatever result files exist, so a label whose run failed keeps its
+      # committed result and the report names that run's commit.
+      - name: Generate the report
+        if: success() || failure()
+        run: python3 -I scripts/s3tests-report.py
+      - name: Upload compat/
+        if: success() || failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: compat
+          path: compat/
+      - name: Upload run logs
+        if: success() || failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: s3tests-runs
+          path: target/s3tests/runs/
+          if-no-files-found: ignore

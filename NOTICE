@@ -1,0 +1,17 @@
+s3dal
+Copyright 2026 The s3dal Authors
+
+This product includes software developed by the s3dal project,
+licensed under the Apache License, Version 2.0.
+
+--------------------------------------------------------------------------------
+
+This product includes software adapted from the s3s project
+(https://github.com/Nugine/s3s), licensed under the Apache License, Version 2.0.
+
+s3s
+Copyright 2023-2026 The s3s Authors
+
+  - src/s3/list/source.rs (the ordered directory walk, from s3s-fs)
+  - scripts/s3tests.sh (the ceph s3-tests runner, from scripts/e2e-s3tests.sh)
+  - scripts/s3tests-report.py (the test categories, from scripts/report-s3tests.py)

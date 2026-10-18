@@ -1,0 +1,15 @@
+Third-party software in s3dal
+
+The s3dal binary is built from the crates below, s3dal itself included. They are grouped by the
+license under which s3dal uses them, and each group ends with the text of that license.
+{{#each licenses}}
+
+================================================================================
+{{{name}}} ({{id}})
+
+{{#each used_by}}
+  {{crate.name}} {{crate.version}}
+{{/each}}
+
+{{{text}}}
+{{/each}}
