@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request makes the older run's result irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: rustfmt and clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      # Pinned: every Rust release brings new lints, which -D warnings turns into failures
+      # unrelated to the change under review. Bump it on purpose, together with the fixes the
+      # newer clippy asks for.
+      - uses: dtolnay/rust-toolchain@1.99
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.backend }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: fs
+            wrap: ""
+          # The same suite against a throwaway RustFS container as the S3 upstream.
+          - backend: s3
+            wrap: scripts/with-rustfs.sh
+          # Azure Blob Storage, against a throwaway Azurite container.
+          - backend: azblob
+            wrap: scripts/with-azurite.sh
+          # Google Cloud Storage, against a throwaway fake-gcs-server container behind
+          # scripts/fake-gcs-proxy.py.
+          - backend: gcs
+            wrap: scripts/with-fake-gcs.sh
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: ${{ matrix.wrap }} cargo test --locked
+
+  msrv:
+    name: build on Rust 1.96 (MSRV)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --all-targets
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t s3dal:ci .
+      # The runtime image has no shell, so a missing library or a wrong default only shows when
+      # it serves: an unsigned request must reach s3dal and be refused by it.
+      - name: Serve from the image
+        run: |
+          docker run -d --name s3dal -p 9000:9000 \
+            -e S3DAL_ACCESS_KEY=ci-access -e S3DAL_SECRET_KEY=ci-secret-key s3dal:ci
+          # Docker's port forward accepts the connection before s3dal listens and then drops it,
+          # which --retry-connrefused does not retry. Without --fail, a 403 is no error to retry.
+          status=$(curl -s -o /dev/null -w '%{http_code}' --retry 10 --retry-all-errors \
+            --retry-delay 1 http://127.0.0.1:9000/)
+          docker logs s3dal
+          test "$status" = 403
+      - name: Stop gracefully
+        run: |
+          docker stop -t 10 s3dal
+          test "$(docker inspect -f '{{.State.ExitCode}}' s3dal)" = 0
+
+  smoke:
+    name: smoke (${{ matrix.backend }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: fs
+            wrap: ""
+          - backend: s3
+            wrap: scripts/with-rustfs.sh
+          - backend: azblob
+            wrap: scripts/with-azurite.sh
+          - backend: gcs
+            wrap: scripts/with-fake-gcs.sh
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The aws CLI and rclone run from their Docker images; s3s-e2e is cloned and built here.
+      # Each script runs even if an earlier one failed, so one run reports all three.
+      - name: aws CLI
+        run: ${{ matrix.wrap }} scripts/smoke-awscli.sh
+      - name: rclone
+        if: success() || failure()
+        run: ${{ matrix.wrap }} scripts/smoke-rclone.sh
+      - name: s3s-e2e
+        if: success() || failure()
+        env:
+          # Outside target/: rust-cache keeps the directory tree of target/ without its files,
+          # and the script would take a restored, empty s3s checkout for a real one.
+          S3S_SRC: ${{ runner.temp }}/s3s
+        run: ${{ matrix.wrap }} scripts/smoke-e2e.sh
+      - name: Upload smoke logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-logs-${{ matrix.backend }}
+          path: target/smoke/
+          if-no-files-found: ignore

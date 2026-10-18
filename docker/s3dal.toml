@@ -1,0 +1,8 @@
+# The image's defaults: the fs backend on the /data volume, on every interface. An S3DAL_*
+# variable overrides its setting; a file mounted over this one, or named by S3DAL_CONFIG,
+# replaces them all.
+backend = "fs"
+address = "0.0.0.0:9000"
+
+[backend-opt]
+root = "/data"

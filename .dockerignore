@@ -1,0 +1,9 @@
+# Only what the image build reads; everything else, target/ above all, stays out of the
+# build context.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!docker/
+!LICENSE
+!NOTICE
