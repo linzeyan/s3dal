@@ -104,6 +104,15 @@ impl<'q, T> PageBuilder<'q, T> {
         self.query.max_keys == 0 || self.items.len() > self.query.max_keys
     }
 
+    /// How many more items the page takes before it is full: a bound on how far ahead a
+    /// source can usefully read.
+    pub fn room(&self) -> usize {
+        if self.query.max_keys == 0 {
+            return 0;
+        }
+        (self.query.max_keys + 1).saturating_sub(self.items.len())
+    }
+
     /// Whether the last item taken is `name`. Keys of one group are contiguous in key order, so
     /// once its CommonPrefix is taken, nothing else from the group can add to the page.
     pub fn took_last(&self, name: &str) -> bool {

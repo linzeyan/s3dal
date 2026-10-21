@@ -109,7 +109,31 @@ changes; the tests on fs, on s3 (RustFS), on azblob (Azurite) and on gcs (fake-g
 build with Rust 1.96; building the Docker image and serving from it; and the three smoke
 scripts on all four backends. ceph s3-tests take long, so `.github/workflows/s3-tests.yml` runs only when started
 by hand (Actions, "s3-tests", "Run workflow"). It uploads the resulting `compat/` directory as an
-artifact and never commits it.
+artifact and never commits it. `.github/workflows/release.yml` runs on a version tag: it builds
+the Docker image for amd64 and arm64, each on a runner of that architecture, serves from each,
+and only then pushes them to `ghcr.io/linzeyan/s3dal` as the version, `X.Y` and `latest`.
+
+## Releasing
+
+`make help` lists the steps, each in `scripts/release.sh`:
+
+```sh
+# first write CHANGELOG.md's "## [X.Y.Z] - YYYY-MM-DD" section
+make bump VERSION=X.Y.Z   # Cargo.toml and Cargo.lock
+make compat               # the version is an edit too: compat/ must record the released tree
+make tag                  # the standard check, a packaging dry run, then commit and tag
+make push                 # push main; CI runs on it
+make publish              # once CI passed on that commit: crates.io, then the tag
+```
+
+`make tag` refuses other uncommitted changes. It makes the commits not yet on `origin/main`,
+together with the version, the changelog and `compat/`, one commit on top of `origin/main`,
+whose message is the changelog section; the commits it replaced stay on the branch
+`pre-squash-vX.Y.Z`. Up to `make push` a step can be undone: `git tag -d vX.Y.Z` and
+`git reset --soft pre-squash-vX.Y.Z` bring the commits back with the release's files staged.
+The push itself is a fast-forward. A version on
+crates.io can only be yanked, so `make publish` asks first, and pushes the tag, which publishes
+the image, only after the crate is up.
 
 ## Conventions
 

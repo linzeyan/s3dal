@@ -1,6 +1,8 @@
 //! DeleteObjects: each key is deleted exactly as DeleteObject deletes it, and failures are
 //! reported per key instead of failing the request.
 
+use std::collections::BTreeMap;
+
 use futures::StreamExt;
 use s3s::dto::*;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
@@ -53,11 +55,28 @@ pub(super) async fn delete_objects(
         .collect()
         .await;
 
+    // A batch usually empties a few directories of many keys. Pruning after each key cost two
+    // backend calls per key, nearly all of them finding the directory still full, and the
+    // concurrent deletes raced to remove the same directory; once per directory does the same.
+    let mut emptied: BTreeMap<&str, &str> = BTreeMap::new();
+    for (object, result) in &results {
+        if let Ok(true) = result
+            && let Some((dir, _)) = object.key.trim_end_matches('/').rsplit_once('/')
+        {
+            emptied.entry(dir).or_insert(&object.key);
+        }
+    }
+    futures::stream::iter(emptied.into_values())
+        .for_each_concurrent(CONCURRENCY, |key| {
+            store::prune_empty_parents(dal, bucket, key)
+        })
+        .await;
+
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
     for (object, result) in results {
         match result {
-            Ok(()) => deleted.push(DeletedObject {
+            Ok(_) => deleted.push(DeletedObject {
                 key: Some(object.key),
                 version_id: object.version_id,
                 ..Default::default()
@@ -79,7 +98,8 @@ pub(super) async fn delete_objects(
     }))
 }
 
-async fn delete_one(dal: &S3Dal, bucket: &str, object: &ObjectIdentifier) -> S3Result<()> {
+/// Whether anything was deleted; the caller prunes the emptied directories.
+async fn delete_one(dal: &S3Dal, bucket: &str, object: &ObjectIdentifier) -> S3Result<bool> {
     // Deleting a version other than the one that exists must not delete the object.
     naming::require_null_version(object.version_id.as_deref())?;
     // AWS documents `*` here as matching any object, as in an If-Match header. s3s reads the
@@ -93,7 +113,7 @@ async fn delete_one(dal: &S3Dal, bucket: &str, object: &ObjectIdentifier) -> S3R
         last_modified: object.last_modified_time.as_ref(),
         size: object.size,
     };
-    store::delete_key(dal, bucket, &object.key, cond).await
+    store::delete_unpruned(dal, bucket, &object.key, cond).await
 }
 
 /// S3 always sends a message with each per-key error; s3dal's errors carry one only where the

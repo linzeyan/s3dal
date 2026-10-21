@@ -97,6 +97,33 @@ async fn each_key_succeeds_or_fails_on_its_own() {
 }
 
 #[tokio::test]
+async fn a_batch_prunes_every_directory_it_empties() {
+    // A batch prunes each emptied directory once, after its deletes, instead of after every
+    // key. It must leave the same state: no directory it emptied, up the whole chain, lingers
+    // as a CommonPrefix, and none that still holds an object goes.
+    let server = server().await;
+    let mut keys = Vec::new();
+    for dir in ["p/q", "p/r", "s/t/u"] {
+        for i in 0..20 {
+            keys.push(format!("{dir}/{i}"));
+        }
+    }
+    for key in &keys {
+        put(&server, key, b"x").await;
+    }
+    put(&server, "p/keep", b"x").await;
+
+    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let out = delete(&server, ids(&refs), true).await.unwrap();
+    assert!(out.errors().is_empty(), "{:?}", out.errors());
+
+    for gone in ["p/q/", "p/r/", "s/t/u/", "s/t/", "s/"] {
+        assert!(!exists(&server, gone).await, "{gone} lingers");
+    }
+    assert!(exists(&server, "p/keep").await);
+}
+
+#[tokio::test]
 async fn a_key_the_response_cannot_carry_refuses_the_request_before_any_delete() {
     // The response names every key, and XML cannot carry a control character. Found only once
     // the response is written, it failed the request with a 500 after the other keys were

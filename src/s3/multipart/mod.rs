@@ -1,7 +1,8 @@
 //! Multipart uploads (design.md "Multipart (phase 2)").
 //!
 //! An upload lives in `.s3dal/uploads/<bucket>/<upload-id>/`: `upload.json` from Create, and for
-//! each part a data file committed by its `part-<nnnnn>.json` manifest. Complete marks
+//! each part its data committed by its `part-<nnnnn>.json` manifest: in a file of its own, or on
+//! fs in the slot `slots` gives it in the file that becomes the object. Complete marks
 //! `upload.json` completed and removes the parts; the record then answers only a retried
 //! Complete. That directory is s3dal's own state, so it is written directly; only the object
 //! Complete produces goes through the key lock.
@@ -10,6 +11,8 @@ mod complete;
 mod list;
 mod part;
 mod record;
+#[cfg(unix)]
+mod slots;
 mod sweep;
 
 use std::time::SystemTime;

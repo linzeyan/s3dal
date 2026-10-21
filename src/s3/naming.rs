@@ -132,6 +132,33 @@ pub(crate) async fn require_bucket(dal: &S3Dal, bucket: &str) -> S3Result<()> {
     }
 }
 
+/// `lookup` under [`require_bucket`]'s rule, with the bucket checked only when needed. Where
+/// directories are real, a key's file lies inside its bucket's directory, so finding it proves
+/// the bucket; only a failure needs the bucket checked, and the bucket's error then wins, as
+/// checking it first would have made it. GET and HEAD save a backend call each that way: on fs
+/// a blocking-pool round trip, a third of a small GET's.
+pub(crate) async fn with_bucket<T>(
+    dal: &S3Dal,
+    bucket: &str,
+    lookup: impl Future<Output = S3Result<T>>,
+) -> S3Result<T> {
+    if !dal.profile.real_dirs {
+        require_bucket(dal, bucket).await?;
+        return lookup.await;
+    }
+    // The name is checked before `lookup` builds a path from it.
+    if validate_bucket_name(bucket).is_err() {
+        return Err(s3_error!(NoSuchBucket));
+    }
+    match lookup.await {
+        Ok(found) => Ok(found),
+        Err(err) => {
+            require_bucket(dal, bucket).await?;
+            Err(err)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

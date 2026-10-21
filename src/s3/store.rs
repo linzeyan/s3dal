@@ -204,7 +204,7 @@ async fn stat_existing(dal: &S3Dal, path: &str) -> S3Result<Option<Metadata>> {
 /// OpenDAL then passes on every `write` as it comes, and azblob makes each one a block: a
 /// streamed body became a request per network read, and failed past Azure's 50,000 blocks per
 /// blob. fs declares the same capabilities, and only writes in larger batches.
-const UNSIZED_WRITE_CHUNK: usize = 8 * 1024 * 1024;
+pub(super) const UNSIZED_WRITE_CHUNK: usize = 8 * 1024 * 1024;
 
 /// `opts` with [`UNSIZED_WRITE_CHUNK`] where the backend needs it. Elsewhere the chunking
 /// stays as given, the default included, which `copy_parts` relies on.
@@ -437,6 +437,20 @@ pub(super) async fn delete_key(
     key: &str,
     cond: DeleteCondition<'_>,
 ) -> S3Result<()> {
+    if delete_unpruned(dal, bucket, key, cond).await? {
+        prune_empty_parents(dal, bucket, key).await;
+    }
+    Ok(())
+}
+
+/// [`delete_key`] without pruning the parents: whether anything was deleted, so a caller
+/// deleting many keys prunes each directory once (see [`prune_empty_parents`]).
+pub(super) async fn delete_unpruned(
+    dal: &S3Dal,
+    bucket: &str,
+    key: &str,
+    cond: DeleteCondition<'_>,
+) -> S3Result<bool> {
     naming::validate_key(key)?;
     let path = naming::object_path(bucket, key);
     let deleted = {
@@ -454,7 +468,7 @@ pub(super) async fn delete_key(
             // Only an object can meet a condition. A folder marker is none, as for GET, so a
             // condition that held because no object is there must not remove the marker.
             if current.is_none() {
-                return Ok(());
+                return Ok(false);
             }
         }
         match found {
@@ -466,10 +480,7 @@ pub(super) async fn delete_key(
             _ => false,
         }
     };
-    if deleted {
-        prune_empty_parents(dal, bucket, key).await;
-    }
-    Ok(())
+    Ok(deleted)
 }
 
 /// Removes a folder marker. S3 deletes only the marker object, never the keys under it; here
@@ -485,7 +496,7 @@ async fn remove_empty_dir(dal: &S3Dal, dir: &str) -> S3Result<bool> {
 /// On backends with real directories, a directory left empty by a delete would still list as
 /// a CommonPrefix. Walks up from `key` removing empty parents, never the bucket itself.
 /// Best effort: the object is already gone, so a failure here must not fail the request.
-async fn prune_empty_parents(dal: &S3Dal, bucket: &str, key: &str) {
+pub(super) async fn prune_empty_parents(dal: &S3Dal, bucket: &str, key: &str) {
     if !dal.profile.real_dirs {
         return;
     }
@@ -499,6 +510,10 @@ async fn prune_empty_parents(dal: &S3Dal, bucket: &str, key: &str) {
         }
         match dal.op.delete(&dir).await {
             Ok(()) => rest = parent,
+            // Another prune removed it between the stat and here: that of a sibling directory
+            // emptied by the same DeleteObjects batch, or of a concurrent request. It is gone,
+            // as wanted, so this is no failure to warn about.
+            Err(err) if err.kind() == opendal::ErrorKind::NotFound => rest = parent,
             Err(err) if io_kind(&err) == Some(io::ErrorKind::DirectoryNotEmpty) => return,
             Err(err) => {
                 tracing::warn!(%dir, error = %err, "cannot remove empty parent directory");

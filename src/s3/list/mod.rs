@@ -9,14 +9,17 @@
 mod page;
 mod source;
 
+pub(super) use source::Proofs;
+
 use std::fmt::Write as _;
+use std::path::PathBuf;
 
 use futures::{StreamExt, TryStreamExt};
 use opendal::Metadata;
 use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result, s3_error};
 
-use super::{S3Dal, acl, naming};
+use super::{S3Dal, acl, fs, naming};
 use crate::backend::Profile;
 use crate::error::{Ctx, map};
 use crate::meta;
@@ -322,11 +325,16 @@ async fn list(dal: &S3Dal, params: Params<'_>) -> S3Result<Listing> {
             }),
         }
     }
-    let contents: Vec<Object> = futures::stream::iter(objects)
-        .map(|(key, entry)| object(dal, params.bucket, key, entry))
-        .buffered(STAT_CONCURRENCY)
-        .try_collect::<Vec<_>>()
-        .await?
+    let found = if fs::is_fs(&dal.op) {
+        fs_objects(dal, params.bucket, objects).await?
+    } else {
+        futures::stream::iter(objects)
+            .map(|(key, entry)| object(dal, params.bucket, key, entry))
+            .buffered(STAT_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?
+    };
+    let contents: Vec<Object> = found
         .into_iter()
         .flatten()
         .map(|object| Object {
@@ -366,8 +374,8 @@ fn non_empty<T>(v: Vec<T>) -> Option<Vec<T>> {
     (!v.is_empty()).then_some(v)
 }
 
-/// The ETag, size and mtime HEAD would report. An entry that vanished or turned into a
-/// directory since it was listed is left out of the page.
+/// One page entry for `key` (see [`stated_object`]), stat'ed through OpenDAL unless the
+/// listing already carried everything.
 async fn object(
     dal: &S3Dal,
     bucket: &str,
@@ -375,18 +383,65 @@ async fn object(
     listed: Metadata,
 ) -> S3Result<Option<Object>> {
     let stat = if listing_is_complete(&dal.profile, &listed) {
-        listed
+        Ok(listed)
     } else {
-        match dal.op.stat(&naming::object_path(bucket, &key)).await {
-            Ok(m) if m.is_file() => m,
-            Ok(_) => return Ok(None),
-            // Read as a GET reads it: once `a/b` is deleted and `a` written, fs answers ENOTDIR,
-            // and one key that changed under the listing failed the whole page.
-            Err(err) => match map(err, Ctx::ObjectRead) {
-                err if *err.code() == s3s::S3ErrorCode::NoSuchKey => return Ok(None),
-                err => return Err(err),
-            },
-        }
+        dal.op.stat(&naming::object_path(bucket, &key)).await
+    };
+    stated_object(dal, key, stat)
+}
+
+/// Keys one blocking task stats on fs.
+const FS_STAT_BATCH: usize = 64;
+
+/// [`object`] for every key of a page on fs, stat'ed straight from the filesystem,
+/// [`FS_STAT_BATCH`] keys to a blocking task. Through OpenDAL each key was a blocking-pool round
+/// trip of its own, which cost more than the stat: listing 10,000 keys took 1.5 times MinIO's
+/// CPU.
+async fn fs_objects(
+    dal: &S3Dal,
+    bucket: &str,
+    objects: Vec<(String, Metadata)>,
+) -> S3Result<Vec<Option<Object>>> {
+    let root = PathBuf::from(dal.op.info().root());
+    let keys: Vec<String> = objects.into_iter().map(|(key, _)| key).collect();
+    let batches: Vec<Vec<PathBuf>> = keys
+        .chunks(FS_STAT_BATCH)
+        .map(|batch| {
+            let path = |key: &String| root.join(naming::object_path(bucket, key));
+            batch.iter().map(path).collect()
+        })
+        .collect();
+    let stats: Vec<Vec<opendal::Result<Metadata>>> = futures::stream::iter(batches)
+        .map(|paths| async move {
+            fs::blocking(move || Ok(paths.iter().map(|p| fs::stat(p)).collect()))
+                .await
+                .map_err(|err| map(err, Ctx::Other))
+        })
+        .buffered(STAT_CONCURRENCY)
+        .try_collect()
+        .await?;
+    keys.into_iter()
+        .zip(stats.into_iter().flatten())
+        .map(|(key, stat)| stated_object(dal, key, stat))
+        .collect()
+}
+
+/// The listing entry for `key` from its stat: the ETag, size and mtime HEAD would report. An
+/// entry that vanished or turned into a directory since it was listed is left out of the page.
+fn stated_object(
+    dal: &S3Dal,
+    key: String,
+    stat: opendal::Result<Metadata>,
+) -> S3Result<Option<Object>> {
+    let stat = match stat {
+        Ok(m) if m.is_file() => m,
+        Ok(_) => return Ok(None),
+        // Read as a GET reads it: once `a/b` is deleted and `a` written, fs answers ENOTDIR,
+        // and one key that changed under the listing failed the whole page.
+        Err(err) => match map(err, Ctx::ObjectRead) {
+            err if *err.code() == s3s::S3ErrorCode::NoSuchKey => return Ok(None),
+            err => return Err(err),
+        },
     };
     let meta = meta::resolve(&dal.profile, &stat);
     Ok(Some(Object {
@@ -454,6 +509,34 @@ mod tests {
     use opendal::raw::Timestamp as OpendalTimestamp;
 
     use super::*;
+
+    #[tokio::test]
+    async fn fs_batches_leave_out_keys_that_changed_under_the_listing() {
+        // As `object` does: `a/b` listed, then deleted and `a` written, answers ENOTDIR; the key
+        // is left out instead of failing the page, and the keys around it stay.
+        let root = tempfile::tempdir().unwrap();
+        let fs_root = root.path().to_string_lossy().into_owned();
+        let op = crate::backend::build_operator("fs", &[("root".to_owned(), fs_root)]).unwrap();
+        let profile = crate::backend::probe(&op).await.unwrap();
+        let dal = S3Dal::new(op.clone(), profile, crate::Settings::default());
+        op.write("b/a", b"x".to_vec()).await.unwrap();
+        op.write("b/z", b"zz".to_vec()).await.unwrap();
+        let listed = |key: &str| (key.to_owned(), MetadataBuilder::file(0).build());
+        let found = fs_objects(&dal, "b", vec![listed("a"), listed("a/b"), listed("z")])
+            .await
+            .unwrap();
+        let keys: Vec<_> = found
+            .iter()
+            .map(|o| {
+                o.as_ref()
+                    .map(|o| (o.key.clone().unwrap(), o.size.unwrap()))
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            [Some(("a".to_owned(), 1)), None, Some(("z".to_owned(), 2))]
+        );
+    }
 
     #[tokio::test]
     async fn a_key_under_what_became_an_object_since_the_listing_is_left_out() {

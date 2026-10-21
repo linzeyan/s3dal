@@ -1038,6 +1038,27 @@ async fn missing_bucket_is_no_such_bucket_for_every_operation() {
     assert_eq!(status(&head), 404);
     // A PUT into a missing bucket must not create it as a side effect.
     assert!(!server.exists("nope/").await);
+
+    // GET and HEAD look the key up before the bucket on fs, so a request that also fails a
+    // check of its own must still report the bucket, as when the bucket was checked first.
+    let get = client
+        .get_object()
+        .bucket("nope")
+        .key("k")
+        .version_id("not-null")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(get.code(), Some("NoSuchBucket"), "{get:?}");
+    let head = client
+        .head_object()
+        .bucket("nope")
+        .key("k")
+        .part_number(0)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(status(&head), 404, "{head:?}");
 }
 
 #[tokio::test]

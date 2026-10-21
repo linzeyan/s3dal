@@ -70,9 +70,13 @@ struct AttrsDef {
 /// so a part whose data failed a check is never seen.
 #[derive(Serialize, Deserialize)]
 pub(super) struct PartManifest {
-    /// The data file in the upload directory. Every upload of a part number writes a new one, so
-    /// a Complete that read an older manifest still finds its data.
+    /// The data file in the upload directory. Every upload of a part number writes a new one,
+    /// or on fs the first one its slot in the upload's object file (see `slots`), which no other
+    /// upload writes; so a Complete that read an older manifest still finds its data.
     pub data: String,
+    /// Where the part starts in `data`. Manifests of uploads begun before slots have none.
+    #[serde(default)]
+    pub offset: u64,
     pub size: u64,
     /// Hex; the part's ETag, and an input to the object's ETag.
     pub md5: String,

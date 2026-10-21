@@ -9,17 +9,19 @@
 //! reads more than the page needs, and neither decides what the page holds: that is
 //! [`PageBuilder`]'s job.
 
+use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use futures::future::Either;
-use futures::{TryStreamExt, stream};
+use futures::TryStreamExt;
 use opendal::options::ListOptions;
 use opendal::{Entry, Lister, Metadata, MetadataBuilder, Operator};
 use s3s::S3Result;
 
 use super::page::{Page, PageBuilder, Query};
 use crate::error::{Ctx, map};
+use crate::s3::fs::is_fs;
 use crate::s3::{S3Dal, naming};
 
 /// Entries of a CommonPrefix group read past its first key before seeking past the rest. A seek
@@ -27,6 +29,43 @@ use crate::s3::{S3Dal, naming};
 /// is cheaper to read through than to seek past, and a large one then costs at most about twice
 /// what the better choice would have.
 const SEEK_AFTER: usize = 1000;
+
+/// Directories [`Proofs`] remembers at most, about 100 bytes each; past it, it starts over.
+const PROOFS_KEPT: usize = 10_000;
+
+/// The file that last proved each fs directory a CommonPrefix (see [`any_file_below`]), both as
+/// backend paths. Reading the directory is what a delimiter listing pays for on fs: ext4 indexes
+/// a whole directory block on the first read of every open, about three quarters of the CPU of
+/// a listing of 100 CommonPrefixes, where MinIO pays one stat each. A file proves its directory
+/// for as long as it is there, which one lstat tells, so a listing proves again with the file
+/// the last one found and reads the directory only once that file is gone. Each listing still
+/// proves every CommonPrefix it returns; only where to look first is remembered.
+#[derive(Default)]
+pub(crate) struct Proofs(Mutex<HashMap<String, String>>);
+
+impl Proofs {
+    fn remembered(&self, dirs: impl Iterator<Item = String>) -> Vec<Option<String>> {
+        let proofs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        dirs.map(|dir| proofs.get(&dir).cloned()).collect()
+    }
+
+    fn remember(&self, found: impl Iterator<Item = (String, Option<String>)>) {
+        let mut proofs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        for (dir, proof) in found {
+            match proof {
+                Some(proof) => {
+                    if proofs.len() >= PROOFS_KEPT && !proofs.contains_key(&dir) {
+                        proofs.clear();
+                    }
+                    proofs.insert(dir, proof);
+                }
+                None => {
+                    proofs.remove(&dir);
+                }
+            }
+        }
+    }
+}
 
 pub(super) async fn collect(dal: &S3Dal, bucket: &str, query: &Query) -> S3Result<Page<Metadata>> {
     let mut page = PageBuilder::new(query);
@@ -37,7 +76,7 @@ pub(super) async fn collect(dal: &S3Dal, bucket: &str, query: &Query) -> S3Resul
         if dal.profile.ordered_list {
             read_ordered(&dal.op, &bucket_dir, &mut page, SEEK_AFTER).await?;
         } else {
-            walk(&dal.op, &bucket_dir, start, &mut page).await?;
+            walk(&dal.op, &dal.proofs, &bucket_dir, start, &mut page).await?;
         }
     }
     Ok(page.finish())
@@ -180,11 +219,14 @@ fn past_group(group: &str, last: &str) -> String {
 /// walk may read every key below the prefix.
 async fn walk(
     op: &Operator,
+    proofs: &Proofs,
     bucket_dir: &str,
     start: &str,
     page: &mut PageBuilder<'_, Metadata>,
 ) -> S3Result<()> {
     let query = page.query();
+    // Proofs read ahead on fs (see `fs_files_below`), by directory.
+    let mut proven: HashMap<String, Option<(String, Metadata)>> = HashMap::new();
     let mut stack = vec![sorted_children(op, bucket_dir, start).await?.into_iter()];
     while let Some(children) = stack.last_mut() {
         let Some((path, meta)) = children.next() else {
@@ -201,11 +243,23 @@ async fn walk(
         } else if let Some(prefix) = query.common_prefix(&path) {
             // A group of a delimiter other than `/` can span several directories (`a-1/` and
             // `a-2/` for `-`); once one of them proved it, the others add nothing.
-            if query.is_after_start(prefix)
-                && !page.took_last(prefix)
-                && let Some((key, meta)) = any_file_below(op, bucket_dir, &path).await?
-            {
-                page.offer(&key, meta);
+            if query.is_after_start(prefix) && !page.took_last(prefix) {
+                let proof = match proven.remove(&path) {
+                    Some(proof) => proof,
+                    None if is_fs(op) => {
+                        let dirs = to_prove(query, path, children.as_slice(), page.room());
+                        let mut found = fs_files_below(op, proofs, bucket_dir, &dirs)
+                            .await?
+                            .into_iter();
+                        let first = found.next().flatten();
+                        proven.extend(dirs.into_iter().skip(1).zip(found));
+                        first
+                    }
+                    None => any_file_below(op, bucket_dir, &path).await?,
+                };
+                if let Some((key, meta)) = proof {
+                    page.offer(&key, meta);
+                }
             }
         } else {
             stack.push(sorted_children(op, bucket_dir, &path).await?.into_iter());
@@ -244,6 +298,29 @@ async fn sorted_children(
     Ok(children)
 }
 
+/// `first`, a directory whose CommonPrefix needs proving, and the directories after it among
+/// `rest`, its siblings in key order, that will need proving too: one per group, and only as
+/// far as the page can reach, counting every sibling as an item it may take. The walk descends
+/// into the next directory that does not fold, so the read-ahead stops there.
+fn to_prove(query: &Query, first: String, rest: &[(String, Metadata)], room: usize) -> Vec<String> {
+    let mut group = query.common_prefix(&first).map(str::to_owned);
+    let mut dirs = vec![first];
+    for (path, meta) in rest.iter().take(room.saturating_sub(1)) {
+        if !meta.is_dir() || !query.may_list_below(path) {
+            continue;
+        }
+        let Some(prefix) = query.common_prefix(path) else {
+            break;
+        };
+        if group.as_deref() == Some(prefix) || !query.is_after_start(prefix) {
+            continue;
+        }
+        group = Some(prefix.to_owned());
+        dirs.push(path.clone());
+    }
+    dirs
+}
+
 /// A CommonPrefix is listed only if an object exists below it, and any one file proves that,
 /// so the search stops at the first file in whatever order the backend lists. Only a file
 /// whose name is a key counts: the page drops any other (one another tool wrote), and the
@@ -253,42 +330,127 @@ async fn any_file_below(
     bucket_dir: &str,
     dir: &str,
 ) -> S3Result<Option<(String, Metadata)>> {
-    let is_key = |bucket_dir: &str, path: &str| {
-        path.strip_prefix(bucket_dir)
-            .is_some_and(|rel| naming::validate_key(rel).is_ok())
-    };
     let mut pending = vec![dir.to_owned()];
     while let Some(dir) = pending.pop() {
         #[cfg(test)]
         tests::record_listing(&dir);
-        let path = format!("{bucket_dir}{dir}");
-        let mut entries = if is_fs(op) {
-            let bucket_dir = bucket_dir.to_owned();
-            let entries = fs_entries(op, path, move |path| is_key(&bucket_dir, path))
-                .await
-                .map_err(backend)?;
-            Either::Left(stream::iter(entries.into_iter().map(Ok)))
-        } else {
-            let lister = op.lister(&path).await.map_err(backend)?;
-            Either::Right(lister.map_ok(Entry::into_parts))
-        };
-        while let Some((path, meta)) = entries.try_next().await.map_err(backend)? {
-            let Some(rel) = path.strip_prefix(bucket_dir) else {
-                continue;
-            };
-            if meta.is_file() && is_key(bucket_dir, &path) {
-                return Ok(Some((rel.to_owned(), meta)));
-            }
-            if meta.is_dir() && rel != dir {
-                pending.push(rel.to_owned());
+        let mut lister = op
+            .lister(&format!("{bucket_dir}{dir}"))
+            .await
+            .map_err(backend)?;
+        while let Some(entry) = lister.try_next().await.map_err(backend)? {
+            let (path, meta) = entry.into_parts();
+            if let Some(proof) = proof_or_subdir(bucket_dir, &dir, path, meta, &mut pending) {
+                return Ok(Some(proof));
             }
         }
     }
     Ok(None)
 }
 
-fn is_fs(op: &Operator) -> bool {
-    op.info().scheme() == "fs"
+/// [`any_file_below`] for each of `dirs` on fs, all in one blocking task, starting with the
+/// file that proved each last time (see [`Proofs`]). Each directory read is cheap; the
+/// blocking-pool round trip around it is not, and a delimiter listing of 100 directories made
+/// 100 of them in a row, at five times MinIO's CPU per page.
+async fn fs_files_below(
+    op: &Operator,
+    proofs: &Proofs,
+    bucket_dir: &str,
+    dirs: &[String],
+) -> S3Result<Vec<Option<(String, Metadata)>>> {
+    #[cfg(test)]
+    tests::record_proof_task();
+    let root = PathBuf::from(op.info().root());
+    let paths: Vec<String> = dirs
+        .iter()
+        .map(|dir| format!("{bucket_dir}{dir}"))
+        .collect();
+    let remembered = proofs.remembered(paths.iter().cloned());
+    let bucket = bucket_dir.to_owned();
+    let dirs = dirs.to_vec();
+    let (found, _listed) = blocking(move || {
+        let mut listed = Vec::new();
+        let found = dirs
+            .iter()
+            .zip(remembered)
+            .map(
+                |(dir, last)| match last.and_then(|p| still_a_file(&root, &bucket, p)) {
+                    Some(proof) => Ok(Some(proof)),
+                    None => fs_file_below(&root, &bucket, dir, &mut listed),
+                },
+            )
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok((found, listed))
+    })
+    .await
+    .map_err(backend)?;
+    #[cfg(test)]
+    for dir in &_listed {
+        tests::record_listing(dir);
+    }
+    let file = |proof: &Option<(String, Metadata)>| {
+        proof.as_ref().map(|(key, _)| format!("{bucket_dir}{key}"))
+    };
+    proofs.remember(paths.into_iter().zip(found.iter().map(file)));
+    Ok(found)
+}
+
+/// The proof at backend path `path`, if it is still a file. Not followed if it became a
+/// symlink, as the directory read would not take one (see [`read_fs_dir`]).
+fn still_a_file(root: &Path, bucket_dir: &str, path: String) -> Option<(String, Metadata)> {
+    let found = std::fs::symlink_metadata(root.join(&path)).ok()?;
+    let key = path.strip_prefix(bucket_dir)?;
+    found
+        .is_file()
+        .then(|| (key.to_owned(), MetadataBuilder::file(0).build()))
+}
+
+/// The search of [`any_file_below`] on fs, read straight from the filesystem; `listed`
+/// collects the directories it read.
+fn fs_file_below(
+    root: &Path,
+    bucket_dir: &str,
+    dir: &str,
+    listed: &mut Vec<String>,
+) -> io::Result<Option<(String, Metadata)>> {
+    let mut pending = vec![dir.to_owned()];
+    while let Some(dir) = pending.pop() {
+        listed.push(dir.clone());
+        let entries = read_fs_dir(root, &format!("{bucket_dir}{dir}"), |path| {
+            is_key(bucket_dir, path)
+        })?;
+        for (path, meta) in entries {
+            if let Some(proof) = proof_or_subdir(bucket_dir, &dir, path, meta, &mut pending) {
+                return Ok(Some(proof));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// One entry of the search below `dir`: the proof if it is a key's file, otherwise queued in
+/// `pending` if it is a directory to search.
+fn proof_or_subdir(
+    bucket_dir: &str,
+    dir: &str,
+    path: String,
+    meta: Metadata,
+    pending: &mut Vec<String>,
+) -> Option<(String, Metadata)> {
+    let rel = path.strip_prefix(bucket_dir)?;
+    if meta.is_file() && is_key(bucket_dir, &path) {
+        return Some((rel.to_owned(), meta));
+    }
+    if meta.is_dir() && rel != dir {
+        pending.push(rel.to_owned());
+    }
+    None
+}
+
+/// Whether the backend path `path` names a key of the bucket at `bucket_dir`.
+fn is_key(bucket_dir: &str, path: &str) -> bool {
+    path.strip_prefix(bucket_dir)
+        .is_some_and(|rel| naming::validate_key(rel).is_ok())
 }
 
 /// The files and directories in the backend directory `path`, named as OpenDAL lists them,
@@ -304,48 +466,61 @@ async fn fs_entries(
     path: String,
     stop_at: impl Fn(&str) -> bool + Send + 'static,
 ) -> opendal::Result<Vec<(String, Metadata)>> {
-    let dir = PathBuf::from(op.info().root()).join(&path);
-    let read = move || -> io::Result<Vec<(String, Metadata)>> {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            // As OpenDAL lists them: a directory that is gone, or a file, holds nothing.
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) =>
-            {
-                return Ok(Vec::new());
-            }
+    let root = PathBuf::from(op.info().root());
+    blocking(move || read_fs_dir(&root, &path, stop_at)).await
+}
+
+/// The body of [`fs_entries`], run on the blocking pool.
+fn read_fs_dir(
+    root: &Path,
+    path: &str,
+    stop_at: impl Fn(&str) -> bool,
+) -> io::Result<Vec<(String, Metadata)>> {
+    let entries = match std::fs::read_dir(root.join(path)) {
+        Ok(entries) => entries,
+        // As OpenDAL lists them: a directory that is gone, or a file, holds nothing.
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(err) => return Err(err),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        // Keys are UTF-8, so no other name can be an object or lead to one.
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        // Not followed, as OpenDAL does not: a symlink is neither, and is no object.
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err),
         };
-        let mut found = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            // Keys are UTF-8, so no other name can be an object or lead to one.
-            let Ok(name) = entry.file_name().into_string() else {
-                continue;
-            };
-            // Not followed, as OpenDAL does not: a symlink is neither, and is no object.
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(err),
-            };
-            if file_type.is_dir() {
-                found.push((format!("{path}{name}/"), MetadataBuilder::dir().build()));
-            } else if file_type.is_file() {
-                let file = format!("{path}{name}");
-                let stop = stop_at(&file);
-                // The size is left unread: every fs key the page returns is stat'ed (see above).
-                found.push((file, MetadataBuilder::file(0).build()));
-                if stop {
-                    break;
-                }
+        if file_type.is_dir() {
+            found.push((format!("{path}{name}/"), MetadataBuilder::dir().build()));
+        } else if file_type.is_file() {
+            let file = format!("{path}{name}");
+            let stop = stop_at(&file);
+            // The size is left unread: every fs key the page returns is stat'ed (see above).
+            found.push((file, MetadataBuilder::file(0).build()));
+            if stop {
+                break;
             }
         }
-        Ok(found)
-    };
+    }
+    Ok(found)
+}
+
+/// Runs a directory read on the blocking pool, its errors as OpenDAL's.
+async fn blocking<T: Send + 'static>(
+    read: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> opendal::Result<T> {
     let io_error = |err: io::Error| {
         let kind = match err.kind() {
             io::ErrorKind::PermissionDenied => opendal::ErrorKind::PermissionDenied,
@@ -365,7 +540,7 @@ fn backend(err: opendal::Error) -> s3s::S3Error {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
     use std::path::Path;
 
@@ -379,11 +554,17 @@ mod tests {
     thread_local! {
         static LISTED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         static LISTERS: RefCell<Vec<ListerStart>> = const { RefCell::new(Vec::new()) };
+        static PROOF_TASKS: Cell<usize> = const { Cell::new(0) };
     }
 
     /// Directories listed on this thread, so tests can show what the walk did not read.
     pub(super) fn record_listing(dir: &str) {
         LISTED.with(|listed| listed.borrow_mut().push(dir.to_owned()));
+    }
+
+    /// Blocking tasks started on this thread to prove CommonPrefixes on fs.
+    pub(super) fn record_proof_task() {
+        PROOF_TASKS.with(|n| n.set(n.get() + 1));
     }
 
     fn take_listed() -> Vec<String> {
@@ -436,11 +617,20 @@ mod tests {
         build_operator("fs", &[("root".into(), root.to_string_lossy().into())]).unwrap()
     }
 
+    /// A page of the walk, with nothing remembered from earlier ones (see [`Proofs`]).
     async fn walk_page(op: &Operator, q: &Query) -> (Vec<String>, Vec<String>) {
+        walk_page_with(op, &Proofs::default(), q).await
+    }
+
+    async fn walk_page_with(
+        op: &Operator,
+        proofs: &Proofs,
+        q: &Query,
+    ) -> (Vec<String>, Vec<String>) {
         take_listed();
         let mut page = PageBuilder::new(q);
         let start = prefix_dir(&q.prefix).unwrap();
-        walk(op, "b/", start, &mut page).await.unwrap();
+        walk(op, proofs, "b/", start, &mut page).await.unwrap();
         (names(&page.finish()), take_listed())
     }
 
@@ -475,6 +665,65 @@ mod tests {
         let (names, listed) = walk_page(&op, &query("", false, None, 1)).await;
         assert_eq!(names, ["a/x"]);
         assert_eq!(listed, ["", "a/", "b/"]);
+    }
+
+    #[tokio::test]
+    async fn a_directory_of_common_prefixes_is_proved_in_one_blocking_task() {
+        // Each proof is a cheap directory read, but a blocking-pool round trip around each one
+        // made a delimiter listing of 100 directories cost five times MinIO's CPU per page.
+        // The read-ahead must stop where the page does: a page of 3 out of 50 directories
+        // must not read the other 46.
+        let root = tempfile::tempdir().unwrap();
+        let files: Vec<String> = (0..50).map(|i| format!("d{i:02}/f")).collect();
+        let files: Vec<&str> = files.iter().map(String::as_str).collect();
+        let op = fs_bucket(root.path(), &files, &[]);
+        let proof_tasks = || PROOF_TASKS.with(|n| n.replace(0));
+
+        proof_tasks();
+        let (names, listed) = walk_page(&op, &query("", true, None, 1000)).await;
+        assert_eq!(names.len(), 50);
+        assert_eq!(listed.len(), 51, "the root and each directory once");
+        assert_eq!(proof_tasks(), 1);
+
+        let (names, listed) = walk_page(&op, &query("", true, None, 3)).await;
+        assert_eq!(names, ["CP:d00/", "CP:d01/", "CP:d02/"]);
+        assert_eq!(listed, ["", "d00/", "d01/", "d02/", "d03/"]);
+        assert_eq!(proof_tasks(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_listing_proves_again_with_the_file_the_last_one_found() {
+        // Reading each directory is most of what a delimiter listing costs on ext4, and the
+        // file that proved a directory last time proves it again for one lstat, as long as it
+        // is still a file there. Once it is not, the directory must be read again: only a
+        // directory with an object below is a CommonPrefix, on every listing, not just the
+        // first.
+        let root = tempfile::tempdir().unwrap();
+        let op = fs_bucket(root.path(), &["a/1", "b/x/2", "c/3", "d/4"], &[]);
+        let proofs = Proofs::default();
+        let q = query("", true, None, 1000);
+        let (names, listed) = walk_page_with(&op, &proofs, &q).await;
+        assert_eq!(names, ["CP:a/", "CP:b/", "CP:c/", "CP:d/"]);
+        assert_eq!(listed, ["", "a/", "b/", "b/x/", "c/", "d/"]);
+        let (names, listed) = walk_page_with(&op, &proofs, &q).await;
+        assert_eq!(names, ["CP:a/", "CP:b/", "CP:c/", "CP:d/"]);
+        assert_eq!(listed, [""], "proved again without reading a directory");
+
+        let bucket = root.path().join("b");
+        // Another object proves `a/` now; nothing does in `b/`, `c/` or `d/`.
+        std::fs::remove_file(bucket.join("a/1")).unwrap();
+        std::fs::write(bucket.join("a/9"), b"x").unwrap();
+        std::fs::remove_file(bucket.join("b/x/2")).unwrap();
+        std::fs::create_dir(bucket.join("b/x/2")).unwrap();
+        std::fs::remove_file(bucket.join("c/3")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("f"), b"x").unwrap();
+        std::fs::remove_file(bucket.join("d/4")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("f"), bucket.join("d/4")).unwrap();
+        let (names, listed) = walk_page_with(&op, &proofs, &q).await;
+        assert_eq!(names, ["CP:a/"]);
+        assert_eq!(listed, ["", "a/", "b/", "b/x/", "b/x/2/", "c/", "d/"]);
     }
 
     #[tokio::test]
@@ -831,7 +1080,8 @@ mod tests {
                 Strategy::Walk => {
                     let mut page = PageBuilder::new(&q);
                     if let Some(start) = prefix_dir(&q.prefix) {
-                        walk(op, "b/", start, &mut page).await.unwrap();
+                        let proofs = Proofs::default();
+                        walk(op, &proofs, "b/", start, &mut page).await.unwrap();
                     }
                     take_listed();
                     page.finish()

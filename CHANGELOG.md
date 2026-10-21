@@ -3,6 +3,31 @@
 All notable changes to s3dal are listed here, in the format of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.1] - 2026-10-21
+
+### Added
+
+- Docker images for amd64 and arm64 on `ghcr.io/linzeyan/s3dal`, published with each release
+  as the version, `X.Y` and `latest`.
+
+### Changed
+
+- On fs, listings read their keys' metadata in batches rather than one call per key, and a
+  delimiter listing remembers the file that proved each common prefix, so the next listing
+  checks that file instead of reading the directory again.
+- On fs, GET and HEAD look the object up before the bucket, and a GET of up to 2 MiB is one
+  stat and read of the same file.
+- On fs, DeleteObjects removes each directory it emptied once, after the batch.
+- On fs, the parts of a multipart upload are written into one file at their place in the
+  object, and Complete renames that file into place when the listed parts fill it exactly: a
+  64 MiB upload in 16 MiB parts writes 64 MiB to an ext4 disk instead of 128. Otherwise
+  Complete copies the parts file to file (`copy_file_range` on Linux). Uploads begun with 0.1.0
+  can still be completed, also with parts added after the upgrade.
+- On Linux with glibc, malloc is bounded to two arenas per core (`MALLOC_ARENA_MAX`, when set,
+  decides instead). glibc's eight per core held on to the buffers of concurrent large uploads:
+  in a benchmark with 8 concurrent 64 MiB uploads the server peaked at 1,175 MiB, now at
+  468–598 MiB. Listings are 6–11% slower for it.
+
 ## [0.1.0] - 2026-10-18
 
 The first version.

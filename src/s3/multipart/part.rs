@@ -4,24 +4,32 @@ use std::ops::Range;
 use std::time::SystemTime;
 
 use bytes::Bytes;
+#[cfg(unix)]
+use bytes::BytesMut;
 use futures::{Stream, StreamExt};
 use opendal::options::WriteOptions;
+#[cfg(unix)]
+use opendal::raw::new_std_io_error;
 use s3s::dto::*;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use uuid::Uuid;
 
 use super::record::{self, PartManifest};
+#[cfg(unix)]
+use super::slots;
 use super::{parse_upload_id, upload_dir};
 use crate::S3Dal;
 use crate::backend::without_stalling;
 use crate::checksum::ALGORITHMS;
 use crate::error::{Ctx, map};
 use crate::s3::copy::{self, Source};
+#[cfg(unix)]
+use crate::s3::fs;
 use crate::s3::naming;
 use crate::s3::precondition::Conditions;
 use crate::s3::store;
 use crate::s3::unsupported::refuse_sse_c;
-use crate::s3::upload::{self, BodyCheck, BodyHeaders, body_error, trailer_lookup};
+use crate::s3::upload::{self, BodyCheck, BodyHeaders, Verified, body_error, trailer_lookup};
 
 /// S3's limits for one part.
 pub(super) const MAX_PART_NUMBER: u32 = 10_000;
@@ -266,6 +274,22 @@ where
     // The part's MD5 is its ETag, so it is always computed.
     let mut check = BodyCheck::new(headers, true)?;
     let dir = upload_dir(bucket, id);
+    #[cfg(unix)]
+    if let Some(slot) = open_slot(dal, &dir, part, headers).await {
+        let (offset, claim) = (slot.offset, slot.claim.clone());
+        let verified = match write_slot(slot, &mut check, &mut body, trailer).await {
+            Ok(verified) => verified,
+            Err(err) => {
+                // No manifest names the slot: this upload claimed it, and no other writes it.
+                // Given up, it takes a retry of the part, which would otherwise be written
+                // apart and make Complete copy the whole object.
+                let _ = fs::blocking(move || Ok(std::fs::remove_file(claim))).await;
+                return Err(err);
+            }
+        };
+        let data = slots::OBJECT_FILE.to_owned();
+        return commit(dal, &dir, part, data, offset, check.received(), verified).await;
+    }
     let data = format!("part-{part:05}-{}", Uuid::new_v4().hyphenated());
     let path = format!("{dir}{data}");
     let opts = store::chunked(&dal.op, WriteOptions::default());
@@ -296,18 +320,103 @@ where
             return Err(err);
         }
     };
+    commit(dal, &dir, part, data, 0, check.received(), verified).await
+}
 
+/// Commits a part whose `size` bytes lie from `offset` in `data`.
+async fn commit(
+    dal: &S3Dal,
+    dir: &str,
+    part: u32,
+    data: String,
+    offset: u64,
+    size: u64,
+    verified: Verified,
+) -> S3Result<PartManifest> {
     let manifest = PartManifest {
         data,
-        size: check.received(),
+        offset,
+        size,
         md5: verified
             .md5_hex
             .expect("BodyCheck hashes MD5 when asked to"),
         checksums: record::checksum_map(verified.checksum),
         last_modified: SystemTime::now(),
     };
-    record::store_manifest(dal, &dir, part, &manifest).await?;
+    record::store_manifest(dal, dir, part, &manifest).await?;
     Ok(manifest)
+}
+
+/// On fs, the part's slot in the upload's object file (see `slots`), for a body whose length
+/// is declared; `None` sends the part to a file of its own.
+#[cfg(unix)]
+async fn open_slot(
+    dal: &S3Dal,
+    dir: &str,
+    part: u32,
+    headers: &BodyHeaders,
+) -> Option<slots::Slot> {
+    let len = u64::try_from(headers.content_length?).ok()?;
+    if !fs::is_fs(&dal.op) {
+        return None;
+    }
+    let path = std::path::PathBuf::from(dal.op.info().root()).join(dir);
+    let opened = fs::blocking(move || slots::open(&path, part, len).map_err(new_std_io_error));
+    match opened.await {
+        Ok(slot) => slot,
+        // A slot only spares Complete a copy. A filesystem that refuses what slots need (hard
+        // links, locks) still takes the part as it took every part before.
+        Err(err) => {
+            tracing::warn!(dir, error = %err, "cannot open the part's slot; writing it apart");
+            None
+        }
+    }
+}
+
+/// Streams `body` into `slot`, checked as `check` says, in the batches the fs writer would
+/// write, then syncs it as that writer does on close: the manifest commits the part only once
+/// its data is on disk. `check` refuses a byte past the declared length, so the part never
+/// runs into the next slot.
+#[cfg(unix)]
+async fn write_slot<S>(
+    slot: slots::Slot,
+    check: &mut BodyCheck,
+    body: &mut S,
+    trailer: impl Fn(&str) -> Option<String>,
+) -> S3Result<Verified>
+where
+    S: Stream<Item = S3Result<Bytes>> + Unpin,
+{
+    use std::os::unix::fs::FileExt;
+
+    let file = std::sync::Arc::new(slot.file);
+    let write = |batch: Bytes, at: u64, sync: bool| {
+        let file = file.clone();
+        fs::blocking(move || {
+            let written = file.write_all_at(&batch, at);
+            let synced = written.and_then(|()| if sync { file.sync_data() } else { Ok(()) });
+            synced.map_err(new_std_io_error)
+        })
+    };
+    let mut at = slot.offset;
+    let mut batch = BytesMut::with_capacity(store::UNSIZED_WRITE_CHUNK);
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        check.update(&chunk)?;
+        // Written before the chunk would overflow it: a batch grown from empty, or past its
+        // capacity, is copied on every doubling and ends up near twice the batch size.
+        if !batch.is_empty() && batch.len() + chunk.len() > store::UNSIZED_WRITE_CHUNK {
+            let next = BytesMut::with_capacity(store::UNSIZED_WRITE_CHUNK);
+            let full = std::mem::replace(&mut batch, next).freeze();
+            let len = full.len() as u64;
+            write(full, at, false).await.map_err(internal)?;
+            at += len;
+        }
+        batch.extend_from_slice(&chunk);
+    }
+    let verified = check.finish(trailer)?;
+    write(batch.freeze(), at, true).await.map_err(internal)?;
+    Ok(verified)
 }
 
 fn internal(err: opendal::Error) -> s3s::S3Error {

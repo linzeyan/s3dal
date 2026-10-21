@@ -2985,7 +2985,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s3dal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3000,6 +3000,7 @@ dependencies = [
  "hmac 0.13.0",
  "hyper 1.12.0",
  "hyper-util",
+ "libc",
  "md-5",
  "opendal",
  "opendal-http-transport-reqwest",
@@ -3018,6 +3019,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "xattr",
 ]
 
 [[package]]

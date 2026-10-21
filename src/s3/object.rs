@@ -14,7 +14,7 @@ use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, TrailingHeaders
 use super::precondition::{self, Conditions};
 use super::store::{self, DeleteCondition, Dest, Precondition, write_err};
 use super::upload::{self, BodyCheck, BodyHeaders, body_error, trailer_lookup};
-use super::{S3Dal, multipart, naming, unsupported};
+use super::{S3Dal, fs, multipart, naming, unsupported};
 use crate::checksum::{self, ALGORITHMS};
 use crate::error::{Ctx, map};
 use crate::meta::{self, Attrs, Computed, ObjectMeta};
@@ -203,16 +203,18 @@ pub(super) async fn get_object(
 ) -> S3Result<S3Response<GetObjectOutput>> {
     unsupported::refuse_sse_on_read(&req.headers)?;
     let input = req.input;
-    naming::require_bucket(dal, &input.bucket).await?;
-    naming::validate_key(&input.key)?;
-    unsupported::refuse_sse_c(
-        input.sse_customer_algorithm.as_ref(),
-        input.sse_customer_key.as_ref(),
-        input.sse_customer_key_md5.as_ref(),
-    )?;
-    naming::require_null_version(input.version_id.as_deref())?;
-    let part = check_part_number(input.part_number, input.range.is_some())?;
-    let (path, obj, version) = stat_object(dal, &input.bucket, &input.key).await?;
+    let (part, (path, obj, version, content)) = naming::with_bucket(dal, &input.bucket, async {
+        naming::validate_key(&input.key)?;
+        unsupported::refuse_sse_c(
+            input.sse_customer_algorithm.as_ref(),
+            input.sse_customer_key.as_ref(),
+            input.sse_customer_key_md5.as_ref(),
+        )?;
+        naming::require_null_version(input.version_id.as_deref())?;
+        let part = check_part_number(input.part_number, input.range.is_some())?;
+        Ok((part, open_object(dal, &input.bucket, &input.key).await?))
+    })
+    .await?;
     precondition::check(
         &Conditions {
             if_match: input.if_match.as_ref(),
@@ -233,12 +235,16 @@ pub(super) async fn get_object(
     let range = served.range.clone();
     let body = if range.is_empty() {
         StreamingBlob::from(Bytes::new())
+    } else if let Some(content) = content {
+        let at = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+        StreamingBlob::from(content.slice(at(range.start)..at(range.end)))
     } else {
         // The conditions and headers describe the object as stat'ed, and a version written since
         // would be served under them: a ranged download, which SDK transfer managers make one
         // part at a time with If-Match, would splice two objects. Where the backend can, the
         // read is pinned to the stat'ed version, and a newer one fails the body instead, which
-        // clients retry. fs cannot, but there the gap is a stat and an open.
+        // clients retry. fs cannot, but there the gap is a stat and an open, and a small object
+        // comes from the file it stat'ed (see `open_object`).
         let reader = match version.filter(|_| dal.op.info().capability().read_with_if_match) {
             Some(version) => dal.op.reader_with(&path).if_match(&version).await,
             None => dal.op.reader(&path).await,
@@ -312,16 +318,18 @@ pub(super) async fn head_object(
     let content_encoding = overridden(input.response_content_encoding.take())?;
     let content_language = overridden(input.response_content_language.take())?;
     let expires = input.response_expires.take().map(http_date).transpose()?;
-    naming::require_bucket(dal, &input.bucket).await?;
-    naming::validate_key(&input.key)?;
-    unsupported::refuse_sse_c(
-        input.sse_customer_algorithm.as_ref(),
-        input.sse_customer_key.as_ref(),
-        input.sse_customer_key_md5.as_ref(),
-    )?;
-    naming::require_null_version(input.version_id.as_deref())?;
-    let part = check_part_number(input.part_number, input.range.is_some())?;
-    let (_, obj, _) = stat_object(dal, &input.bucket, &input.key).await?;
+    let (part, (_, obj, _)) = naming::with_bucket(dal, &input.bucket, async {
+        naming::validate_key(&input.key)?;
+        unsupported::refuse_sse_c(
+            input.sse_customer_algorithm.as_ref(),
+            input.sse_customer_key.as_ref(),
+            input.sse_customer_key_md5.as_ref(),
+        )?;
+        naming::require_null_version(input.version_id.as_deref())?;
+        let part = check_part_number(input.part_number, input.range.is_some())?;
+        Ok((part, stat_object(dal, &input.bucket, &input.key).await?))
+    })
+    .await?;
     precondition::check(
         &Conditions {
             if_match: input.if_match.as_ref(),
@@ -738,6 +746,32 @@ pub(super) async fn stat_object(
     Ok((path, meta::resolve(&dal.profile, &m), version))
 }
 
+/// [`stat_object`] for GET, with the content of a small object on fs, read in the same trip
+/// through the blocking pool (see [`fs::read_small`]).
+async fn open_object(
+    dal: &S3Dal,
+    bucket: &str,
+    key: &str,
+) -> S3Result<(String, ObjectMeta, Option<String>, Option<Bytes>)> {
+    #[cfg(unix)]
+    if fs::is_fs(&dal.op) {
+        let path = naming::object_path(bucket, key);
+        let full = std::path::PathBuf::from(dal.op.info().root()).join(&path);
+        let (m, content) = fs::blocking(move || fs::read_small(&full))
+            .await
+            .map_err(read_err)?;
+        if !m.is_file() {
+            return Err(s3_error!(NoSuchKey));
+        }
+        #[cfg(test)]
+        tests::record_small_read(content.is_some());
+        let version = m.etag().map(str::to_owned);
+        return Ok((path, meta::resolve(&dal.profile, &m), version, content));
+    }
+    let (path, obj, version) = stat_object(dal, bucket, key).await?;
+    Ok((path, obj, version, None))
+}
+
 fn read_err(err: opendal::Error) -> s3s::S3Error {
     map(err, Ctx::ObjectRead)
 }
@@ -764,5 +798,76 @@ mod tests {
         assert_eq!(stored_content_encoding(None), None);
         // Anything else is kept verbatim, as S3 does.
         assert_eq!(stored("br, gzip").as_deref(), Some("br, gzip"));
+    }
+
+    thread_local! {
+        static SMALL_READS: std::cell::RefCell<Vec<bool>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Whether each GET on fs on this thread came with its content (see `open_object`).
+    pub(super) fn record_small_read(with_content: bool) {
+        SMALL_READS.with(|reads| reads.borrow_mut().push(with_content));
+    }
+
+    fn get_request(input: GetObjectInput) -> S3Request<GetObjectInput> {
+        S3Request {
+            input,
+            method: hyper::Method::GET,
+            uri: "/bkt/k".parse().unwrap(),
+            headers: HeaderMap::new(),
+            extensions: hyper::http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn get(dal: &S3Dal, key: &str, range: Option<&str>) -> (GetObjectOutput, Vec<u8>) {
+        let input = GetObjectInput::builder()
+            .bucket("bkt".to_owned())
+            .key(key.to_owned())
+            .range(range.map(|r| Range::parse(r).unwrap()))
+            .build()
+            .unwrap();
+        let mut out = get_object(dal, get_request(input)).await.unwrap().output;
+        let mut body = Vec::new();
+        let mut stream = out.body.take().unwrap();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        (out, body)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_small_get_on_fs_is_served_from_its_stat() {
+        // Through OpenDAL a small GET on fs was three trips through the blocking pool (stat,
+        // open, read), most of what it cost; its content now comes with the stat. A large one
+        // keeps OpenDAL's streaming reader. Both must answer as before.
+        let root = tempfile::tempdir().unwrap();
+        let fs_root = root.path().to_string_lossy().into_owned();
+        let op = crate::backend::build_operator("fs", &[("root".to_owned(), fs_root)]).unwrap();
+        let profile = crate::backend::probe(&op).await.unwrap();
+        let dal = S3Dal::new(op.clone(), profile, crate::Settings::default());
+        op.write("bkt/small", b"hello world".to_vec())
+            .await
+            .unwrap();
+        let large: Vec<u8> = (0..=fs::READ_WHOLE).map(|i| i as u8).collect();
+        op.write("bkt/large", large.clone()).await.unwrap();
+        let (_, head, _) = stat_object(&dal, "bkt", "small").await.unwrap();
+        SMALL_READS.with(|reads| reads.take());
+
+        let (out, body) = get(&dal, "small", None).await;
+        assert_eq!(body, b"hello world");
+        assert_eq!(out.content_length, Some(11));
+        assert_eq!(out.e_tag, Some(ETag::Strong(head.etag)));
+        let (out, body) = get(&dal, "small", Some("bytes=6-")).await;
+        assert_eq!(body, b"world");
+        assert_eq!(out.content_range.as_deref(), Some("bytes 6-10/11"));
+        let (_, body) = get(&dal, "large", Some("bytes=-3")).await;
+        assert_eq!(body, large[large.len() - 3..]);
+        assert_eq!(SMALL_READS.with(|reads| reads.take()), [true, true, false]);
     }
 }

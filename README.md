@@ -143,6 +143,10 @@ docker run -d --name s3dal -p 9000:9000 \
     -v s3dal-data:/data s3dal
 ```
 
+Released versions from 0.1.1 on are also published for amd64 and arm64 as
+`ghcr.io/linzeyan/s3dal:<version>` (and `:latest`); use that name in place of `s3dal` and
+skip the build.
+
 - `/data` is declared a volume, so objects never land in the container's own writable layer,
   which is removed with the container. Without `-v`, Docker creates an anonymous volume.
 - The volume's filesystem must support user xattrs, as above. A named volume lives on the

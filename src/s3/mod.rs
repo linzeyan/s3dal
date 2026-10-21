@@ -5,6 +5,7 @@ mod acl;
 mod bucket;
 mod copy;
 mod delete_objects;
+mod fs;
 mod list;
 mod multipart;
 mod naming;
@@ -35,6 +36,7 @@ pub struct S3Dal {
     locks: Arc<store::KeyLocks>,
     /// Keyed by upload directory: one Complete of an upload at a time.
     upload_locks: Arc<store::KeyLocks>,
+    proofs: Arc<list::Proofs>,
 }
 
 impl S3Dal {
@@ -46,6 +48,7 @@ impl S3Dal {
             settings,
             locks: Arc::default(),
             upload_locks: Arc::default(),
+            proofs: Arc::default(),
         }
     }
 

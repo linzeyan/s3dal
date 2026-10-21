@@ -1,6 +1,6 @@
 mod common;
 
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
@@ -1150,9 +1150,11 @@ async fn the_stale_upload_sweep_removes_exactly_what_went_stale() {
     // s3dal has no lifecycle rules, so without the sweep an abandoned upload would hold its
     // parts forever. It must take every kind of stale entry, judged by times every backend has,
     // and nothing a client may still use: an upload in progress, or the record a retried
-    // Complete needs. Backend mtimes have second precision and may come from another clock, so
-    // the age leaves a margin of seconds on both sides.
-    const AGE: Duration = Duration::from_secs(4);
+    // Complete needs. What exists before the wait below is stale and what comes after it is
+    // not: each sweep's age reaches back to the end of the wait and a margin further, however
+    // long the requests since took. Backend mtimes have second precision and may come from
+    // another clock, so the margin is seconds, and the wait three of them.
+    const MARGIN: Duration = Duration::from_secs(2);
     let server = server().await;
     let client = &server.client;
     let uploads = format!(".s3dal/uploads/{BUCKET}");
@@ -1177,7 +1179,9 @@ async fn the_stale_upload_sweep_removes_exactly_what_went_stale() {
     // Not an upload id, so not s3dal's to remove, however old.
     plant("not-an-upload").await;
 
-    tokio::time::sleep(AGE + Duration::from_secs(2)).await;
+    tokio::time::sleep(3 * MARGIN).await;
+    let waited = Instant::now();
+    let age = || waited.elapsed() + MARGIN;
 
     let late_done = complete(&server, "late", &late, &[(1, &late_etag)])
         .await
@@ -1210,7 +1214,7 @@ async fn the_stale_upload_sweep_removes_exactly_what_went_stale() {
     let recent = uuid::Uuid::new_v4().to_string();
     plant(&recent).await;
 
-    assert_eq!(server.dal.sweep_stale_uploads(AGE).await.unwrap(), 4);
+    assert_eq!(server.dal.sweep_stale_uploads(age()).await.unwrap(), 4);
     let mut kept = vec![
         fresh.clone(),
         late.clone(),
@@ -1246,7 +1250,7 @@ async fn the_stale_upload_sweep_removes_exactly_what_went_stale() {
         .unwrap();
     assert_eq!(get(&server, "fresh").await, b"fresh");
 
-    assert_eq!(server.dal.sweep_stale_uploads(AGE).await.unwrap(), 0);
+    assert_eq!(server.dal.sweep_stale_uploads(age()).await.unwrap(), 0);
 }
 
 #[tokio::test]

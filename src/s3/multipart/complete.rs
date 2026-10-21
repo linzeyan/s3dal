@@ -8,6 +8,8 @@ use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use hyper::header::HOST;
 use md5::{Digest, Md5};
 use opendal::options::{ComposeOptions, WriteOptions};
+#[cfg(unix)]
+use opendal::raw::new_std_io_error;
 use opendal::{Metadata, Writer};
 use s3s::dto::*;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
@@ -16,17 +18,19 @@ use uuid::Uuid;
 
 use super::part::part_number;
 use super::record::{self, Completed, PartManifest, Upload};
+#[cfg(unix)]
+use super::slots;
 use super::{parse_upload_id, upload_dir};
 use crate::S3Dal;
 use crate::checksum::{self, ALGORITHMS};
 use crate::meta::{self, Computed, PartLayout};
-use crate::s3::naming;
 use crate::s3::store::{self, Dest, Precondition, write_err};
 use crate::s3::unsupported::refuse_sse_c;
+use crate::s3::{fs, naming};
 use crate::server::{RequestId, Scheme};
 
 /// Every part except the last must be at least this large.
-const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+pub(super) const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 
 /// Manifest reads in flight. A Complete may list 10000 parts, and reading their manifests one
 /// by one would keep the client waiting before the response even starts.
@@ -581,6 +585,8 @@ impl Assembly {
         };
         let closed = match compose_options(&dal, &opts) {
             Some(compose) => compose_parts(&dest, &dir, &parts, compose, cond).await?,
+            #[cfg(unix)]
+            None if fs::is_fs(&dal.op) => assemble_on_fs(&dest, &dir, &parts, &opts, cond).await?,
             None => {
                 let opts = WriteOptions {
                     chunk: store::chunk_for(&dal.op, total),
@@ -657,11 +663,142 @@ async fn finish(dal: &S3Dal, bucket: &str, id: Uuid, dir: &str, completed: &reco
 async fn copy_parts(dir: &str, parts: &[PartManifest], w: &mut Writer) -> S3Result<()> {
     for part in parts {
         let path = format!("{dir}{}", part.data);
-        w.copy_from(&path, 0..part.size)
+        w.copy_from(&path, part.offset..part.offset + part.size)
             .await
             .map_err(|err| copy_part_err(&path, err))?;
     }
     Ok(())
+}
+
+/// Assembles the parts on fs and commits the object as [`Dest::commit`] commits a write: the
+/// condition checked and the file renamed into place under the key's lock. fs checks no
+/// condition itself (`Profile::conditional_writes`), so that check is the only one, as it is
+/// for a writer there. The file is the upload's own when its parts fill it (see `slots`),
+/// otherwise one the parts are copied into (see [`fs::assemble`]). On failure nothing reaches
+/// the key and the upload stays as it was.
+#[cfg(unix)]
+async fn assemble_on_fs(
+    dest: &Dest<'_>,
+    dir: &str,
+    parts: &[PartManifest],
+    opts: &WriteOptions,
+    cond: Precondition<'_>,
+) -> S3Result<Metadata> {
+    let dal = dest.dal;
+    let root = std::path::PathBuf::from(dal.op.info().root());
+    let target = root.join(&dest.path);
+    let user_metadata = opts.user_metadata.clone().unwrap_or_default();
+    if slots::fill(parts)
+        && let Some(closed) =
+            take_in_place(dest, &root.join(dir), parts, &user_metadata, cond).await?
+    {
+        return Ok(closed);
+    }
+    #[cfg(test)]
+    tests::record_fs_complete("copied");
+    // Where OpenDAL's fs writer keeps its files, so the tmp sweep removes one a crash left.
+    let tmp = root
+        .join(crate::backend::RESERVED_ROOT)
+        .join("tmp")
+        .join(Uuid::new_v4().to_string());
+    let sources: Vec<_> = parts
+        .iter()
+        .map(|p| {
+            let path = root.join(format!("{dir}{}", p.data));
+            (path, p.offset..p.offset + p.size)
+        })
+        .collect();
+    let assembled = {
+        let (tmp, target) = (tmp.clone(), target.clone());
+        fs::blocking(move || {
+            // As the writer does for every write, so a removed tmp directory is made again.
+            fs::make_parents(&tmp)?;
+            fs::make_parents(&target)?;
+            Ok(fs::assemble(&tmp, &sources, &user_metadata))
+        })
+        .await
+        .map_err(write_err)?
+    };
+    let closed = match assembled {
+        Ok(closed) => closed,
+        Err(err) => {
+            store::prune_empty_parents(dal, dest.bucket, dest.key).await;
+            return Err(match err {
+                fs::AssembleError::Source(n, err) => {
+                    copy_part_err(&format!("{dir}{}", parts[n].data), err)
+                }
+                fs::AssembleError::Write(err) => write_err(err),
+            });
+        }
+    };
+    let committed = {
+        let _guard = dal.locks.lock(&dest.path).await;
+        match dest.check(cond).await {
+            Ok(()) => {
+                let tmp = tmp.clone();
+                fs::blocking(move || fs::rename_into_place(&tmp, &target))
+                    .await
+                    .map_err(write_err)
+            }
+            Err(err) => Err(err),
+        }
+    };
+    if let Err(err) = committed {
+        let _ = fs::blocking(move || Ok(std::fs::remove_file(&tmp))).await;
+        store::prune_empty_parents(dal, dest.bucket, dest.key).await;
+        return Err(err);
+    }
+    Ok(closed)
+}
+
+/// Commits the upload's object file in `upload`, which `parts` fill, as the object: on ext4,
+/// which shares no extents, a copy wrote every byte of it a second time. `None` when the file
+/// cannot be taken (see [`slots::take`]); the parts are then copied. A failed commit leaves
+/// the file where it was, for the next Complete to take.
+#[cfg(unix)]
+async fn take_in_place(
+    dest: &Dest<'_>,
+    upload: &std::path::Path,
+    parts: &[PartManifest],
+    user_metadata: &std::collections::HashMap<String, String>,
+    cond: Precondition<'_>,
+) -> S3Result<Option<Metadata>> {
+    let dal = dest.dal;
+    let total = parts.iter().map(|p| p.size).sum();
+    let taken = {
+        let (upload, user_metadata) = (upload.to_owned(), user_metadata.clone());
+        fs::blocking(move || slots::take(&upload, total, &user_metadata).map_err(new_std_io_error))
+            .await
+    };
+    let (file, closed) = match taken {
+        Ok(Some(taken)) => taken,
+        Ok(None) => return Ok(None),
+        // Copying needs none of what taking it does (a lock, xattrs on the file as it is).
+        Err(err) => {
+            tracing::warn!(upload = %upload.display(), error = %err, "cannot take the upload's object file; copying the parts");
+            return Ok(None);
+        }
+    };
+    #[cfg(test)]
+    tests::record_fs_complete("in place");
+    let object = upload.join(slots::OBJECT_FILE);
+    let target = std::path::PathBuf::from(dal.op.info().root()).join(&dest.path);
+    let committed = {
+        let _guard = dal.locks.lock(&dest.path).await;
+        match dest.check(cond).await {
+            Ok(()) => fs::blocking(move || fs::rename_into_place(&object, &target))
+                .await
+                .map_err(write_err),
+            Err(err) => Err(err),
+        }
+    };
+    // Its lock keeps parts out of the file until it is the object.
+    drop(file);
+    if let Err(err) = committed {
+        store::prune_empty_parents(dal, dest.bucket, dest.key).await;
+        return Err(err);
+    }
+    Ok(Some(closed))
 }
 
 /// `opts` for composing the parts on the backend, where it composes objects with every field
@@ -758,9 +895,323 @@ mod tests {
 
     use super::*;
 
+    thread_local! {
+        static FS_COMPLETES: std::cell::RefCell<Vec<&'static str>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// How each Complete on fs on this thread made the object (see `assemble_on_fs`).
+    pub(super) fn record_fs_complete(how: &'static str) {
+        FS_COMPLETES.with(|c| c.borrow_mut().push(how));
+    }
+
+    /// Those recorded since the last call.
+    fn fs_completes() -> Vec<&'static str> {
+        FS_COMPLETES.with(std::cell::RefCell::take)
+    }
+
+    fn request<T>(input: T) -> S3Request<T> {
+        S3Request {
+            input,
+            method: hyper::Method::POST,
+            uri: "/".parse().unwrap(),
+            headers: hyper::HeaderMap::new(),
+            extensions: hyper::http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    /// An upload to `bkt/<key>`, created with a Content-Type, on fs in a directory of its own.
+    #[cfg(unix)]
+    struct FsUpload {
+        root: tempfile::TempDir,
+        op: Operator,
+        dal: S3Dal,
+        key: String,
+        id: String,
+    }
+
+    #[cfg(unix)]
+    impl FsUpload {
+        async fn new(key: &str) -> Self {
+            use s3s::S3;
+
+            let root = tempfile::tempdir().unwrap();
+            let fs_root = root.path().to_string_lossy().into_owned();
+            let op = crate::backend::build_operator("fs", &[("root".to_owned(), fs_root)]).unwrap();
+            let profile = crate::backend::probe(&op).await.unwrap();
+            let dal = S3Dal::new(op.clone(), profile, crate::Settings::default());
+            op.create_dir("bkt/").await.unwrap();
+            let created = CreateMultipartUploadInput::builder()
+                .bucket("bkt".to_owned())
+                .key(key.to_owned())
+                .content_type(Some("text/plain".to_owned()))
+                .build()
+                .unwrap();
+            let id = dal
+                .create_multipart_upload(request(created))
+                .await
+                .unwrap()
+                .output
+                .upload_id
+                .unwrap();
+            fs_completes();
+            Self {
+                root,
+                op,
+                dal,
+                key: key.to_owned(),
+                id,
+            }
+        }
+
+        async fn part(
+            &self,
+            n: i32,
+            data: Vec<u8>,
+            content_md5: Option<String>,
+        ) -> S3Result<CompletedPart> {
+            use s3s::S3;
+
+            // In 64 KiB pieces, as a request body arrives, so a part spans write batches.
+            let len = data.len();
+            let data = bytes::Bytes::from(data);
+            let pieces: Vec<Result<_, std::io::Error>> = (0..len)
+                .step_by(64 * 1024)
+                .map(|at| Ok(data.slice(at..len.min(at + 64 * 1024))))
+                .collect();
+            let part = UploadPartInput::builder()
+                .bucket("bkt".to_owned())
+                .key(self.key.clone())
+                .upload_id(self.id.clone())
+                .part_number(n)
+                .content_length(Some(i64::try_from(len).unwrap()))
+                .content_md5(content_md5)
+                .body(Some(StreamingBlob::wrap(futures::stream::iter(pieces))))
+                .build()
+                .unwrap();
+            let e_tag = self.dal.upload_part(request(part)).await?.output.e_tag;
+            Ok(CompletedPart {
+                part_number: Some(n),
+                e_tag,
+                ..Default::default()
+            })
+        }
+
+        async fn complete(
+            &self,
+            parts: &[CompletedPart],
+        ) -> S3Result<CompleteMultipartUploadOutput> {
+            use s3s::S3;
+
+            let complete = CompleteMultipartUploadInput::builder()
+                .bucket("bkt".to_owned())
+                .key(self.key.clone())
+                .upload_id(self.id.clone())
+                .multipart_upload(Some(CompletedMultipartUpload {
+                    parts: Some(parts.to_vec()),
+                }))
+                .build()
+                .unwrap();
+            let out = self
+                .dal
+                .complete_multipart_upload(request(complete))
+                .await?;
+            out.output.future.unwrap().await
+        }
+
+        /// The upload's directory, or a file in it.
+        fn upload(&self, name: &str) -> std::path::PathBuf {
+            let dir = self.root.path().join(".s3dal/uploads/bkt").join(&self.id);
+            dir.join(name)
+        }
+
+        /// The object as HEAD reports it, after its content was checked against `expected`.
+        async fn object(&self, expected: &[u8]) -> meta::ObjectMeta {
+            let path = format!("bkt/{}", self.key);
+            // Not `assert_eq!`, which would print megabytes.
+            assert!(self.op.read(&path).await.unwrap().to_vec() == expected);
+            meta::resolve(&self.dal.profile, &self.op.stat(&path).await.unwrap())
+        }
+    }
+
+    #[cfg(unix)]
+    fn filled(byte: u8, len: u64) -> Vec<u8> {
+        vec![byte; usize::try_from(len).unwrap()]
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn on_fs_parts_of_one_size_become_the_object_in_place() {
+        // Clients upload parts of one size, the last one shorter. Copied, every byte of them
+        // was written a second time, as ext4 shares no extents; the file they were written
+        // into becomes the object instead. It must be the object a copy makes: the parts in
+        // order, with the ETag and Content-Type HEAD reports, and nothing left of the upload
+        // but its record.
+        use std::os::unix::fs::MetadataExt;
+
+        let up = FsUpload::new("a/k").await;
+        let mut parts = Vec::new();
+        let mut expected = Vec::new();
+        for (n, data) in [
+            (1, filled(1, MIN_PART_SIZE)),
+            (2, filled(2, MIN_PART_SIZE)),
+            (3, b"tail".to_vec()),
+        ] {
+            expected.extend_from_slice(&data);
+            parts.push(up.part(n, data, None).await.unwrap());
+        }
+        let written = std::fs::metadata(up.upload(slots::OBJECT_FILE)).unwrap();
+
+        let done = up.complete(&parts).await.unwrap();
+        assert_eq!(fs_completes(), ["in place"]);
+        let object = std::fs::metadata(up.root.path().join("bkt/a/k")).unwrap();
+        assert_eq!(object.ino(), written.ino());
+        let head = up.object(&expected).await;
+        assert!(head.etag.ends_with("-3"), "{}", head.etag);
+        assert_eq!(head.content_type(), "text/plain");
+        assert_eq!(done.e_tag, Some(ETag::Strong(head.etag)));
+        let left: Vec<_> = std::fs::read_dir(up.upload(""))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, [record::UPLOAD_FILE]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn on_fs_a_part_longer_than_a_write_batch_lands_whole_in_its_slot() {
+        // A part is written to its slot in batches, each of which must land right after the
+        // one before. Bytes that vary with their position show a batch landing anywhere else,
+        // or not at all.
+        let size = crate::s3::store::UNSIZED_WRITE_CHUNK as u64 * 2 + 12_345;
+        let varied = |n: u8| -> Vec<u8> { (0..size).map(|i| (i % 251) as u8 ^ n).collect() };
+        let up = FsUpload::new("a/k").await;
+        let mut parts = Vec::new();
+        let mut expected = Vec::new();
+        for (n, data) in [(1, varied(1)), (2, varied(2)), (3, b"tail".to_vec())] {
+            expected.extend_from_slice(&data);
+            parts.push(up.part(n, data, None).await.unwrap());
+        }
+
+        up.complete(&parts).await.unwrap();
+        assert_eq!(fs_completes(), ["in place"]);
+        up.object(&expected).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn on_fs_parts_out_of_place_are_copied_file_to_file() {
+        // A last part that arrives before any full one cannot know its slot, so it is written
+        // apart; through OpenDAL's writer every byte of the parts was then read into s3dal and
+        // written out again, where Complete copies file to file. The object must still be the
+        // one the writer made, with nothing left in the writer's directory.
+        let up = FsUpload::new("a/k").await;
+        let tail = up.part(2, b"tail".to_vec(), None).await.unwrap();
+        let first = up.part(1, filled(1, MIN_PART_SIZE), None).await.unwrap();
+
+        let done = up.complete(&[first, tail]).await.unwrap();
+        assert_eq!(fs_completes(), ["copied"]);
+        let mut expected = filled(1, MIN_PART_SIZE);
+        expected.extend_from_slice(b"tail");
+        let head = up.object(&expected).await;
+        assert!(head.etag.ends_with("-2"), "{}", head.etag);
+        assert_eq!(head.content_type(), "text/plain");
+        assert_eq!(done.e_tag, Some(ETag::Strong(head.etag)));
+        let left = up.op.list(".s3dal/tmp/").await.unwrap();
+        assert!(left.iter().all(|e| e.path() == ".s3dal/tmp/"), "{left:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn on_fs_a_file_holding_a_part_not_listed_is_copied_from() {
+        // A Complete may leave out the last parts uploaded; taken as it is, the file would make
+        // them part of the object.
+        let up = FsUpload::new("a/k").await;
+        let first = up.part(1, filled(1, MIN_PART_SIZE), None).await.unwrap();
+        let second = up.part(2, filled(2, MIN_PART_SIZE), None).await.unwrap();
+        up.part(3, b"tail".to_vec(), None).await.unwrap();
+
+        up.complete(&[first, second]).await.unwrap();
+        assert_eq!(fs_completes(), ["copied"]);
+        let mut expected = filled(1, MIN_PART_SIZE);
+        expected.extend_from_slice(&filled(2, MIN_PART_SIZE));
+        up.object(&expected).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn on_fs_a_failed_upload_of_a_part_leaves_the_committed_one() {
+        // A manifest is a part's commit point, so the data it names must not change. Another
+        // upload of the part number is found to be bad only once its body has ended, after
+        // its first batch was written; written into the slot, it would corrupt the object.
+        let up = FsUpload::new("a/k").await;
+        let size = 9 << 20;
+        let first = up.part(1, filled(1, size), None).await.unwrap();
+        let second = up.part(2, filled(2, size), None).await.unwrap();
+        let other = base64_simd::STANDARD.encode_to_string(Md5::digest(b"other"));
+        let err = up.part(2, filled(7, size), Some(other)).await.unwrap_err();
+        assert_eq!(*err.code(), S3ErrorCode::BadDigest);
+
+        up.complete(&[first, second]).await.unwrap();
+        assert_eq!(fs_completes(), ["in place"]);
+        let mut expected = filled(1, size);
+        expected.extend_from_slice(&filled(2, size));
+        up.object(&expected).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn on_fs_a_part_retried_after_it_failed_still_takes_its_slot() {
+        // SDKs retry a part that failed. Written apart, the retry would make Complete copy the
+        // whole object again, for one network error; written into the slot, it must replace
+        // every byte the failed upload left there.
+        let up = FsUpload::new("a/k").await;
+        let size = 9 << 20;
+        let first = up.part(1, filled(1, size), None).await.unwrap();
+        let other = base64_simd::STANDARD.encode_to_string(Md5::digest(b"other"));
+        up.part(2, filled(7, size), Some(other)).await.unwrap_err();
+        let second = up.part(2, filled(2, size), None).await.unwrap();
+
+        up.complete(&[first, second]).await.unwrap();
+        assert_eq!(fs_completes(), ["in place"]);
+        let mut expected = filled(1, size);
+        expected.extend_from_slice(&filled(2, size));
+        up.object(&expected).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn on_fs_a_failed_commit_leaves_the_file_for_the_next_complete() {
+        // A Complete that fails is retried, or the client fixes what made it fail and sends
+        // it again; until the file is in place nothing it needs may be gone.
+        let up = FsUpload::new("a").await;
+        let first = up.part(1, filled(1, MIN_PART_SIZE), None).await.unwrap();
+        let tail = up.part(2, b"tail".to_vec(), None).await.unwrap();
+        // A directory where the object would go.
+        up.op.write("bkt/a/b", b"x".to_vec()).await.unwrap();
+        up.complete(&[first.clone(), tail.clone()])
+            .await
+            .unwrap_err();
+        assert_eq!(fs_completes(), ["in place"]);
+
+        up.op.delete("bkt/a/b").await.unwrap();
+        up.op.delete("bkt/a/").await.unwrap();
+        let done = up.complete(&[first, tail]).await.unwrap();
+        assert_eq!(fs_completes(), ["in place"]);
+        let mut expected = filled(1, MIN_PART_SIZE);
+        expected.extend_from_slice(b"tail");
+        let head = up.object(&expected).await;
+        assert_eq!(done.e_tag, Some(ETag::Strong(head.etag)));
+    }
+
     fn manifest(data: &[u8]) -> PartManifest {
         PartManifest {
             data: String::new(),
+            offset: 0,
             size: data.len() as u64,
             md5: meta::md5_hex(data),
             checksums: BTreeMap::new(),

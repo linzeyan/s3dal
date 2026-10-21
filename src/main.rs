@@ -9,6 +9,7 @@ use tokio::time::MissedTickBehavior;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
+    limit_malloc_arenas();
     let cli = Cli::load();
     // stderr, with clap's errors: logs are diagnostics, not the output of a command. Colors
     // only on a terminal: tracing-subscriber colors by default, which leaves escape codes in
@@ -26,6 +27,26 @@ fn main() -> anyhow::Result<()> {
         Command::Serve(args) => serve(args),
     }
 }
+
+/// Two malloc arenas per core, where glibc allows eight. A thread that finds the arenas busy
+/// moves to another, and an arena keeps what is freed into it rather than returning it, so
+/// the buffers of large uploads, 8 at a time, come to be held once per arena. In the benchmark
+/// on a 4-core guest the server peaked at 728 MiB with eight per core and 520 MiB with two,
+/// at the same throughput but for listings, 6–11% slower. One per core gave 467 MiB, with
+/// listings 14–20% slower: they allocate on every thread at once. MALLOC_ARENA_MAX, when set,
+/// still decides.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn limit_malloc_arenas() {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let arenas = libc::c_int::try_from(cores * 2).unwrap_or(libc::c_int::MAX);
+        // SAFETY: mallopt only bounds the arenas created from now on; no other thread runs yet.
+        unsafe { libc::mallopt(libc::M_ARENA_MAX, arenas) };
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn limit_malloc_arenas() {}
 
 #[tokio::main]
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
