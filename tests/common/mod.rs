@@ -110,6 +110,8 @@ pub struct TestServer {
     /// The server's own handle, for work it does outside requests, such as the stale-upload
     /// sweep, which tests run once instead of waiting for a background schedule.
     pub dal: S3Dal,
+    /// Changes the server's key pairs and domains, as a config reload does.
+    pub auth: server::LiveAuth,
     fs_root: Option<tempfile::TempDir>,
     shutdown: Option<oneshot::Sender<()>>,
 }
@@ -150,7 +152,8 @@ impl TestServer {
             fs_root,
         } = backend;
         let dal = S3Dal::new(op.clone(), profile, settings);
-        let service = server::build_service(dal.clone(), keys, &[]).unwrap();
+        let auth = server::LiveAuth::new(keys, &[]).unwrap();
+        let service = server::build_service(dal.clone(), &auth, None);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let scheme = if tls.is_some() { "https" } else { "http" };
@@ -167,6 +170,7 @@ impl TestServer {
             op,
             profile,
             dal,
+            auth,
             fs_root,
             shutdown: Some(tx),
         }

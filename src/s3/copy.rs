@@ -205,7 +205,7 @@ pub(super) async fn copy_object(
     let headers = source.expected(0..len, input.checksum_algorithm.take())?;
     let buffered = !profile.native_etag
         && headers.content_md5.is_none()
-        && len <= dal.settings.etag_buffer_limit;
+        && len <= dal.settings().etag_buffer_limit;
     let mut check = BodyCheck::new(&headers, buffered)?;
     let dest = Dest::new(dal, &input.bucket, &input.key);
     dest.check(cond).await?;

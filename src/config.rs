@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::error::ErrorKind;
+use clap::parser::ValueSource;
 use clap::{ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::Deserialize;
 
@@ -24,6 +25,36 @@ pub struct Cli {
 pub enum Command {
     /// Serve the S3 API on top of an OpenDAL backend.
     Serve(ServeArgs),
+    /// Check `serve`'s settings, from the same flags, variables and file, and print them with
+    /// secrets redacted.
+    CheckConfig(ServeArgs),
+    /// Exit 0 if the server answers its health check, 1 if not. Without `--url`, asks the server
+    /// that `serve` would start with the same variables and config file, so a container's
+    /// health check needs no arguments.
+    Healthcheck(HealthcheckArgs),
+    /// Print a new random key pair, in the config file's `[[credentials]]` form.
+    Keygen,
+    #[cfg(feature = "client")]
+    #[command(flatten)]
+    Client(crate::client::ClientCommand),
+}
+
+/// The subcommands that take `serve`'s settings, config file included.
+const SERVE_LIKE: [&str; 2] = ["serve", "check-config"];
+
+#[derive(Debug, Clone, Args)]
+pub struct HealthcheckArgs {
+    /// Base URL of the server, for example `https://127.0.0.1:9000`. Its certificate is not
+    /// verified: the check asks whether the process answers, and sends no secret.
+    #[arg(long)]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum LogFormat {
+    Text,
+    /// One JSON object per line, for log collectors.
+    Json,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -47,7 +78,7 @@ pub struct ServeArgs {
     #[arg(long, env = "S3DAL_ADDRESS", default_value = "127.0.0.1:9000")]
     pub address: SocketAddr,
 
-    /// One key pair; the config file can list several. These two replace the file's.
+    /// One key pair, in addition to the config file's `[[credentials]]`.
     // Keys are mandatory: an open-source gateway must not default to anonymous access.
     #[arg(long, env = "S3DAL_ACCESS_KEY")]
     access_key: Option<String>,
@@ -55,9 +86,15 @@ pub struct ServeArgs {
     #[arg(long, env = "S3DAL_SECRET_KEY", hide_env_values = true)]
     secret_key: Option<String>,
 
-    /// Every key pair that may sign requests, from the flags or else from the config file.
+    /// Every key pair that may sign requests: the flags' or variables' first, then the config
+    /// file's.
     #[arg(skip)]
     pub credentials: Vec<KeyPair>,
+
+    /// The access key of the pair from the flags or variables, which editing the config file
+    /// cannot change or remove.
+    #[arg(skip)]
+    pub fixed_access_key: Option<String>,
 
     #[arg(long, env = "S3DAL_REGION", default_value = "us-east-1")]
     pub region: String,
@@ -84,6 +121,20 @@ pub struct ServeArgs {
     /// PEM private key of `--tls-cert`.
     #[arg(long, env = "S3DAL_TLS_KEY")]
     pub tls_key: Option<PathBuf>,
+
+    /// Log line format on stderr. `RUST_LOG` sets the levels.
+    #[arg(long, env = "S3DAL_LOG_FORMAT", value_enum, default_value = "text")]
+    pub log_format: LogFormat,
+
+    /// Address and port of the web console; without it there is none. It speaks HTTPS when the
+    /// S3 port does, with the same certificate.
+    #[arg(long, env = "S3DAL_CONSOLE_ADDRESS")]
+    pub console_address: Option<SocketAddr>,
+
+    /// The long names of the settings given by a flag or a variable, which outrank the config
+    /// file, so editing the file cannot change them.
+    #[arg(skip)]
+    pub locked: Vec<String>,
 }
 
 impl ServeArgs {
@@ -95,6 +146,53 @@ impl ServeArgs {
         }
     }
 
+    /// The settings in the config file's syntax, with secret keys and every backend option
+    /// that may be a credential redacted, so the output can be pasted into an issue.
+    pub fn describe(&self) -> String {
+        const REDACTED: &str = "\"<redacted>\"";
+        let secretish = ["key", "secret", "token", "password", "credential", "sas"];
+        let path =
+            |p: &Option<PathBuf>| p.as_ref().map(|p| format!("{:?}", p.display().to_string()));
+        let mut out = vec![
+            format!("backend = {:?}", self.backend),
+            format!("address = \"{}\"", self.address),
+            format!("region = {:?}", self.region),
+            format!("domain = {:?}", self.domain),
+            format!("etag-buffer-limit = {}", self.etag_buffer_limit),
+            format!(
+                "stale-upload-age = \"{}s\"",
+                self.stale_upload_age.as_secs()
+            ),
+        ];
+        out.extend(path(&self.tls_cert).map(|p| format!("tls-cert = {p}")));
+        out.extend(path(&self.tls_key).map(|p| format!("tls-key = {p}")));
+        let format = match self.log_format {
+            LogFormat::Text => "text",
+            LogFormat::Json => "json",
+        };
+        out.push(format!("log-format = \"{format}\""));
+        out.extend(
+            self.console_address
+                .map(|a| format!("console-address = \"{a}\"")),
+        );
+        out.push("\n[backend-opt]".into());
+        for (name, value) in &self.backend_opts {
+            let lower = name.to_ascii_lowercase();
+            if secretish.iter().any(|s| lower.contains(s)) {
+                out.push(format!("{name} = {REDACTED}"));
+            } else {
+                out.push(format!("{name} = {value:?}"));
+            }
+        }
+        for pair in &self.credentials {
+            out.push(format!(
+                "\n[[credentials]]\naccess-key = {:?}\nsecret-key = {REDACTED}",
+                pair.access_key
+            ));
+        }
+        out.join("\n") + "\n"
+    }
+
     /// Takes what the file holds in shapes no flag has, then applies the rules that span
     /// several settings.
     fn finish(&mut self, file: FileOnly) -> Result<(), String> {
@@ -103,14 +201,21 @@ impl ServeArgs {
         if self.backend_opts.is_empty() {
             self.backend_opts = file.backend_opts;
         }
+        // Added to the file's pairs rather than replacing them: a deployment keeps one pair in
+        // its environment, which always works, and manages the others in the file, from the
+        // console or by hand, without a restart.
         self.credentials = match (self.access_key.take(), self.secret_key.take()) {
-            (Some(access_key), Some(secret_key)) => vec![KeyPair {
-                access_key,
-                secret_key,
-            }],
-            (None, None) => file.credentials,
+            (Some(access_key), Some(secret_key)) => {
+                self.fixed_access_key = Some(access_key.clone());
+                vec![KeyPair {
+                    access_key,
+                    secret_key,
+                }]
+            }
+            (None, None) => Vec::new(),
             _ => return Err("--access-key and --secret-key must be given together".into()),
         };
+        self.credentials.extend(file.credentials);
         check_key_pairs(&self.credentials)?;
         if self.tls_cert.is_some() != self.tls_key.is_some() {
             return Err("--tls-cert and --tls-key must be given together".into());
@@ -179,34 +284,78 @@ impl Cli {
             .clone()
             .ignore_errors(true)
             .try_get_matches_from(&args)?;
+        let sub = first
+            .subcommand_name()
+            .filter(|name| SERVE_LIKE.contains(name))
+            .unwrap_or("serve")
+            .to_owned();
         let path = first
-            .subcommand_matches("serve")
+            .subcommand_matches(&sub)
             .and_then(|m| m.get_one::<PathBuf>("config"))
             .cloned();
         let file = match path {
             Some(path) => {
-                let serve = cmd.find_subcommand("serve").expect("defined above").clone();
-                let (serve, file) =
-                    read_file(serve, &path).map_err(|(kind, msg)| serve_error(&cmd, kind, msg))?;
-                cmd = cmd.mut_subcommand("serve", |_| serve);
+                let serve = cmd.find_subcommand(&sub).expect("defined above").clone();
+                let (serve, file) = read_file(serve, &path)
+                    .map_err(|(kind, msg)| serve_error(&cmd, &sub, kind, msg))?;
+                cmd = cmd.mut_subcommand(&sub, |_| serve);
                 file
             }
             None => FileOnly::default(),
         };
-        let mut cli = Self::from_arg_matches(&cmd.clone().try_get_matches_from(&args)?)?;
-        let Command::Serve(serve) = &mut cli.command;
-        serve
-            .finish(file)
-            .map_err(|msg| serve_error(&cmd, ErrorKind::ArgumentConflict, msg))?;
+        let matches = cmd.clone().try_get_matches_from(&args)?;
+        let mut cli = Self::from_arg_matches(&matches)?;
+        if let Command::Serve(serve) | Command::CheckConfig(serve) = &mut cli.command {
+            // File values are defaults to clap, so a value from anywhere else outranks the file.
+            if let (Some(m), Some(def)) =
+                (matches.subcommand_matches(&sub), cmd.find_subcommand(&sub))
+            {
+                serve.locked = def
+                    .get_arguments()
+                    .filter(|arg| {
+                        matches!(
+                            m.value_source(arg.get_id().as_str()),
+                            Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+                        )
+                    })
+                    .filter_map(|arg| arg.get_long().map(str::to_owned))
+                    .collect();
+            }
+            serve
+                .finish(file)
+                .map_err(|msg| serve_error(&cmd, &sub, ErrorKind::ArgumentConflict, msg))?;
+        }
         Ok(cli)
+    }
+
+    /// `serve`'s settings from the environment and its config file alone, as a server started
+    /// without flags would have them.
+    pub fn serve_from_env() -> Result<ServeArgs, clap::Error> {
+        Self::serve_from(["s3dal", "serve"])
+    }
+
+    /// `serve`'s settings from a command line, read again as at startup: a config reload
+    /// passes the process's own arguments, so flags, variables and the file keep their order
+    /// of precedence.
+    pub fn serve_from(
+        args: impl IntoIterator<Item = impl Into<OsString>>,
+    ) -> Result<ServeArgs, clap::Error> {
+        let cli = Self::load_from(Self::command(), args)?;
+        let Command::Serve(serve) = cli.command else {
+            return Err(clap::Error::raw(
+                ErrorKind::InvalidSubcommand,
+                "not `serve`",
+            ));
+        };
+        Ok(serve)
     }
 }
 
-/// An error shown with `serve`'s usage line, like the errors clap reports itself.
-fn serve_error(cmd: &clap::Command, kind: ErrorKind, msg: String) -> clap::Error {
+/// An error shown with the subcommand's usage line, like the errors clap reports itself.
+fn serve_error(cmd: &clap::Command, sub: &str, kind: ErrorKind, msg: String) -> clap::Error {
     let mut cmd = cmd.clone();
     cmd.build();
-    let serve = cmd.find_subcommand_mut("serve").expect("defined above");
+    let serve = cmd.find_subcommand_mut(sub).expect("defined above");
     serve.error(kind, msg)
 }
 
@@ -347,6 +496,30 @@ fn parse_key_value(s: &str) -> Result<(String, String), String> {
     Ok((k.to_owned(), v.to_owned()))
 }
 
+/// A size as `--etag-buffer-limit` takes it, in the largest unit that divides it.
+pub fn format_size(n: u64) -> String {
+    for (unit, size) in [("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)] {
+        if n != 0 && n.is_multiple_of(size) {
+            return format!("{}{unit}", n / size);
+        }
+    }
+    n.to_string()
+}
+
+/// A duration as `--stale-upload-age` takes it, in the largest unit that divides it.
+pub fn format_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    if s == 0 {
+        return "0".into();
+    }
+    for (unit, secs) in [("d", 86_400), ("h", 3_600), ("m", 60)] {
+        if s.is_multiple_of(secs) {
+            return format!("{}{unit}", s / secs);
+        }
+    }
+    format!("{s}s")
+}
+
 fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
@@ -401,7 +574,9 @@ mod tests {
             serve.mut_args(|arg| arg.env(None::<&'static str>))
         });
         let argv = ["s3dal", "serve"].iter().chain(args).copied();
-        let Command::Serve(serve) = Cli::load_from(cmd, argv)?.command;
+        let Command::Serve(serve) = Cli::load_from(cmd, argv)?.command else {
+            unreachable!("parsed as serve")
+        };
         Ok(serve)
     }
 
@@ -498,7 +673,17 @@ mod tests {
             args.backend_opts,
             [("root".to_owned(), "/elsewhere".to_owned())]
         );
-        assert_eq!(args.credentials, [pair("carol", "carol-secret")]);
+        // Key pairs are the exception: the flag's pair is added, so the file's pairs, which the
+        // console manages, keep working next to the one the environment fixes.
+        assert_eq!(
+            args.credentials,
+            [
+                pair("carol", "carol-secret"),
+                pair("alice", "alice-secret"),
+                pair("bob", "bob-secret")
+            ]
+        );
+        assert_eq!(args.fixed_access_key.as_deref(), Some("carol"));
         // What no flag names still comes from the file.
         assert_eq!(args.address, "0.0.0.0:9100".parse().unwrap());
         assert_eq!(args.etag_buffer_limit, 16 * 1024 * 1024);
@@ -645,12 +830,71 @@ mod tests {
                 &format!("--stale-upload-age={age}"),
             ])
             .unwrap();
-            let Command::Serve(args) = cli.command;
+            let Command::Serve(args) = cli.command else {
+                unreachable!("parsed as serve")
+            };
             args.settings().stale_upload_age
         };
         assert_eq!(args("0"), None);
         assert_eq!(args("0h"), None);
         assert_eq!(args("2h"), Some(Duration::from_secs(7_200)));
+    }
+
+    #[test]
+    fn check_config_prints_no_secret() {
+        // Its output is what users paste into an issue or a chat to ask why the server does
+        // not do what they expect; a secret key or upstream credential must not travel with it.
+        let file = config_file(
+            "backend = \"s3\"\n\
+             [backend-opt]\nbucket = \"up\"\nsecret_access_key = \"UPSTREAM-SECRET\"\n\
+             session_token = \"UPSTREAM-TOKEN\"\n\
+             [[credentials]]\naccess-key = \"alice\"\nsecret-key = \"ALICE-SECRET\"\n",
+        );
+        let args = serve(&["--config", file.path().to_str().unwrap()]).unwrap();
+        let text = args.describe();
+        for secret in ["UPSTREAM-SECRET", "UPSTREAM-TOKEN", "ALICE-SECRET"] {
+            assert!(!text.contains(secret), "{secret} in:\n{text}");
+        }
+        // What is not secret is shown, or the output would not help.
+        for shown in [
+            "bucket = \"up\"",
+            "access-key = \"alice\"",
+            "backend = \"s3\"",
+        ] {
+            assert!(text.contains(shown), "{shown} missing from:\n{text}");
+        }
+    }
+
+    #[test]
+    fn check_config_reads_the_config_file_as_serve_does() {
+        // A check that read the file differently from `serve` would pass a file the server
+        // then refuses.
+        let file = config_file("backend = \"fs\"\nregion = \"eu-west-1\"\n");
+        let path = file.path().to_str().unwrap();
+        let cmd = Cli::command().mut_subcommand("check-config", |sub| {
+            sub.mut_args(|arg| arg.env(None::<&'static str>))
+        });
+        let argv = [
+            "s3dal",
+            "check-config",
+            "--config",
+            path,
+            "--access-key=a",
+            "--secret-key=b",
+        ];
+        let Command::CheckConfig(args) = Cli::load_from(cmd.clone(), argv).unwrap().command else {
+            panic!("parsed as another command")
+        };
+        assert_eq!(args.region, "eu-west-1");
+        let bad = config_file("backend = \"fs\"\nregion = 1\nunknown = 2\n");
+        let argv = [
+            "s3dal",
+            "check-config",
+            "--config",
+            bad.path().to_str().unwrap(),
+        ];
+        let err = Cli::load_from(cmd, argv).unwrap_err();
+        assert!(err.to_string().contains("`unknown`"), "{err}");
     }
 
     #[test]

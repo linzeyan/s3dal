@@ -56,7 +56,7 @@ pub(super) async fn create_bucket(
         // AWS answers a re-create of a bucket the caller owns with 200 in us-east-1, for legacy
         // compatibility, and with BucketAlreadyOwnedByYou in every other region. The bucket
         // stays as it is either way.
-        if dal.settings.region == LEGACY_REGION {
+        if dal.settings().region == LEGACY_REGION {
             return Ok(S3Response::new(created));
         }
         return Err(s3_error!(BucketAlreadyOwnedByYou));
@@ -128,7 +128,7 @@ pub(super) async fn head_bucket(
     require_bucket(dal, &req.input.bucket).await?;
     // SDKs read x-amz-bucket-region to pick the signing region for the bucket.
     Ok(S3Response::new(HeadBucketOutput {
-        bucket_region: Some(dal.settings.region.clone()),
+        bucket_region: Some(dal.settings().region.clone()),
         ..Default::default()
     }))
 }
@@ -148,7 +148,7 @@ pub(super) async fn list_buckets(
             ));
         }
     };
-    let region = &dal.settings.region;
+    let region = &dal.settings().region;
 
     let mut buckets = Vec::new();
     // Every bucket lives in the configured region, so a filter naming another region matches
@@ -234,7 +234,7 @@ pub(super) async fn get_bucket_location(
     req: S3Request<GetBucketLocationInput>,
 ) -> S3Result<S3Response<GetBucketLocationOutput>> {
     require_bucket(dal, &req.input.bucket).await?;
-    let region = &dal.settings.region;
+    let region = &dal.settings().region;
     Ok(S3Response::new(GetBucketLocationOutput {
         location_constraint: (region != LEGACY_REGION)
             .then(|| BucketLocationConstraint::from(region.clone())),

@@ -261,7 +261,7 @@ impl<'a> Dest<'a> {
     pub(super) fn send_whole_up_to_limit(&self, opts: &mut WriteOptions) {
         if self.dal.profile.native_etag {
             opts.chunk =
-                Some(usize::try_from(self.dal.settings.etag_buffer_limit).unwrap_or(usize::MAX));
+                Some(usize::try_from(self.dal.settings().etag_buffer_limit).unwrap_or(usize::MAX));
         }
     }
 

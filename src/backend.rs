@@ -36,7 +36,7 @@ const PROBE_BODY: &[u8] = &[
 /// filesystem without xattrs), and no capability says whether `stat` returns an ETag or whether
 /// directories outlive their last child. Each field picks one code path for the whole process,
 /// so a field never has two sources of truth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Profile {
     /// `stat` returns the MD5 of what one write stored as its ETag, so the backend's ETag is
     /// what S3 would report and is authoritative. An ETag of another kind (Azure's and GCS's

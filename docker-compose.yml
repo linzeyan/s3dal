@@ -1,0 +1,48 @@
+# s3dal with its web console, objects on the local disk of the Docker host.
+#
+#   printf 'S3DAL_ACCESS_KEY=admin\nS3DAL_SECRET_KEY=%s\n' "$(openssl rand -hex 20)" >.env
+#   docker compose up -d
+#
+# The S3 API is on http://localhost:9000; the console on http://localhost:9001, where the key
+# pair in .env signs in. Key pairs and settings changed in the console are saved in the config
+# volume and take effect without a restart.
+services:
+  s3dal:
+    image: ghcr.io/linzeyan/s3dal:latest
+    # Builds the image from this checkout when it cannot be pulled, or with `--build`.
+    build: .
+    restart: unless-stopped
+    # The host ports; set S3DAL_PORT and S3DAL_CONSOLE_PORT in .env where 9000 is taken, by
+    # the MinIO this replaces, say.
+    ports:
+      - "${S3DAL_PORT:-9000}:9000"
+      - "${S3DAL_CONSOLE_PORT:-9001}:9001"
+    environment:
+      # This pair cannot be removed from the console, so a lost secret elsewhere never locks
+      # every user out; change it here and `docker compose up -d` again.
+      S3DAL_ACCESS_KEY: ${S3DAL_ACCESS_KEY:?set S3DAL_ACCESS_KEY in .env}
+      S3DAL_SECRET_KEY: ${S3DAL_SECRET_KEY:?set S3DAL_SECRET_KEY in .env}
+      S3DAL_CONSOLE_ADDRESS: 0.0.0.0:9001
+    volumes:
+      - data:/data
+      # The config file, /etc/s3dal/s3dal.toml: a copy of the image's on first start. To edit it
+      # on the host instead, put it at ./config/s3dal.toml and mount the directory in place of
+      # the volume, as below; s3dal applies a saved edit within seconds. On Linux the console
+      # can save to it only if uid 65532 may write it.
+      #   - ./config:/etc/s3dal
+      - config:/etc/s3dal
+    healthcheck:
+      # The image has no shell or curl; s3dal checks itself, at the address in its config.
+      test: ["CMD", "/usr/local/bin/s3dal", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+      start_interval: 1s
+    # On stop, s3dal gives requests in flight 10 seconds to finish; Docker's own default of 10
+    # would kill it just as a large upload is about to.
+    stop_grace_period: 15s
+
+volumes:
+  data:
+  config:

@@ -92,6 +92,16 @@ jobs:
         run: |
           docker stop -t 10 s3dal
           test "$(docker inspect -f '{{.State.ExitCode}}' s3dal)" = 0
+      # Builds from the layers above, so it adds seconds, not a second image build.
+      - name: docker compose
+        run: scripts/smoke-compose.sh
+      - name: Upload compose logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: compose-logs
+          path: target/smoke/compose/
+          if-no-files-found: ignore
 
   smoke:
     name: smoke (${{ matrix.backend }})

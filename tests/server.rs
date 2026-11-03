@@ -20,8 +20,9 @@ use h2::client::SendRequest;
 use hyper::{Request, Version};
 use opendal::ErrorKind;
 use opendal::options::WriteOptions;
-use s3dal::config::KeyPair;
-use s3dal::{Profile, S3Dal, Settings, server};
+use s3dal::config::{Cli, KeyPair};
+use s3dal::live::Live;
+use s3dal::{Profile, Settings, server};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
@@ -63,6 +64,58 @@ async fn unsigned_requests_are_rejected() {
     let (status, _) = raw_request(&server.endpoint, "PUT", "/bkt/new", &[], b"data").await;
     assert_eq!(status, 403);
     assert!(!server.exists("bkt/new").await);
+}
+
+#[tokio::test]
+async fn the_health_check_answers_without_a_signature_and_never_shadows_a_signed_request() {
+    // Container runtimes and load balancers probe without credentials, and a probe that got 403
+    // or 501 could not tell a healthy server from a broken one. Yet a signed request for the same
+    // path is an S3 request (virtual-hosted style it names the key `_s3dal/health`) and must
+    // reach s3s.
+    let server = TestServer::start().await;
+    for method in ["GET", "HEAD"] {
+        let (status, body) =
+            raw_request(&server.endpoint, method, server::HEALTH_PATH, &[], b"").await;
+        assert_eq!(status, 200, "{method}");
+        assert!(body.is_empty(), "{method}");
+    }
+    let (status, _) = raw_request(&server.endpoint, "PUT", server::HEALTH_PATH, &[], b"").await;
+    assert_ne!(status, 200);
+    let (status, body) = common::signed_request(
+        &server.endpoint,
+        "GET",
+        server::HEALTH_PATH,
+        "",
+        &[],
+        "UNSIGNED-PAYLOAD",
+        b"",
+    )
+    .await;
+    assert_ne!(status, 200, "{}", String::from_utf8_lossy(&body));
+
+    server::check_health(&server.endpoint).await.unwrap();
+}
+
+#[tokio::test]
+async fn check_health_fails_when_nothing_answers() {
+    // A health check that passed for a stopped server would keep traffic flowing to it.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    assert!(
+        server::check_health(&format!("http://{addr}"))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn check_health_speaks_tls_to_an_https_server_without_trusting_its_certificate() {
+    // The certificate a container serves is for its public name, not for the loopback address
+    // its own health check connects to.
+    let cert = TestCert::new();
+    let server = start_https(&cert).await;
+    server::check_health(&server.endpoint).await.unwrap();
 }
 
 /// Sends a presigned request as a browser or `curl` would: only the URL and the headers the
@@ -381,14 +434,15 @@ async fn every_configured_key_pair_signs_requests() {
 }
 
 #[tokio::test]
-async fn build_service_refuses_missing_or_duplicate_key_pairs() {
-    // Embedders call build_service without the CLI's checks. It must neither serve without
-    // keys nor leave which of two secrets for one access key applies to lookup order.
-    let backend = Backend::fs().await;
-    let dal = || S3Dal::new(backend.op.clone(), backend.profile, Settings::default());
-    assert!(server::build_service(dal(), &[], &[]).is_err());
+async fn live_auth_refuses_missing_or_duplicate_key_pairs() {
+    // Embedders build the key pairs without the CLI's checks, and a reload replaces them. Neither
+    // may serve without keys, nor leave which of two secrets for one access key applies to
+    // lookup order.
+    assert!(server::LiveAuth::new(&[], &[]).is_err());
     let twice = [pair("a", "one"), pair("a", "two")];
-    assert!(server::build_service(dal(), &twice, &[]).is_err());
+    assert!(server::LiveAuth::new(&twice, &[]).is_err());
+    let auth = server::LiveAuth::new(&[pair("a", "one")], &[]).unwrap();
+    assert!(auth.replace(&twice, &[]).is_err());
 }
 
 /// A self-signed certificate for 127.0.0.1 and its key, as the PEM files `--tls-cert` and
@@ -422,7 +476,7 @@ impl TestCert {
     }
 
     fn acceptor(&self) -> TlsAcceptor {
-        server::tls_acceptor(&self.cert(), &self.key()).unwrap()
+        server::tls_acceptor(&self.cert(), &self.key()).unwrap().0
     }
 }
 
@@ -1339,4 +1393,124 @@ async fn error_logs_carry_the_request_id() {
         .find(|line| line.contains(&id))
         .unwrap_or_else(|| panic!("{id} is not in the log:\n{text}"));
     assert!(line.contains("InvalidAccessKeyId"), "{line}");
+}
+
+/// A server whose settings come from the config file `text` and reload from it, as `serve
+/// --config` runs. Returns the server, its reload handle and the file.
+async fn start_live(
+    text: &str,
+    tls: Option<(TlsAcceptor, server::LiveCert)>,
+) -> (TestServer, Arc<Live>, tempfile::NamedTempFile) {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), text).unwrap();
+    // `--backend` as a flag: scripts/with-rustfs.sh exports S3DAL_BACKEND for the whole run.
+    let argv: Vec<std::ffi::OsString> = vec![
+        "s3dal".into(),
+        "serve".into(),
+        "--backend=fs".into(),
+        "--config".into(),
+        file.path().into(),
+    ];
+    let args = Cli::serve_from(&argv).unwrap();
+    let (acceptor, cert) = tls.unzip();
+    let backend = Backend::from_env().await;
+    let server =
+        TestServer::start_serving(backend, args.settings(), &args.credentials, acceptor).await;
+    let live = Live::new(argv, args, server.dal.clone(), server.auth.clone(), cert);
+    (server, Arc::new(live), file)
+}
+
+const ALICE: &str = "[[credentials]]\naccess-key = \"alice\"\nsecret-key = \"alice-secret\"\n";
+const BOB: &str = "[[credentials]]\naccess-key = \"bob\"\nsecret-key = \"bob-secret\"\n";
+
+#[tokio::test]
+async fn a_config_reload_replaces_key_pairs_without_a_restart() {
+    // Revoking a leaked key must take effect at once, and must not cut the uploads and
+    // downloads of every other client the way a restart would.
+    let (server, live, file) = start_live(ALICE, None).await;
+    let alice = client(&server.endpoint, "alice", "alice-secret");
+    let bob = client(&server.endpoint, "bob", "bob-secret");
+    alice.list_buckets().send().await.unwrap();
+
+    std::fs::write(file.path(), BOB).unwrap();
+    live.reload().unwrap();
+    bob.list_buckets().send().await.unwrap();
+    let err = alice.list_buckets().send().await.unwrap_err();
+    assert_eq!(err.code(), Some("InvalidAccessKeyId"), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_config_file_with_a_mistake_leaves_the_running_settings_alone() {
+    // An edit saved halfway, or with a typo, must not lock every client out: the server keeps
+    // what it runs with until the file is right.
+    let (server, live, file) = start_live(&format!("region = \"eu-west-1\"\n{ALICE}"), None).await;
+    let alice = client(&server.endpoint, "alice", "alice-secret");
+    for broken in [
+        // Not TOML.
+        "[[credentials]\naccess-key = ",
+        // Valid TOML, but the region would change while the key pairs cannot.
+        "region = \"us-west-2\"\n[[credentials]]\naccess-key = \"a\"\nsecret-key = \"x\"\n\
+         [[credentials]]\naccess-key = \"a\"\nsecret-key = \"y\"\n",
+    ] {
+        std::fs::write(file.path(), broken).unwrap();
+        assert!(live.reload().is_err(), "{broken}");
+        alice.list_buckets().send().await.unwrap();
+        assert_eq!(server.dal.settings().region, "eu-west-1");
+    }
+}
+
+#[tokio::test]
+async fn settings_that_need_a_restart_are_reported_rather_than_half_applied() {
+    // The listener's address cannot move under its clients; the operator must learn that the
+    // change waits for a restart instead of believing it is in effect.
+    let (server, live, file) = start_live(ALICE, None).await;
+    std::fs::write(
+        file.path(),
+        format!("address = \"127.0.0.1:1\"\nregion = \"eu-west-1\"\n{ALICE}"),
+    )
+    .unwrap();
+    live.reload().unwrap();
+    assert_eq!(live.pending_restart(), ["address"]);
+    assert_eq!(server.dal.settings().region, "eu-west-1");
+}
+
+#[tokio::test]
+async fn the_watcher_applies_an_edited_config_file_by_itself() {
+    // Editing the file is the whole procedure; nobody has to find the process and signal it.
+    let (server, live, file) = start_live(ALICE, None).await;
+    let watcher = tokio::spawn(s3dal::live::watch(live));
+    // Lets the watcher read the file as it was before the edit.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    std::fs::write(file.path(), BOB).unwrap();
+    let bob = client(&server.endpoint, "bob", "bob-secret");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while bob.list_buckets().send().await.is_err() {
+        assert!(tokio::time::Instant::now() < deadline, "not reloaded");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    watcher.abort();
+}
+
+#[tokio::test]
+async fn a_renewed_certificate_is_served_without_a_restart() {
+    // Certificates from ACME live for weeks; renewing one must not need a restart that cuts
+    // every transfer in progress.
+    let old = TestCert::new();
+    let tls = server::tls_acceptor(&old.cert(), &old.key()).unwrap();
+    let text = format!(
+        "tls-cert = {:?}\ntls-key = {:?}\n{ALICE}",
+        old.cert().display().to_string(),
+        old.key().display().to_string()
+    );
+    let (server, live, _file) = start_live(&text, Some(tls)).await;
+    let addr = server.endpoint.trim_start_matches("https://");
+    tls_connect(addr, &old, &[b"http/1.1"]).await;
+
+    // Renewal rewrites the files in place; the config file stays the same.
+    let new = TestCert::new();
+    std::fs::copy(new.cert(), old.cert()).unwrap();
+    std::fs::copy(new.key(), old.key()).unwrap();
+    live.reload().unwrap();
+    // Verified against the new certificate alone, so this connects only if it is presented.
+    tls_connect(addr, &new, &[b"http/1.1"]).await;
 }

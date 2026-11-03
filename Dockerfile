@@ -30,10 +30,12 @@ VOLUME ["/data"]
 # Defaults in a config file, the lowest precedence s3dal has: as flags or variables they would
 # override a config file mounted by the user, while in a file `-e S3DAL_BACKEND=s3` still
 # overrides them without replacing the command. Credentials are deliberately absent; s3dal
-# refuses to start without a key pair.
-COPY docker/s3dal.toml /etc/s3dal/s3dal.toml
+# refuses to start without a key pair. Owned by s3dal's user so the console can save edits to it;
+# a named volume on /etc/s3dal starts as a copy of it with that owner, and keeps the edits.
+COPY --chown=65532:65532 docker/s3dal.toml /etc/s3dal/s3dal.toml
 ENV S3DAL_CONFIG=/etc/s3dal/s3dal.toml
-EXPOSE 9000
+# The S3 API, and the web console when S3DAL_CONSOLE_ADDRESS turns it on.
+EXPOSE 9000 9001
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/s3dal"]
 CMD ["serve"]

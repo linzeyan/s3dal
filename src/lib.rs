@@ -5,8 +5,12 @@
 
 pub mod backend;
 mod checksum;
+#[cfg(feature = "client")]
+pub mod client;
 pub mod config;
+pub mod console;
 mod error;
+pub mod live;
 pub mod meta;
 mod s3;
 pub mod server;

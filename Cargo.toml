@@ -1,6 +1,6 @@
 [package]
 name = "s3dal"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 # s3s 0.17 requires 1.96.
 rust-version = "1.96"
@@ -24,12 +24,25 @@ include = [
 ]
 
 [features]
-default = ["services-s3", "services-azblob", "services-gcs"]
+default = ["services-s3", "services-azblob", "services-gcs", "client"]
 # A remote service brings OpenDAL's HTTP transport with it; fs alone needs none, so each one
 # that s3dal is tested against is a feature that a build can leave out.
 services-s3 = ["opendal/services-s3", "opendal/http-transport-reqwest"]
 services-azblob = ["opendal/services-azblob", "opendal/http-transport-reqwest"]
 services-gcs = ["opendal/services-gcs", "opendal/http-transport-reqwest"]
+# The `ls`, `cp`, ... subcommands. Every crate they need is already compiled for OpenDAL's s3
+# service, so in the default build they cost little more than their own code.
+client = [
+    "dep:http",
+    "dep:percent-encoding",
+    "dep:quick-xml",
+    "dep:reqsign-aws-v4",
+    "dep:reqsign-core",
+    "dep:reqwest",
+    "tokio/fs",
+    "tokio/io-std",
+    "tokio/io-util",
+]
 
 [dependencies]
 anyhow = "1"
@@ -41,11 +54,27 @@ bytes = "1"
 # `string`: values read from the config file become flag defaults at runtime.
 clap = { version = "4.6", features = ["derive", "env", "string"] }
 futures = "0.3"
+# Already compiled for uuid. `keygen` draws key pairs from the OS generator.
+getrandom = "0.4"
+# Already compiled for reqwest. The client builds the request head that reqsign signs.
+http = { version = "1", optional = true }
 # Already compiled for s3s; wraps its service to fix up request headers before s3s parses them.
 hyper = "1"
 hyper-util = { version = "0.1.20", features = ["server-auto", "http1", "http2", "tokio"] }
 md-5 = "0.11"
 opendal = { version = "0.59.4", default-features = false, features = ["services-fs", "services-memory", "executors-tokio", "layers-retry"] }
+# Already compiled for reqwest. The client escapes keys and query values as SigV4 canonicalizes
+# them, so the URL sent and the URL signed agree.
+percent-encoding = { version = "2.3", optional = true }
+# Already compiled for s3s and reqsign, with `serialize`. The client reads S3's XML responses.
+quick-xml = { version = "0.42", features = ["serialize"], optional = true }
+# Already compiled for OpenDAL's s3 service, which signs its requests with them; the client
+# signs its own, and presigns URLs, the same way.
+reqsign-aws-v4 = { version = "3.3.1", default-features = false, optional = true }
+reqsign-core = { version = "3.3.2", default-features = false, optional = true }
+# Already compiled for OpenDAL's s3 service, with these features: the client's HTTP transport,
+# with streamed bodies for uploads and downloads larger than memory.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"], optional = true }
 s3s = "0.17.0"
 # Already compiled for s3s, which decodes and encodes x-amz-meta-* values with it; s3dal stores
 # them in the same encoded form.
@@ -60,10 +89,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 # Already compiled for OpenDAL's s3 service (reqwest's TLS), with the same aws-lc-rs provider.
 # Serves HTTPS, and re-exports rustls and its PEM parser.
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
-# The `serve --config` file. Only parsing: s3dal never writes TOML.
+# Reads the `serve --config` file; the console writes it with toml_edit below.
 toml = { version = "1.1.6", default-features = false, features = ["std", "parse", "serde"] }
+# The console edits the config file. Unlike serializing with `toml`, it changes only the keys it
+# sets and keeps the rest of the file, comments and layout included, as the operator wrote it.
+# Shares its parser with `toml`.
+toml_edit = { version = "0.25.17", default-features = false, features = ["parse", "display"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# `json`: `--log-format json`, one object per line for log collectors.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(unix)'.dependencies]

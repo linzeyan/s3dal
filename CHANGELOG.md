@@ -3,6 +3,39 @@
 All notable changes to s3dal are listed here, in the format of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] - 2026-11-03
+
+### Added
+
+- A web console, on a port of its own with `--console-address`: browse, upload, preview,
+  download and delete objects, share presigned links, manage key pairs, and change settings.
+  Requests are signed in the browser with the key pair that signed in; changed settings are
+  saved to the config file, its comments kept.
+- Settings that change while s3dal runs: an edit of the config file, or a renewed TLS
+  certificate and key, applies within seconds, or at once on SIGHUP. Key pairs, region,
+  domains, `etag-buffer-limit` and `stale-upload-age` change without a restart; the rest is
+  reported as waiting for one. A file with a mistake leaves the running settings alone.
+- Client subcommands for any S3 endpoint: `ls`, `mb`, `rb`, `cp`, `mv`, `rm`, `cat`, `stat`,
+  `presign`, in the `client` feature, on by default.
+- `s3dal check-config`, `s3dal healthcheck`, `s3dal keygen`, and the unsigned health endpoint
+  `GET /_s3dal/health`.
+- An access log line for every request, with its request ID, status, error code, access key,
+  bytes sent and time taken; `--log-format json` for one JSON object per line.
+- `docker-compose.yml`, with the console on, and the image's health check.
+
+### Changed
+
+- The key pair given by `--access-key` and `--secret-key` (or `S3DAL_ACCESS_KEY` and
+  `S3DAL_SECRET_KEY`) is added to the config file's `[[credentials]]` instead of replacing
+  them. A deployment that relied on the variables to shut out the file's pairs must remove
+  them from the file.
+- s3s's own log lines are off by default (`RUST_LOG` default `info,s3s=off`): it logged every
+  refused request, an unsigned one included, at ERROR. The access log reports them at INFO.
+- The image's config file belongs to the user s3dal runs as, so the console can save to it,
+  and the image exposes the console's port 9001 too.
+- README covers features and settings; backends, clients, operations, compatibility and
+  differences from S3 moved to `guide/`.
+
 ## [0.1.1] - 2026-10-21
 
 ### Added

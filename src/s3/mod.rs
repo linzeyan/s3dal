@@ -16,7 +16,7 @@ mod tmp;
 mod unsupported;
 mod upload;
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use opendal::Operator;
@@ -32,7 +32,9 @@ use crate::config::Settings;
 pub struct S3Dal {
     pub(crate) op: Operator,
     pub(crate) profile: Profile,
-    pub(crate) settings: Settings,
+    /// Replaced whole when the config file changes; a request reads it once per decision, so a
+    /// reload mid-request changes nothing it has already decided.
+    settings: Arc<RwLock<Arc<Settings>>>,
     locks: Arc<store::KeyLocks>,
     /// Keyed by upload directory: one Complete of an upload at a time.
     upload_locks: Arc<store::KeyLocks>,
@@ -45,11 +47,28 @@ impl S3Dal {
         Self {
             op,
             profile,
-            settings,
+            settings: Arc::new(RwLock::new(Arc::new(settings))),
             locks: Arc::default(),
             upload_locks: Arc::default(),
             proofs: Arc::default(),
         }
+    }
+
+    pub fn settings(&self) -> Arc<Settings> {
+        // A panic while holding the lock leaves a whole value behind, since a write only swaps
+        // the Arc, so a poisoned lock is still safe to read.
+        self.settings
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Applies to requests that start from now on, and to the next stale-upload sweep.
+    pub fn set_settings(&self, settings: Settings) {
+        *self
+            .settings
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::new(settings);
     }
 
     /// Removes the multipart uploads last used more than `age` ago: active uploads by when they

@@ -70,7 +70,7 @@ pub(super) async fn put_object(
     // stores a trailer checksum; it costs no extra memory there, because OpenDAL holds a body of
     // that size anyway to send it in one request (`Dest::send_whole_up_to_limit`).
     let buffered = input.content_md5.is_none()
-        && declared.is_some_and(|n| n <= dal.settings.etag_buffer_limit);
+        && declared.is_some_and(|n| n <= dal.settings().etag_buffer_limit);
     let mut check = BodyCheck::new(&BodyHeaders::from_put(&input), buffered)?;
     let dest = Dest::new(dal, &input.bucket, &input.key);
 

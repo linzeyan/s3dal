@@ -19,8 +19,21 @@
 
 ```sh
 cargo build                          # debug build of the library and the s3dal binary
-cargo build --no-default-features    # fs only, without the s3, azblob and gcs backends
+cargo build --release                # target/release/s3dal
+cargo install --path .               # into ~/.cargo/bin
 ```
+
+The features `services-s3`, `services-azblob` and `services-gcs`, all on by default, add the
+`s3`, `azblob` and `gcs` backends and the HTTP client they need; `client`, also on by default,
+adds the `ls`, `cp`, ... subcommands, on that same HTTP client.
+`cargo build --release --no-default-features` builds an fs-only server, and
+`--no-default-features --features services-s3` one with fs and s3 only.
+
+The console's page (`src/console/assets/`) is plain JavaScript modules and CSS, compiled into
+the binary with `include_str!`: there is no build step and no npm dependency, so `cargo build`
+is all it takes. Its Content-Security-Policy allows scripts from the console's own origin only,
+and the page never assigns `innerHTML`: object names are untrusted text on the page that holds
+the secret key.
 
 ## The standard check
 
@@ -58,7 +71,7 @@ A change is not done while a test fails, is skipped, or is marked `#[ignore]`.
   service. `scripts/fake-gcs-proxy.py` fills in, in front of fake-gcs-server, what GCS does and
   the emulator does not (XML API multipart uploads, batch requests as OpenDAL sends them), so
   the tests exercise what s3dal sends GCS. A difference that would take a change in s3dal or a
-  weaker test is listed in README.md under "Compatibility" instead.
+  weaker test is listed in [guide/compatibility.md](guide/compatibility.md) instead.
 - A test of what a client can observe runs on the suite's backend (`TestServer::start`). A test
   of gateway-only machinery (synthesized ETags, files planted behind s3dal's back, key/prefix
   conflicts, directory mtimes) runs on fs in every run (`TestServer::start_fs`).
@@ -74,6 +87,7 @@ the backend root and client files as well.
 | `scripts/smoke-awscli.sh` | aws CLI, including a 64 MiB multipart upload and copy | Docker |
 | `scripts/smoke-rclone.sh` | rclone: copy, check, sync, server-side copy | Docker |
 | `scripts/smoke-e2e.sh` | s3s's end-to-end suite (`s3s-e2e`), built from s3s v0.17.0 | git, network on first run; `S3S_SRC` can name an existing checkout |
+| `scripts/smoke-compose.sh` | `docker-compose.yml` with the image built from the checkout: health check, console, the client in the container, a restart | Docker Compose; ports 19000 and 19001 |
 
 To run one on another backend, wrap it: `scripts/with-rustfs.sh scripts/smoke-rclone.sh`, and
 likewise with `scripts/with-azurite.sh` or `scripts/with-fake-gcs.sh`. `AWS_CLI_IMAGE`,
@@ -106,8 +120,8 @@ subset for debugging; it never writes `compat/`.
 `.github/workflows/ci.yml` runs on pushes to `main` and on pull requests: rustfmt and clippy on
 a pinned Rust version (1.99), so that the lints a new Rust release adds do not fail unrelated
 changes; the tests on fs, on s3 (RustFS), on azblob (Azurite) and on gcs (fake-gcs-server); a
-build with Rust 1.96; building the Docker image and serving from it; and the three smoke
-scripts on all four backends. ceph s3-tests take long, so `.github/workflows/s3-tests.yml` runs only when started
+build with Rust 1.96; building the Docker image, serving from it, and
+`scripts/smoke-compose.sh`; and the three client smoke scripts on all four backends. ceph s3-tests take long, so `.github/workflows/s3-tests.yml` runs only when started
 by hand (Actions, "s3-tests", "Run workflow"). It uploads the resulting `compat/` directory as an
 artifact and never commits it. `.github/workflows/release.yml` runs on a version tag: it builds
 the Docker image for amd64 and arm64, each on a runner of that architecture, serves from each,
@@ -144,7 +158,8 @@ the image, only after the crate is up.
 - A test is named after the behavior it checks, and its first comment states why that behavior
   matters. For example, `delete_with_if_match_deletes_only_the_expected_etag` begins with "A
   cleanup job must not delete an object that was replaced after it decided to."
-- A deliberate difference from S3 is listed in README.md under "Differences from Amazon S3".
+- README.md introduces s3dal and its settings; details go to `guide/`. A deliberate difference
+  from S3 is listed in [guide/differences.md](guide/differences.md).
 - A new dependency must be under a license listed in `docker/about.toml`; otherwise the image
   build fails, which is the point. Adding a license there is a decision for review.
 - Code adapted from s3s or s3s-fs keeps the original attribution. The file starts with
