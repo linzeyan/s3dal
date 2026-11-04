@@ -3,6 +3,31 @@
 All notable changes to s3dal are listed here, in the format of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-11-04
+
+### Added
+
+- `--log-file`, with size-based rotation: `--log-max-size` (default `100MiB`, `0` never
+  rotates) and `--log-max-files` (default 5) rotated files kept.
+- `--log-level`, which a config reload or the console changes without a restart.
+- Key pair limits: `allow` (buckets, or `bucket/folder/`) and `access = "read-only"` in a
+  `[[credentials]]` table. A limited pair lists only the buckets it reaches, cannot list
+  above its folders, and cannot manage buckets or the console's settings.
+- Console: uploads send a SHA-512 checksum, which the object's details show in hex; an upload
+  asks before replacing an existing object (replace, skip, keep both), an option per browser.
+- Console: the upload panel minimizes, keeps its scroll position, lists every file of a large
+  upload in order with a total, and stays open once scrolled.
+- Console: the settings that take a restart are editable, the backend and its options
+  included; a new backend is built and probed before it is saved.
+- The project icon, in the console and the README.
+
+### Changed
+
+- `--log-level` (`S3DAL_LOG_LEVEL`) replaces `RUST_LOG`, which s3dal no longer reads. s3s's
+  lines stay off unless a directive names `s3s`, and a word that is not a level, alone or
+  after `=`, is refused rather than read as a target at TRACE.
+- `--help` lists each command with one line, and wraps at the terminal's width.
+
 ## [0.2.0] - 2026-11-03
 
 ### Added

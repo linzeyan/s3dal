@@ -17,10 +17,16 @@ use hyper::{Method, Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::access::{S3Access, S3AccessContext};
+use s3s::auth::Credentials;
 use s3s::auth::{S3Auth, SecretKey};
-use s3s::dto::PostObjectInput;
+use s3s::dto::{
+    CopyObjectInput, CopySource, DeleteObjectsInput, ListMultipartUploadsInput,
+    ListObjectVersionsInput, ListObjectsInput, ListObjectsV2Input, PostObjectInput,
+    UploadPartCopyInput,
+};
 use s3s::header::X_AMZ_REQUEST_ID;
 use s3s::host::{MultiDomain, S3Host, VirtualHost};
+use s3s::path::S3Path;
 use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s::{Body, HttpError, HttpResponse, S3Error, S3Request, S3Result, StdError, s3_error};
 use socket2::{SockRef, TcpKeepalive};
@@ -44,6 +50,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::Instrument;
 
 use crate::S3Dal;
+use crate::access::Limit;
 use crate::config::{KeyPair, check_key_pairs};
 use crate::console::{self, Console};
 use crate::live::Live;
@@ -53,7 +60,7 @@ use crate::live::Live;
 pub fn build_service(dal: S3Dal, auth: &LiveAuth, console: Option<Arc<Live>>) -> S3Service {
     let mut b = S3ServiceBuilder::new(dal);
     b.set_auth(KeyAuth(auth.clone()));
-    b.set_access(Access);
+    b.set_access(Access(auth.clone()));
     b.set_host(LiveHost(auth.clone()));
     if let Some(live) = console {
         b.set_route(console::AdminRoute::new(live));
@@ -69,6 +76,8 @@ pub struct LiveAuth(Arc<RwLock<Auth>>);
 #[derive(Default)]
 struct Auth {
     secrets: HashMap<String, SecretKey>,
+    /// Only the pairs that have limits.
+    limits: HashMap<String, Arc<Limit>>,
     /// `None` without domains: s3s's MultiDomain refuses an empty list.
     domains: Option<MultiDomain>,
 }
@@ -89,6 +98,12 @@ impl LiveAuth {
             .iter()
             .map(|p| (p.access_key.clone(), SecretKey::from(p.secret_key.as_str())))
             .collect();
+        let mut limits = HashMap::new();
+        for pair in key_pairs {
+            if let Some(limit) = pair.limit().map_err(anyhow::Error::msg)? {
+                limits.insert(pair.access_key.clone(), Arc::new(limit));
+            }
+        }
         let domains = if domains.is_empty() {
             None
         } else {
@@ -97,8 +112,18 @@ impl LiveAuth {
                     .context("invalid domain for virtual-hosted-style requests")?,
             )
         };
-        *self.0.write().unwrap_or_else(PoisonError::into_inner) = Auth { secrets, domains };
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = Auth {
+            secrets,
+            limits,
+            domains,
+        };
         Ok(())
+    }
+
+    /// The limits of the pair that signed, `None` when it has none.
+    pub(crate) fn limit(&self, credentials: Option<&Credentials>) -> Option<Arc<Limit>> {
+        let key = credentials?.access_key.as_str();
+        self.read().limits.get(key).cloned()
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Auth> {
@@ -152,8 +177,44 @@ impl S3Host for LiveHost {
     }
 }
 
-/// Runs before any operation, so what applies to every operation is decided once.
-struct Access;
+/// Runs before any operation, so what applies to every operation is decided once. Key pair
+/// limits are checked here on the request's path, and in the per-operation methods below on
+/// what only the parsed input names: a listing's prefix, the keys of a batch delete, a form
+/// upload's key and a copy's source.
+struct Access(LiveAuth);
+
+/// Operations that change nothing. Everything else writes, or manages a bucket, which a pair
+/// with limits never may.
+fn reads(op: &str) -> bool {
+    ["Get", "Head", "List"].iter().any(|p| op.starts_with(p)) || op == "SelectObjectContent"
+}
+
+fn denied() -> S3Error {
+    s3_error!(AccessDenied, "Access Denied")
+}
+
+impl Access {
+    fn limit<T>(&self, req: &S3Request<T>) -> Option<Arc<Limit>> {
+        self.0.limit(req.credentials.as_ref())
+    }
+
+    fn listing<T>(&self, req: &S3Request<T>, bucket: &str, prefix: Option<&str>) -> S3Result<()> {
+        match self.limit(req) {
+            Some(l) if !l.reaches_listing(bucket, prefix.unwrap_or_default()) => Err(denied()),
+            _ => Ok(()),
+        }
+    }
+
+    fn source<T>(&self, req: &S3Request<T>, source: &CopySource) -> S3Result<()> {
+        let Some(limit) = self.limit(req) else {
+            return Ok(());
+        };
+        match source {
+            CopySource::Bucket { bucket, key, .. } if limit.reaches_key(bucket, key) => Ok(()),
+            _ => Err(denied()),
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl S3Access for Access {
@@ -171,15 +232,92 @@ impl S3Access for Access {
         if expected_owner.iter().any(|h| cx.headers().contains_key(*h)) {
             return Err(expected_owner_not_implemented());
         }
+        let Some(limit) = self.0.limit(cx.credentials()) else {
+            return Ok(());
+        };
+        let op = cx.s3_op().name();
+        let read = reads(op);
+        let allowed = match cx.s3_path() {
+            // ListBuckets, whose answer leaves out the buckets the pair does not reach.
+            S3Path::Root => read,
+            // Listings check their prefix once it is parsed. A batch delete and a form upload
+            // write objects, whose keys are checked in the same way; any other write to a
+            // bucket manages the bucket itself.
+            S3Path::Bucket { bucket } => {
+                limit.reaches_bucket(bucket)
+                    && (read || (limit.may_write() && matches!(op, "DeleteObjects" | "PostObject")))
+            }
+            S3Path::Object { bucket, key } => {
+                limit.reaches_key(bucket, key) && (read || limit.may_write())
+            }
+        };
+        if !allowed {
+            return Err(denied());
+        }
+        cx.extensions_mut().insert(limit);
         Ok(())
     }
 
-    /// A form upload names the expected owner in a form field, which `check` does not see.
+    /// A form upload names the expected owner and its key in form fields, which `check` does
+    /// not see.
     async fn post_object(&self, req: &mut S3Request<PostObjectInput>) -> S3Result<()> {
         if req.input.expected_bucket_owner.is_some() {
             return Err(expected_owner_not_implemented());
         }
-        Ok(())
+        match self.limit(req) {
+            Some(l) if !l.reaches_key(&req.input.bucket, &req.input.key) => Err(denied()),
+            _ => Ok(()),
+        }
+    }
+
+    /// All or nothing: a batch that names one key outside the pair's folders is refused whole,
+    /// rather than deleting the others and reporting that one.
+    async fn delete_objects(&self, req: &mut S3Request<DeleteObjectsInput>) -> S3Result<()> {
+        let Some(limit) = self.limit(req) else {
+            return Ok(());
+        };
+        let bucket = &req.input.bucket;
+        if req
+            .input
+            .delete
+            .objects
+            .iter()
+            .all(|o| limit.reaches_key(bucket, &o.key))
+        {
+            Ok(())
+        } else {
+            Err(denied())
+        }
+    }
+
+    async fn copy_object(&self, req: &mut S3Request<CopyObjectInput>) -> S3Result<()> {
+        self.source(req, &req.input.copy_source)
+    }
+
+    async fn upload_part_copy(&self, req: &mut S3Request<UploadPartCopyInput>) -> S3Result<()> {
+        self.source(req, &req.input.copy_source)
+    }
+
+    async fn list_objects(&self, req: &mut S3Request<ListObjectsInput>) -> S3Result<()> {
+        self.listing(req, &req.input.bucket, req.input.prefix.as_deref())
+    }
+
+    async fn list_objects_v2(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
+        self.listing(req, &req.input.bucket, req.input.prefix.as_deref())
+    }
+
+    async fn list_object_versions(
+        &self,
+        req: &mut S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<()> {
+        self.listing(req, &req.input.bucket, req.input.prefix.as_deref())
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        req: &mut S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<()> {
+        self.listing(req, &req.input.bucket, req.input.prefix.as_deref())
     }
 }
 

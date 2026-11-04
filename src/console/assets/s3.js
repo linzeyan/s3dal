@@ -33,6 +33,16 @@ function children(node, name) {
   return Array.from(node.getElementsByTagName(name));
 }
 
+// The SHA-512 of a file or part, as S3 sends checksums: base64. Read into memory only while it
+// is hashed; the upload sends the Blob again, which the browser streams from disk, so a part's
+// bytes are not held for as long as it travels.
+async function sha512(blob) {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-512", await blob.arrayBuffer()));
+  return btoa(String.fromCharCode(...digest));
+}
+
+const CHECKSUMS = ["crc32", "crc32c", "crc64nvme", "sha1", "sha256", "sha512", "md5"];
+
 async function errorFrom(res) {
   const body = res.status === 204 || !res.body ? "" : await res.text();
   const requestId = res.headers.get("x-amz-request-id") ?? "";
@@ -146,12 +156,19 @@ export class S3 {
   }
 
   async head(bucket, key) {
-    const res = await this.request("HEAD", objectPath(bucket, key));
+    const res = await this.request("HEAD", objectPath(bucket, key), {
+      headers: { "x-amz-checksum-mode": "ENABLED" },
+    });
     const metadata = [];
     res.headers.forEach((value, name) => {
       if (name.startsWith("x-amz-meta-")) metadata.push([name.slice(11), value]);
     });
+    const checksums = CHECKSUMS.flatMap((alg) => {
+      const value = res.headers.get(`x-amz-checksum-${alg}`);
+      return value ? [{ algorithm: alg, value, type: res.headers.get("x-amz-checksum-type") ?? "" }] : [];
+    });
     return {
+      checksums,
       size: Number(res.headers.get("content-length")),
       contentType: res.headers.get("content-type") ?? "",
       etag: res.headers.get("etag") ?? "",
@@ -160,6 +177,16 @@ export class S3 {
       contentEncoding: res.headers.get("content-encoding") ?? "",
       metadata,
     };
+  }
+
+  async exists(bucket, key) {
+    try {
+      await this.request("HEAD", objectPath(bucket, key));
+      return true;
+    } catch (err) {
+      if (err.status === 404) return false;
+      throw err;
+    }
   }
 
   // The first bytes of an object, for a text preview.
@@ -197,24 +224,30 @@ export class S3 {
   }
 
   // Uploads `file`, reporting progress in bytes. A single PUT up to the threshold, parts above
-  // it. `signal` aborts it; an aborted multipart upload is removed from the server.
-  async upload(bucket, key, file, { onProgress = () => {}, signal } = {}) {
+  // it. Each body carries its SHA-512, which the server checks and keeps: a whole file's for a
+  // PUT, each part's for a multipart upload (S3 has no whole-object SHA checksum for those, only
+  // the composite of the parts'). `ifNoneMatch` fails the upload with PreconditionFailed if the
+  // key exists by the time it would be written. `signal` aborts it; an aborted multipart upload
+  // is removed from the server.
+  async upload(bucket, key, file, { onProgress = () => {}, signal, ifNoneMatch = false } = {}) {
     const contentType = file.type || "application/octet-stream";
+    const condition = ifNoneMatch ? { "if-none-match": "*" } : {};
+    const path = objectPath(bucket, key);
     if (file.size <= MULTIPART_THRESHOLD) {
-      await this.send("PUT", objectPath(bucket, key), [], file, contentType, onProgress, signal);
+      const headers = { "content-type": contentType, "x-amz-checksum-sha512": await sha512(file), ...condition };
+      await this.send("PUT", path, [], file, headers, onProgress, signal);
       return;
     }
-    const path = objectPath(bucket, key);
     const created = await this.request("POST", path, {
       query: [["uploads", ""]],
-      headers: { "content-type": contentType },
+      headers: { "content-type": contentType, "x-amz-checksum-algorithm": "SHA512" },
     });
     const uploadId = text(xml(await created.text()), "UploadId");
     const loaded = new Map();
     const report = () => onProgress([...loaded.values()].reduce((a, b) => a + b, 0));
     try {
       const count = Math.ceil(file.size / PART_SIZE);
-      const etags = new Array(count);
+      const parts = new Array(count);
       let next = 0;
       const worker = async () => {
         while (next < count) {
@@ -224,18 +257,20 @@ export class S3 {
             ["partNumber", String(n + 1)],
             ["uploadId", uploadId],
           ];
-          etags[n] = await this.send("PUT", path, query, part, null, (b) => {
+          const checksum = await sha512(part);
+          const etag = await this.send("PUT", path, query, part, { "x-amz-checksum-sha512": checksum }, (b) => {
             loaded.set(n, b);
             report();
           }, signal);
+          parts[n] = { etag, checksum };
         }
       };
       await Promise.all(Array.from({ length: Math.min(PART_CONCURRENCY, count) }, worker));
       const body =
         "<CompleteMultipartUpload>" +
-        etags.map((e, i) => `<Part><PartNumber>${i + 1}</PartNumber><ETag>${e}</ETag></Part>`).join("") +
+        parts.map((p, i) => `<Part><PartNumber>${i + 1}</PartNumber><ETag>${p.etag}</ETag><ChecksumSHA512>${p.checksum}</ChecksumSHA512></Part>`).join("") +
         "</CompleteMultipartUpload>";
-      const done = await this.request("POST", path, { query: [["uploadId", uploadId]], body });
+      const done = await this.request("POST", path, { query: [["uploadId", uploadId]], body, headers: condition });
       // Complete answers 200 and may still carry an error, sent after the parts were joined.
       const answer = await done.text();
       if (answer.includes("<Error>")) {
@@ -251,8 +286,7 @@ export class S3 {
   // One body upload with XMLHttpRequest, which unlike fetch reports upload progress. The body is
   // not hashed (UNSIGNED-PAYLOAD): hashing a large file first would read it twice. Returns the
   // ETag.
-  async send(method, path, query, body, contentType, onProgress, signal) {
-    const headers = contentType ? { "content-type": contentType } : {};
+  async send(method, path, query, body, headers, onProgress, signal) {
     const req = await this.signed(method, path, {
       query,
       headers,
@@ -287,6 +321,11 @@ export class S3 {
   }
 
   // The server's own settings API, answered on the console's listener only.
+
+  // What the signed-in key pair may reach; the one request a pair with limits may make here.
+  async whoami() {
+    return (await this.request("GET", "/_s3dal/admin/whoami")).json();
+  }
 
   async info() {
     return (await this.request("GET", "/_s3dal/admin/info")).json();

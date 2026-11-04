@@ -19,8 +19,8 @@
 #       never writes compat/: a subset would silently replace the full record.
 #
 # Environment: S3TESTS_TIMEOUT (seconds per test, default 120), S3TESTS_CARGO_FLAGS (extra
-# `cargo build` flags, such as "--features services-s3"), RUST_LOG (the server's log filter),
-# S3TESTS_KEEP=1 (keep the fs root after the run).
+# `cargo build` flags, such as "--features services-s3"), S3DAL_LOG_LEVEL (the server's
+# --log-level), S3TESTS_KEEP=1 (keep the fs root after the run).
 #
 # The s3-tests checkout and its venv are cached under target/s3tests/ and rebuilt only when the
 # ref or the dependency snapshot changes, so only the first run needs network access. Each run
@@ -193,7 +193,7 @@ start_server() {
     # Port 0 lets the OS pick a free port; the server logs the address it bound. s3s at debug
     # logs each request's operation and the error document it got, which is what explains a
     # failing test.
-    NO_COLOR=1 RUST_LOG="${RUST_LOG:-info,s3s=debug}" "$TARGET_DIR/debug/s3dal" serve \
+    NO_COLOR=1 S3DAL_LOG_LEVEL="${S3DAL_LOG_LEVEL:-info,s3s=debug}" "$TARGET_DIR/debug/s3dal" serve \
         "${backend[@]}" --address 127.0.0.1:0 \
         --access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY" \
         >"$RUN_DIR/server.log" 2>&1 &

@@ -1,3 +1,5 @@
+<img src="src/console/assets/icon.svg" alt="" width="88" align="right">
+
 # s3dal
 
 s3dal serves the Amazon S3 API on top of an [Apache OpenDAL](https://opendal.apache.org/)
@@ -25,7 +27,7 @@ handles the protocol (routing, SigV4, XML); OpenDAL handles storage.
 |---|---|---|
 | Stores objects on | A directory, or an S3, Azure Blob or GCS bucket you already have | Drives it manages itself |
 | Durability | The backend's | Erasure coding across drives and nodes |
-| Users, IAM policies | No: every key pair reaches every bucket | Yes |
+| Users, IAM policies | Key pairs limited to buckets or folders, read-only or read-write; no policies | Yes |
 | Versioning, object lock, encryption, lifecycle | No | Yes |
 | Web console | Objects, key pairs, settings | Yes |
 | License | Apache-2.0 | AGPL-3.0 |
@@ -103,6 +105,10 @@ for secrets, which then stay out of shell history and process listings.
 | `--tls-cert` | `S3DAL_TLS_CERT` | | PEM certificate chain; with `--tls-key`, s3dal serves HTTPS only, the console included |
 | `--tls-key` | `S3DAL_TLS_KEY` | | PEM private key of the certificate |
 | `--log-format` | `S3DAL_LOG_FORMAT` | `text` | `text`, or `json` for one object per line; see [Logs](guide/operations.md#logs) |
+| `--log-level` | `S3DAL_LOG_LEVEL` | `info` | A level, then any `target=level`, comma-separated, as in `info,s3dal=debug` |
+| `--log-file` | `S3DAL_LOG_FILE` | | File the log is written to; without it, stderr |
+| `--log-max-size` | `S3DAL_LOG_MAX_SIZE` | `100MiB` | Size past which the log file is renamed to `<file>.1` and a new one started; `0` never rotates |
+| `--log-max-files` | `S3DAL_LOG_MAX_FILES` | `5` | Rotated log files kept |
 
 `s3dal check-config` takes the same flags, variables and file as `serve`, and prints the
 settings `serve` would run with, secrets redacted, or what is wrong with them.
@@ -131,6 +137,8 @@ secret-key = "..."
 [[credentials]]
 access-key = "backup"
 secret-key = "..."
+allow = ["photos", "logs/app/"]
+access = "read-only"
 ```
 
 `domain` or `backend-opt` given by flag or variable replaces the file's whole rather than
@@ -140,13 +148,22 @@ paths are relative to the working directory.
 ### Key pairs
 
 There is no anonymous mode: s3dal does not start without a key pair, and every request must be
-signed (SigV4, in headers, as a presigned URL, or as a POST policy). All key pairs reach the
-same buckets; there is one tenant.
+signed (SigV4, in headers, as a presigned URL, or as a POST policy).
 
-The pair given by `--access-key` and `--secret-key` (or their variables) comes first, and the
-file's `[[credentials]]` are added to it. That pair cannot be removed or changed from the
-console, so the operator always keeps a way in. `s3dal keygen` prints a new random pair in the
-file's form.
+A pair reaches every bucket unless its `[[credentials]]` table limits it:
+
+- `allow` lists the buckets, or folders as `bucket/folder/`, it reaches. A listing must stay
+  inside one, so a pair allowed `photos/2024/` cannot list `photos/` and see the other years.
+- `access = "read-only"` lets it read and list, not write or delete; the default is
+  `"read-write"`.
+- A pair with either limit cannot create or delete buckets, nor use the console's server and
+  settings pages: those reach past any one bucket. ListBuckets names only the buckets it
+  reaches. A batch delete or a copy that names one key outside its folders is refused whole.
+
+The pair given by `--access-key` and `--secret-key` (or their variables) comes first, has no
+limits, and the file's `[[credentials]]` are added to it. That pair cannot be removed or
+changed from the console, so the operator always keeps a way in. `s3dal keygen` prints a new
+random pair in the file's form.
 
 ### Changes while it runs
 
@@ -155,9 +172,9 @@ change within about two seconds; `kill -HUP` applies it at once. Requests in fli
 cut.
 
 - Applied at once: key pairs, `region`, `domain`, `etag-buffer-limit`, `stale-upload-age`,
-  and a renewed certificate and key.
-- `backend`, `backend-opt`, `address`, `console-address`, `log-format`, and turning TLS on or
-  off take a restart. Until then the log, and the console, say a restart is pending.
+  `log-level`, and a renewed certificate and key.
+- `backend`, `backend-opt`, `address`, `console-address`, `log-format`, `log-file`,
+  `log-max-size`, `log-max-files`, and turning TLS on or off take a restart. Until then the log, and the console, say a restart is pending.
 - A file with a mistake changes nothing: the log says what is wrong, and s3dal keeps running
   with the settings it had. `s3dal check-config` shows the same error before you save.
 
@@ -166,12 +183,18 @@ cut.
 `--console-address` (`S3DAL_CONSOLE_ADDRESS`) turns on a web console on a port of its own:
 
 - buckets and objects: browse, filter, upload files and folders by drag and drop (large ones
-  in parallel parts), preview images and text, download, delete, copy a link that expires;
-- key pairs: add and remove;
-- settings: change those that apply at once, and see the rest;
+  in parallel parts, each with a SHA-512 checksum the server verifies and keeps), preview
+  images and text, download, delete, copy a link that expires. An upload asks before it
+  replaces an object of the same name: replace, skip, or keep both under a new name (turned
+  off in Settings, per browser);
+- key pairs: add, remove, and set their limits;
+- settings: change those that apply at once, and save the rest, the backend included, for
+  the next restart; a new backend is probed first, so the restart does not find it broken;
 - server: version, uptime, backend and what it stores natively.
 
-You sign in with any key pair. The console signs each request in the browser with it, as an
+You sign in with any key pair, and see what it may do: a pair with limits sees only its
+buckets and folders, and no write controls if it is read-only. The console signs each request
+in the browser with it, as an
 S3 client does; the secret is kept in the tab's session storage and is sent nowhere. The
 console's page and its settings API answer only on the console port, and settings are saved
 to the config file, comments and all. Without a config file, or with one s3dal cannot write,

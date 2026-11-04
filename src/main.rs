@@ -10,16 +10,18 @@ use futures::FutureExt;
 use s3dal::console::Console;
 use s3dal::live::{self, Live};
 use s3dal::server::LiveAuth;
-use s3dal::{S3Dal, backend, server};
+use s3dal::{S3Dal, backend, logging, server};
 use tokio::net::TcpListener;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::reload;
 
 fn main() -> anyhow::Result<()> {
     limit_malloc_arenas();
     let cli = Cli::load();
     match cli.command {
         Command::Serve(args) => {
-            init_logging(args.log_format);
+            init_logging(&args)?;
             serve(args)
         }
         Command::CheckConfig(args) => {
@@ -33,26 +35,39 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn init_logging(format: LogFormat) {
-    // s3s logs every error answer, a client's unsigned request included, at ERROR, in two or
-    // three lines; the access log says the same in one line at the right level. s3dal logs the
-    // failures that are its own. `RUST_LOG=info,s3s=debug` brings s3s's lines back.
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,s3s=off"));
-    // stderr, with clap's errors: logs are diagnostics, not the output of a command.
-    let logs = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(filter);
-    match format {
-        LogFormat::Json => logs.json().init(),
-        LogFormat::Text => {
-            // Colors only on a terminal: tracing-subscriber colors by default, which leaves
-            // escape codes in `docker logs`, journald and log files.
-            let ansi = std::io::stderr().is_terminal()
-                && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
-            logs.with_ansi(ansi).init();
+/// Behind a reload layer, so a config reload can change `--log-level` without a restart;
+/// `logging::filter` says why s3s is off by default.
+fn init_logging(args: &ServeArgs) -> anyhow::Result<()> {
+    // `--log-level` was checked when the settings were read.
+    let filter = logging::filter(&args.log_level).map_err(|e| anyhow::anyhow!(e))?;
+    let (filter, handle) = reload::Layer::new(filter);
+    logging::set_reload_handle(handle);
+    // stderr by default, with clap's errors: logs are diagnostics, not the output of a command.
+    let (writer, terminal) = match &args.log_file {
+        Some(path) => {
+            let file = logging::RotatingFile::open(path, args.log_max_size, args.log_max_files)
+                .with_context(|| format!("cannot open the log file {}", path.display()))?;
+            (BoxMakeWriter::new(file), false)
         }
-    }
+        None => (
+            BoxMakeWriter::new(std::io::stderr),
+            std::io::stderr().is_terminal(),
+        ),
+    };
+    let logs = tracing_subscriber::fmt::layer().with_writer(writer);
+    let logs = match args.log_format {
+        LogFormat::Json => logs.json().boxed(),
+        // Colors only on a terminal: tracing-subscriber colors by default, which leaves escape
+        // codes in `docker logs`, journald and log files.
+        LogFormat::Text => logs
+            .with_ansi(terminal && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()))
+            .boxed(),
+    };
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(logs)
+        .init();
+    Ok(())
 }
 
 #[tokio::main(flavor = "current_thread")]

@@ -2,7 +2,10 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{ACCESS_KEY, Backend, SECRET_KEY, client, raw_request, raw_response, signed_headers};
+use common::{
+    ACCESS_KEY, Backend, SECRET_KEY, client, raw_request, raw_response, signed_headers,
+    signed_headers_as,
+};
 use s3dal::config::Cli;
 use s3dal::console::Console;
 use s3dal::live::Live;
@@ -196,8 +199,8 @@ async fn a_console_edit_is_written_to_the_file_and_applied_at_once() {
     // file), and leave what the operator wrote by hand in the file as it was.
     let server = ConsoleServer::start(CONFIG, &[]).await;
     let edit = r#"{"settings":{"stale-upload-age":"12h"},
-        "credentials":[{"access_key":"s3dal-test-access"},
-                       {"access_key":"bob","secret_key":"bob-secret-key"}]}"#;
+        "credentials":[{"access_key":"s3dal-test-access","access":"read-write"},
+                       {"access_key":"bob","secret_key":"bob-secret-key","access":"read-write"}]}"#;
     let (status, body) = server.api("PUT", "/_s3dal/admin/config", edit).await;
     assert_eq!(status, 200, "{body}");
 
@@ -225,13 +228,65 @@ async fn a_console_edit_the_server_refuses_leaves_the_file_as_it_was() {
     for edit in [
         r#"{"settings":{"etag-buffer-limit":"8MB"}}"#,
         r#"{"settings":{"backend":"s3"}}"#,
-        r#"{"credentials":[{"access_key":"s3dal-test-access"},{"access_key":"new"}]}"#,
-        r#"{"credentials":[{"access_key":"s3dal-test-access"},{"access_key":"weak","secret_key":"short"}]}"#,
+        r#"{"credentials":[{"access_key":"s3dal-test-access","access":"read-write"},{"access_key":"new","access":"read-write"}]}"#,
+        r#"{"credentials":[{"access_key":"s3dal-test-access","access":"read-write"},{"access_key":"weak","secret_key":"short","access":"read-write"}]}"#,
+        // A limit the server cannot read must not reach the file either.
+        r#"{"credentials":[{"access_key":"s3dal-test-access","access":"read-write"},{"access_key":"bob","secret_key":"bob-secret-key","access":"read-write","allow":[]}]}"#,
+        // Listing pairs without their limits would lift them; the field is required.
+        r#"{"credentials":[{"access_key":"s3dal-test-access"}]}"#,
+        r#"{"settings":{"log-max-files":"many"}}"#,
     ] {
         let (status, body) = server.api("PUT", "/_s3dal/admin/config", edit).await;
         assert_eq!(status, 400, "{edit}: {body}");
         assert_eq!(server.file_text(), CONFIG, "{edit}");
     }
+}
+
+#[tokio::test]
+async fn a_key_pair_with_limits_signs_in_but_cannot_reach_the_settings() {
+    // The settings hold every key pair and the backend, which reach past any one folder; the
+    // console still needs to learn what such a pair may do, to show only that.
+    let config = format!(
+        "{CONFIG}\n[[credentials]]\naccess-key = \"viewer\"\nsecret-key = \"viewer-secret\"\n\
+         allow = [\"photos/2024/\"]\naccess = \"read-only\"\n"
+    );
+    let server = ConsoleServer::start(&config, &[]).await;
+    let as_viewer = |method: &'static str, path: &'static str| {
+        let headers = signed_headers_as(
+            &server.console,
+            method,
+            path,
+            "",
+            &[],
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "viewer",
+            "viewer-secret",
+        );
+        let console = server.console.clone();
+        async move {
+            let h: Vec<(&str, &str)> = headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            let (status, body) =
+                raw_request(&console, method, &format!("/s3{path}"), &h, b"").await;
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+    let (status, body) = as_viewer("GET", "/_s3dal/admin/whoami").await;
+    assert_eq!(status, 200, "{body}");
+    let me: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(me["admin"], false);
+    assert_eq!(me["write"], false);
+    assert_eq!(me["allow"][0]["bucket"], "photos");
+    assert_eq!(me["allow"][0]["prefix"], "2024/");
+    for path in ["/_s3dal/admin/config", "/_s3dal/admin/info"] {
+        let (status, body) = as_viewer("GET", path).await;
+        assert_eq!(status, 403, "{path}: {body}");
+    }
+    // A pair without limits is told so.
+    let (_, body) = server.api("GET", "/_s3dal/admin/whoami", "").await;
+    assert!(body.contains("\"admin\":true"), "{body}");
 }
 
 #[tokio::test]

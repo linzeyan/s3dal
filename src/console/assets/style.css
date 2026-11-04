@@ -667,6 +667,35 @@ textarea.input {
   text-align: right;
 }
 
+.col-actions.wide {
+  width: 96px;
+  white-space: nowrap;
+}
+
+/* Backend options: a name and a value per row, under the setting's description. */
+.opt-setting {
+  align-items: start;
+}
+
+.opt-editor {
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+}
+
+.opt-list {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+}
+
+.opt-row {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
 .name-cell {
   display: flex;
   align-items: center;
@@ -959,8 +988,34 @@ a.name-cell:hover span,
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   padding: 10px 10px 10px 16px;
-  border-bottom: 1px solid var(--border);
+}
+
+.upload-heading {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.upload-actions {
+  display: flex;
+  gap: 2px;
+}
+
+/* Points down while open: pressing it sends the panel down to its header. */
+.upload-toggle .icon {
+  transform: rotate(90deg);
+  transition: transform 160ms;
+}
+
+.uploads.collapsed .upload-toggle .icon {
+  transform: rotate(-90deg);
+}
+
+.progress.upload-total {
+  height: 3px;
+  border-radius: 0;
 }
 
 .upload-list {
@@ -968,6 +1023,34 @@ a.name-cell:hover span,
   padding: 4px 0;
   list-style: none;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  border-top: 1px solid var(--border);
+}
+
+.uploads.collapsed .upload-list {
+  display: none;
+}
+
+.check-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.check-field input,
+.check-setting input {
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
+}
+
+.check-setting {
+  grid-template-columns: minmax(0, 1fr) auto;
+  cursor: pointer;
+  border-bottom: 0;
 }
 
 .upload-item {
@@ -995,6 +1078,10 @@ a.name-cell:hover span,
 
 .upload-status.failed {
   color: var(--danger);
+}
+
+.upload-status:empty {
+  display: none;
 }
 
 .progress {

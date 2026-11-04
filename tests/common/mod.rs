@@ -131,10 +131,7 @@ impl TestServer {
     }
 
     pub async fn start_on(backend: Backend, settings: Settings) -> Self {
-        let keys = [KeyPair {
-            access_key: ACCESS_KEY.to_owned(),
-            secret_key: SECRET_KEY.to_owned(),
-        }];
+        let keys = [KeyPair::new(ACCESS_KEY, SECRET_KEY)];
         Self::start_serving(backend, settings, &keys, None).await
     }
 
@@ -334,6 +331,23 @@ pub fn signed_headers(
     headers: &[(&str, &str)],
     payload: &str,
 ) -> Vec<(String, String)> {
+    signed_headers_as(
+        endpoint, method, path, query, headers, payload, ACCESS_KEY, SECRET_KEY,
+    )
+}
+
+/// [`signed_headers`] for another key pair.
+#[allow(clippy::too_many_arguments)]
+pub fn signed_headers_as(
+    endpoint: &str,
+    method: &str,
+    path: &str,
+    query: &str,
+    headers: &[(&str, &str)],
+    payload: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Vec<(String, String)> {
     let hmac = |key: &[u8], data: &str| {
         let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
         mac.update(data.as_bytes());
@@ -373,11 +387,11 @@ pub fn signed_headers(
     );
     let key = [date, "us-east-1", "s3", "aws4_request"]
         .iter()
-        .fold(format!("AWS4{SECRET_KEY}").into_bytes(), |key, part| {
+        .fold(format!("AWS4{secret_key}").into_bytes(), |key, part| {
             hmac(&key, part)
         });
     let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={ACCESS_KEY}/{scope}, SignedHeaders={names}, Signature={}",
+        "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={names}, Signature={}",
         hex(&hmac(&key, &to_sign))
     );
     signed.retain(|(k, _)| k != "host");

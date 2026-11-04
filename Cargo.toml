@@ -1,6 +1,6 @@
 [package]
 name = "s3dal"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # s3s 0.17 requires 1.96.
 rust-version = "1.96"
@@ -51,8 +51,10 @@ async-trait = "0.1"
 # Content-MD5 is base64 of the digest.
 base64-simd = "0.8"
 bytes = "1"
-# `string`: values read from the config file become flag defaults at runtime.
-clap = { version = "4.6", features = ["derive", "env", "string"] }
+# `string`: values read from the config file become flag defaults at runtime. `wrap_help`: help
+# text wraps at the terminal's width, where unwrapped it ran past the edge and the terminal's own
+# wrapping put the rest of a line into the command column.
+clap = { version = "4.6", features = ["derive", "env", "string", "wrap_help"] }
 futures = "0.3"
 # Already compiled for uuid. `keygen` draws key pairs from the OS generator.
 getrandom = "0.4"

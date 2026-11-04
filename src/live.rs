@@ -62,6 +62,10 @@ impl Live {
         &self.dal
     }
 
+    pub(crate) fn auth(&self) -> &LiveAuth {
+        &self.auth
+    }
+
     /// The settings whose values changed since startup but take a restart to apply.
     pub fn pending_restart(&self) -> Vec<&'static str> {
         restart_only_changes(&self.started, &self.lock())
@@ -84,6 +88,9 @@ impl Live {
             live.set(certified);
         }
         self.dal.set_settings(args.settings());
+        if args.log_level != current.log_level {
+            crate::logging::set_level(&args.log_level);
+        }
         *current = args;
         Ok(())
     }
@@ -117,6 +124,15 @@ fn restart_only_changes(started: &ServeArgs, now: &ServeArgs) -> Vec<&'static st
     }
     if started.log_format != now.log_format {
         changed.push("log-format");
+    }
+    if started.log_file != now.log_file {
+        changed.push("log-file");
+    }
+    if started.log_max_size != now.log_max_size {
+        changed.push("log-max-size");
+    }
+    if started.log_max_files != now.log_max_files {
+        changed.push("log-max-files");
     }
     if started.console_address != now.console_address {
         changed.push("console-address");

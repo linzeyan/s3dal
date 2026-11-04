@@ -101,7 +101,7 @@ start_server() {
     # Port 0 lets the OS pick a free port; the server logs the address it bound.
     # s3s::ops at debug logs the operation each request resolved to, which shows what a
     # client actually called when a step fails.
-    NO_COLOR=1 RUST_LOG="${RUST_LOG:-info,s3s::ops=debug}" "$TARGET_DIR/debug/s3dal" serve \
+    NO_COLOR=1 S3DAL_LOG_LEVEL="${S3DAL_LOG_LEVEL:-info,s3s::ops=debug}" "$TARGET_DIR/debug/s3dal" serve \
         "${backend[@]}" --address 127.0.0.1:0 \
         --access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY" \
         >"$LOG_DIR/server.log" 2>&1 &

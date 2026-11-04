@@ -387,10 +387,149 @@ async fn a_backend_trusted_with_write_conditions_checks_them_on_multipart_writes
 }
 
 fn pair(access_key: &str, secret_key: &str) -> KeyPair {
-    KeyPair {
-        access_key: access_key.to_owned(),
-        secret_key: secret_key.to_owned(),
+    KeyPair::new(access_key, secret_key)
+}
+
+#[tokio::test]
+async fn a_key_pair_with_limits_reaches_only_its_buckets_and_folders() {
+    // A pair handed to one team or job must not read, list or change what lies outside the
+    // folders it was given, by any of the paths S3 offers: a listing of the parent, a batch
+    // delete, a copy that reads another folder, or bucket management.
+    let mut viewer = pair("viewer", "viewer-secret");
+    viewer.allow = Some(vec!["photos/2024".into()]);
+    viewer.access = s3dal::access::Access::ReadOnly;
+    let mut writer = pair("writer", "writer-secret");
+    writer.allow = Some(vec!["logs".into()]);
+    let keys = [pair("admin", "admin-secret"), viewer, writer];
+    let server =
+        TestServer::start_serving(Backend::from_env().await, Settings::default(), &keys, None)
+            .await;
+    let admin = client(&server.endpoint, "admin", "admin-secret");
+    let viewer = client(&server.endpoint, "viewer", "viewer-secret");
+    let writer = client(&server.endpoint, "writer", "writer-secret");
+    for bucket in ["photos", "logs", "other"] {
+        admin.create_bucket().bucket(bucket).send().await.unwrap();
     }
+    for key in ["2024/a.jpg", "2023/b.jpg", "2024-old/c.jpg"] {
+        let body = ByteStream::from_static(b"x");
+        admin
+            .put_object()
+            .bucket("photos")
+            .key(key)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+    }
+    let denied = |r: Result<(), Option<String>>, what: &str| {
+        assert_eq!(r.unwrap_err().as_deref(), Some("AccessDenied"), "{what}");
+    };
+    let code = |e: &dyn ProvideErrorMetadata| e.code().map(str::to_owned);
+
+    // The listing of buckets names only the ones the pair reaches.
+    let names: Vec<String> = viewer
+        .list_buckets()
+        .send()
+        .await
+        .unwrap()
+        .buckets()
+        .iter()
+        .filter_map(|b| b.name().map(str::to_owned))
+        .collect();
+    assert_eq!(names, ["photos"]);
+
+    viewer
+        .get_object()
+        .bucket("photos")
+        .key("2024/a.jpg")
+        .send()
+        .await
+        .unwrap();
+    for key in ["2023/b.jpg", "2024-old/c.jpg"] {
+        let r = viewer.get_object().bucket("photos").key(key).send().await;
+        denied(r.map(|_| ()).map_err(|e| code(&e)), key);
+    }
+    viewer
+        .list_objects_v2()
+        .bucket("photos")
+        .prefix("2024/")
+        .send()
+        .await
+        .unwrap();
+    let r = viewer
+        .list_objects_v2()
+        .bucket("photos")
+        .delimiter("/")
+        .send()
+        .await;
+    denied(
+        r.map(|_| ()).map_err(|e| code(&e)),
+        "listing the parent folder",
+    );
+    let r = viewer
+        .put_object()
+        .bucket("photos")
+        .key("2024/new.jpg")
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await;
+    denied(
+        r.map(|_| ()).map_err(|e| code(&e)),
+        "a read-only pair writing",
+    );
+
+    writer
+        .put_object()
+        .bucket("logs")
+        .key("app.log")
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap();
+    let r = writer.create_bucket().bucket("mine").send().await;
+    denied(r.map(|_| ()).map_err(|e| code(&e)), "creating a bucket");
+    let r = writer.delete_bucket().bucket("logs").send().await;
+    denied(
+        r.map(|_| ()).map_err(|e| code(&e)),
+        "deleting its own bucket",
+    );
+    let r = writer
+        .copy_object()
+        .bucket("logs")
+        .key("stolen.jpg")
+        .copy_source("photos/2024/a.jpg")
+        .send()
+        .await;
+    denied(
+        r.map(|_| ()).map_err(|e| code(&e)),
+        "copying from a folder it does not reach",
+    );
+    let delete = aws_sdk_s3::types::Delete::builder()
+        .objects(
+            aws_sdk_s3::types::ObjectIdentifier::builder()
+                .key("app.log")
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    let r = writer
+        .delete_objects()
+        .bucket("photos")
+        .delete(delete.clone())
+        .send()
+        .await;
+    denied(
+        r.map(|_| ()).map_err(|e| code(&e)),
+        "a batch delete in another bucket",
+    );
+    writer
+        .delete_objects()
+        .bucket("logs")
+        .delete(delete)
+        .send()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -996,7 +1135,7 @@ async fn start_binary(
         .env_clear()
         .env("S3DAL_ACCESS_KEY", ACCESS_KEY)
         .env("S3DAL_SECRET_KEY", SECRET_KEY)
-        .env("RUST_LOG", "info")
+        .env("S3DAL_LOG_LEVEL", "info")
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
@@ -1451,6 +1590,8 @@ async fn a_config_file_with_a_mistake_leaves_the_running_settings_alone() {
         // Valid TOML, but the region would change while the key pairs cannot.
         "region = \"us-west-2\"\n[[credentials]]\naccess-key = \"a\"\nsecret-key = \"x\"\n\
          [[credentials]]\naccess-key = \"a\"\nsecret-key = \"y\"\n",
+        // A log level that would enable nothing: the region must not change without it.
+        &format!("region = \"us-west-2\"\nlog-level = \"verbose\"\n{ALICE}"),
     ] {
         std::fs::write(file.path(), broken).unwrap();
         assert!(live.reload().is_err(), "{broken}");
@@ -1466,11 +1607,14 @@ async fn settings_that_need_a_restart_are_reported_rather_than_half_applied() {
     let (server, live, file) = start_live(ALICE, None).await;
     std::fs::write(
         file.path(),
-        format!("address = \"127.0.0.1:1\"\nregion = \"eu-west-1\"\n{ALICE}"),
+        format!(
+            "address = \"127.0.0.1:1\"\nregion = \"eu-west-1\"\nlog-max-size = \"1MiB\"\n{ALICE}"
+        ),
     )
     .unwrap();
     live.reload().unwrap();
-    assert_eq!(live.pending_restart(), ["address"]);
+    // The log file stays open as it was; a new size limit waits for the restart that reopens it.
+    assert_eq!(live.pending_restart(), ["address", "log-max-size"]);
     assert_eq!(server.dal.settings().region, "eu-west-1");
 }
 

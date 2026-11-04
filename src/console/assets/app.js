@@ -23,17 +23,33 @@ const SESSION = "s3dal-session";
 
 let s3 = null;
 let signedInAs = "";
+// What the signed-in pair may reach, from the server: { admin, write, allow }. The page shows
+// only what it can do; the server checks every request regardless.
+let me = null;
+
+const isAdmin = () => me?.admin === true;
+const canWrite = () => me?.write === true;
+
+// The folders of `bucket` the pair is limited to, or null when it reaches the whole bucket.
+function scopesIn(bucket) {
+  if (!me?.allow) return null;
+  const prefixes = me.allow.filter((a) => a.bucket === bucket).map((a) => a.prefix);
+  return prefixes.includes("") ? null : prefixes;
+}
 
 function fail(err) {
   const d = describeError(err);
   if (d) toast(d.message, { kind: "error", detail: d.detail });
 }
 
-function restore() {
+// Asked again on every load rather than kept: the pair's limits may have changed since.
+async function restore() {
   try {
     const { accessKey, secretKey } = JSON.parse(sessionStorage.getItem(SESSION) ?? "null") ?? {};
     if (!accessKey || !secretKey) return;
-    s3 = new S3({ accessKey, secretKey, region: REGION });
+    const candidate = new S3({ accessKey, secretKey, region: REGION });
+    me = await candidate.whoami();
+    s3 = candidate;
     signedInAs = accessKey;
   } catch {
     sessionStorage.removeItem(SESSION);
@@ -43,6 +59,7 @@ function restore() {
 function signOut() {
   sessionStorage.removeItem(SESSION);
   s3 = null;
+  me = null;
   signedInAs = "";
   history.replaceState(null, "", "#/");
   render();
@@ -121,9 +138,8 @@ function loginView() {
       error.textContent = "";
       const candidate = new S3({ accessKey: access.value.trim(), secretKey: secret.value, region: REGION });
       try {
-        // Any signed request proves the pair; this one also tells the console it may use the
-        // settings API.
-        await candidate.info();
+        // Any signed request proves the pair; this one also says what it may reach.
+        me = await candidate.whoami();
         sessionStorage.setItem(SESSION, JSON.stringify({ accessKey: candidate.creds.accessKey, secretKey: secret.value }));
         s3 = candidate;
         signedInAs = candidate.creds.accessKey;
@@ -160,8 +176,8 @@ function shell(active, ...content) {
       h("a", { class: "brand", href: "#/" }, logo(), "s3dal"),
       h("div", { class: "nav" },
         link("#/", "bucket", "Buckets", "buckets"),
-        link("#/server", "server", "Server", "server"),
-        link("#/settings", "settings", "Settings", "settings"),
+        isAdmin() && link("#/server", "server", "Server", "server"),
+        isAdmin() && link("#/settings", "settings", "Settings", "settings"),
       ),
       h("div", { class: "sidebar-foot" },
         h("div", { class: "whoami", title: `Signed in as ${signedInAs}` }, icon("key"), h("span", { class: "mono truncate" }, signedInAs)),
@@ -181,8 +197,10 @@ function bucketsView() {
     try {
       const buckets = (await s3.listBuckets()).sort((a, b) => a.name.localeCompare(b.name));
       if (!buckets.length) {
-        body.replaceChildren(emptyState("bucket", "No buckets yet", "A bucket holds objects. Create one to start uploading.",
-          h("button", { class: "button primary", onclick: createBucket }, icon("plus"), "Create bucket")));
+        body.replaceChildren(isAdmin()
+          ? emptyState("bucket", "No buckets yet", "A bucket holds objects. Create one to start uploading.",
+            h("button", { class: "button primary", onclick: createBucket }, icon("plus"), "Create bucket"))
+          : emptyState("bucket", "No buckets", "This key pair reaches no existing bucket."));
         return;
       }
       body.replaceChildren(h("table", { class: "table" },
@@ -190,7 +208,7 @@ function bucketsView() {
         h("tbody", {}, buckets.map((b) => h("tr", {},
           h("td", {}, h("a", { class: "name-cell", href: bucketHref(b.name, "") }, icon("bucket"), h("span", { class: "truncate" }, b.name))),
           h("td", { class: "col-date muted" }, formatDate(b.created)),
-          h("td", { class: "col-actions" },
+          h("td", { class: "col-actions" }, isAdmin() &&
             h("button", { class: "icon-button", title: `Delete ${b.name}`, "aria-label": `Delete ${b.name}`, onclick: () => deleteBucket(b.name, load) }, icon("trash"))),
         ))),
       ));
@@ -199,8 +217,9 @@ function bucketsView() {
     }
   };
   load();
+  // Managing buckets reaches past any one bucket, which a pair with limits never may.
   return shell("buckets",
-    pageHeader("Buckets", [h("button", { class: "button primary", onclick: createBucket }, icon("plus"), "Create bucket")]),
+    pageHeader("Buckets", [isAdmin() && h("button", { class: "button primary", onclick: createBucket }, icon("plus"), "Create bucket")]),
     body);
 }
 
@@ -256,6 +275,11 @@ function isText(key, contentType) {
 
 function browserView(bucket, prefix) {
   const state = { folders: [], objects: [], next: null, selected: new Set(), filter: "", active: null };
+  // A pair limited to folders of this bucket cannot list the levels above them, which would
+  // show the names of the others; there the page shows the way down to its folders instead.
+  const scopes = scopesIn(bucket);
+  const inScope = !scopes || scopes.some((p) => prefix.startsWith(p));
+  const writable = canWrite() && inScope;
   const tbody = h("tbody");
   const table = h("table", { class: "table selectable" });
   const body = h("section", { class: "panel" }, loadingRows());
@@ -316,7 +340,7 @@ function browserView(bucket, prefix) {
     const rows = visible();
     tbody.replaceChildren(...rows.map(row));
     const n = state.selected.size;
-    deleteButton.hidden = n === 0;
+    deleteButton.hidden = n === 0 || !writable;
     deleteButton.lastChild.textContent = n ? `Delete ${n}` : "Delete";
     selectAll.checked = rows.length > 0 && rows.every((r) => state.selected.has(r.key));
     selectAll.indeterminate = n > 0 && !selectAll.checked;
@@ -324,9 +348,11 @@ function browserView(bucket, prefix) {
     count.textContent = `${total.toLocaleString()} item${total === 1 ? "" : "s"}${state.next ? " loaded" : ""}`;
     footer.replaceChildren(count, state.next ? more : "");
     if (!rows.length && !state.filter) {
-      body.replaceChildren(emptyState("folder", prefix ? "This folder is empty" : "This bucket is empty",
-        "Drop files anywhere on this page, or use Upload.",
-        h("button", { class: "button primary", onclick: () => fileInput.click() }, icon("upload"), "Upload files")));
+      body.replaceChildren(writable
+        ? emptyState("folder", prefix ? "This folder is empty" : "This bucket is empty",
+          "Drop files anywhere on this page, or use Upload.",
+          h("button", { class: "button primary", onclick: () => fileInput.click() }, icon("upload"), "Upload files"))
+        : emptyState("folder", prefix ? "This folder is empty" : "This bucket is empty", "This key pair can read here, not write."));
     } else if (!body.contains(table)) {
       body.replaceChildren(table, footer);
     }
@@ -353,6 +379,12 @@ function browserView(bucket, prefix) {
   }
 
   async function load(reset = true) {
+    if (!inScope) {
+      const next = new Set(scopes.filter((p) => p.startsWith(prefix)).map((p) => prefix + p.slice(prefix.length).split("/")[0] + "/"));
+      Object.assign(state, { folders: [...next].sort(), objects: [], next: null });
+      paint();
+      return;
+    }
     try {
       if (reset) {
         state.next = null;
@@ -407,7 +439,7 @@ function browserView(bucket, prefix) {
       h("div", { class: "drawer-actions" },
         h("button", { class: "button primary", onclick: () => download(entry.key) }, icon("download"), "Download"),
         h("button", { class: "button", onclick: () => shareLink(entry.key) }, icon("link"), "Copy link"),
-        h("button", { class: "icon-button danger-text", title: "Delete", "aria-label": `Delete ${name}`, onclick: () => deleteKeys([entry.key]) }, icon("trash"))),
+        writable && h("button", { class: "icon-button danger-text", title: "Delete", "aria-label": `Delete ${name}`, onclick: () => deleteKeys([entry.key]) }, icon("trash"))),
       props,
     );
     drawer.hidden = false;
@@ -421,6 +453,7 @@ function browserView(bucket, prefix) {
         ...prop("Last modified", formatDate(meta.modified)),
         ...prop("Content type", meta.contentType, true),
         ...prop("ETag", meta.etag, true),
+        ...meta.checksums.flatMap((c) => prop(`Checksum (${CHECKSUM_NAMES[c.algorithm] ?? c.algorithm})`, checksumText(c), true)),
         ...prop("Cache control", meta.cacheControl, true),
         ...prop("Content encoding", meta.contentEncoding, true),
         ...meta.metadata.flatMap(([k, v]) => prop(`x-amz-meta-${k}`, v, true)),
@@ -545,20 +578,22 @@ function browserView(bucket, prefix) {
     pageHeader("", [
       deleteButton,
       h("button", { class: "icon-button", title: "Refresh", "aria-label": "Refresh", onclick: () => load() }, icon("refresh")),
-      h("button", { class: "button", onclick: newFolder }, icon("plus"), "New folder"),
-      h("button", { class: "button", onclick: () => folderInput.click() }, icon("folder"), "Upload folder"),
-      h("button", { class: "button primary", onclick: () => fileInput.click() }, icon("upload"), "Upload"),
+      writable && [
+        h("button", { class: "button", onclick: newFolder }, icon("plus"), "New folder"),
+        h("button", { class: "button", onclick: () => folderInput.click() }, icon("folder"), "Upload folder"),
+        h("button", { class: "button primary", onclick: () => fileInput.click() }, icon("upload"), "Upload"),
+      ],
     ], crumbs),
     h("div", { class: "toolbar" }, filter),
     body, drawer, overlay, fileInput, folderInput,
   );
   view.addEventListener("dragenter", (e) => {
-    if (![...e.dataTransfer.types].includes("Files")) return;
+    if (!writable || ![...e.dataTransfer.types].includes("Files")) return;
     dragDepth++;
     overlay.hidden = false;
   });
   view.addEventListener("dragover", (e) => {
-    if ([...e.dataTransfer.types].includes("Files")) e.preventDefault();
+    if (writable && [...e.dataTransfer.types].includes("Files")) e.preventDefault();
   });
   view.addEventListener("dragleave", () => {
     if (--dragDepth <= 0) {
@@ -570,6 +605,7 @@ function browserView(bucket, prefix) {
     e.preventDefault();
     dragDepth = 0;
     overlay.hidden = true;
+    if (!writable) return;
     const files = await filesFromDrop(e.dataTransfer.items);
     if (files.length) enqueue(files);
   });
@@ -580,7 +616,7 @@ function browserView(bucket, prefix) {
       filter.focus();
     } else if (e.key === "Escape" && !drawer.hidden && !document.querySelector("dialog[open]")) {
       closeDetails();
-    } else if ((e.key === "Delete" || (e.key === "Backspace" && e.metaKey)) && !typing && state.selected.size) {
+    } else if ((e.key === "Delete" || (e.key === "Backspace" && e.metaKey)) && !typing && state.selected.size && writable) {
       deleteSelected();
     }
   };
@@ -589,102 +625,271 @@ function browserView(bucket, prefix) {
   return view;
 }
 
+const CHECKSUM_NAMES = {
+  crc32: "CRC32", crc32c: "CRC32C", crc64nvme: "CRC64NVME", sha1: "SHA-1", sha256: "SHA-256", sha512: "SHA-512", md5: "MD5",
+};
+
+// In hex, as `shasum -a 512` prints it, so it can be compared with a local file's. A multipart
+// upload's is the checksum of its parts' checksums ("…-3" from S3), which no local tool computes.
+function checksumText({ value, type }) {
+  const [, b64, parts] = /^([^-]*)(?:-(\d+))?$/.exec(value) ?? [];
+  let hex;
+  try {
+    hex = Array.from(atob(b64), (c) => c.charCodeAt(0).toString(16).padStart(2, "0")).join("");
+  } catch {
+    return value;
+  }
+  return parts || type === "COMPOSITE" ? `${hex} (of ${parts ?? "its"} parts)` : hex;
+}
+
 // Folders made in this tab, as "bucket/prefix/". s3dal lists a prefix only once it holds an
 // object, so a new folder would vanish from its parent until something is uploaded into it.
 const madeFolders = new Set();
 
 // ----- Uploads -----
 
+// Whether an upload asks before it replaces an object of the same name. Kept per browser: it is
+// how this person works, not a setting of the server.
+const ASK_REPLACE = "s3dal-ask-replace";
+const askBeforeReplacing = () => localStorage.getItem(ASK_REPLACE) !== "0";
+
+const FINISHED = new Set(["done", "skipped", "cancelled", "failed"]);
+
+// "a/b (1).txt", "a/b (2).txt", ...: the first name under which nothing exists yet.
+async function freeKey(bucket, key) {
+  const slash = key.lastIndexOf("/") + 1;
+  const name = key.slice(slash);
+  const dot = name.lastIndexOf(".");
+  const [base, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ""];
+  for (let n = 1; ; n++) {
+    const candidate = `${key.slice(0, slash)}${base} (${n})${ext}`;
+    if (!(await s3.exists(bucket, candidate))) return candidate;
+  }
+}
+
+// The panel is built once and its rows are updated in place. Rebuilt on every change, as it
+// was, it lost its scroll position many times a second, and showing only the newest 200 rows
+// hid the files being uploaded from a folder of more.
 const uploads = {
   items: [],
   panel: null,
+  collapsed: false,
+  // Keeps the file being uploaded in view until the user scrolls the list themselves.
+  follow: true,
+  asking: Promise.resolve(),
+  scheduled: false,
 
   add(bucket, prefix, files, onDone) {
-    const batch = files.map(([path, file]) => ({
+    const batch = { decision: null };
+    const items = files.map(([path, file]) => ({
       key: prefix + path,
+      prefix,
       bucket,
       file,
+      size: file.size,
       loaded: 0,
       status: "queued",
       controller: new AbortController(),
+      batch,
     }));
-    this.items.push(...batch);
-    this.paint();
-    pool(batch, 3, async (item) => {
-      if (item.status === "cancelled") return;
-      item.status = "uploading";
-      this.paint();
-      try {
-        await s3.upload(item.bucket, item.key, item.file, {
-          signal: item.controller.signal,
-          onProgress: (b) => {
-            item.loaded = b;
-            this.paintItem(item);
-          },
-        });
-        item.status = "done";
-      } catch (err) {
-        item.status = err?.name === "AbortError" ? "cancelled" : "failed";
-        item.error = describeError(err)?.message;
-      }
-      this.paint();
-    }).then(() => {
+    this.items.push(...items);
+    this.build();
+    this.follow = true;
+    this.list.append(...items.map((item) => this.row(item)));
+    this.update();
+    pool(items, 3, (item) => this.run(item)).then(() => {
       onDone();
       // A finished batch gets out of the way; one with failures stays until dismissed, so
-      // the user sees which files did not make it.
+      // the user sees which files did not make it, and so does one the user has scrolled
+      // through, which would otherwise vanish under the pointer.
       setTimeout(() => {
-        const idle = this.items.every((i) => i.status === "done" || i.status === "cancelled");
-        if (idle) {
-          this.items = [];
-          this.paint();
-        }
+        if (this.follow && this.items.every((i) => FINISHED.has(i.status) && i.status !== "failed")) this.clear();
       }, 4000);
     });
   },
 
-  paintItem(item) {
-    const pct = item.file.size ? Math.min(100, (item.loaded / item.file.size) * 100) : 100;
-    item.bar?.style.setProperty("--progress", `${pct}%`);
-    if (item.meta) item.meta.textContent = `${formatBytes(item.loaded)} of ${formatBytes(item.file.size)}`;
+  async run(item) {
+    if (item.status === "cancelled") return;
+    item.status = "uploading";
+    this.paintItem(item);
+    if (this.follow) item.li.scrollIntoView({ block: "nearest" });
+    try {
+      for (;;) {
+        // Asked first, so a large file is not sent only to be refused; the write is still
+        // conditional, so a file that appears meanwhile is caught rather than replaced.
+        let ifNoneMatch = false;
+        if (askBeforeReplacing()) {
+          ifNoneMatch = true;
+          if (await s3.exists(item.bucket, item.key)) {
+            const choice = await this.ask(item);
+            if (item.status === "cancelled") return;
+            if (choice === "skip") {
+              item.status = "skipped";
+              return;
+            }
+            if (choice === "keep") item.key = await freeKey(item.bucket, item.key);
+            else ifNoneMatch = false;
+            this.paintItem(item);
+          }
+        }
+        try {
+          await s3.upload(item.bucket, item.key, item.file, {
+            signal: item.controller.signal,
+            ifNoneMatch,
+            onProgress: (b) => {
+              item.loaded = b;
+              this.paintItem(item);
+            },
+          });
+          break;
+        } catch (err) {
+          if (!(ifNoneMatch && err?.code === "PreconditionFailed")) throw err;
+          item.loaded = 0;
+        }
+      }
+      item.status = "done";
+    } catch (err) {
+      item.status = err?.name === "AbortError" ? "cancelled" : "failed";
+      item.error = describeError(err)?.message;
+    } finally {
+      // The File is a handle to the user's disk; holding it after the upload is what kept a
+      // large dropped folder's entries alive for as long as the panel stayed open.
+      item.file = null;
+      item.controller = null;
+      this.paintItem(item);
+    }
   },
 
-  paint() {
-    if (!this.items.length) {
-      this.panel?.remove();
-      this.panel = null;
-      return;
+  // One question at a time, however many uploads run: the answer may apply to the rest.
+  ask(item) {
+    const answer = this.asking.then(async () => {
+      if (item.batch.decision) return item.batch.decision;
+      if (item.status === "cancelled") return "skip";
+      const all = h("input", { type: "checkbox" });
+      const value = await dialog({
+        title: "Replace existing object?",
+        body: [
+          h("p", {}, h("span", { class: "mono" }, `${item.bucket}/${item.key}`), " already exists."),
+          h("label", { class: "check-field" }, all, "Do the same for the other files of this upload that exist"),
+        ],
+        actions: [
+          { label: "Skip", value: "skip", kind: "ghost" },
+          { label: "Keep both", value: "keep" },
+          { label: "Replace", value: "replace", kind: "primary", autofocus: true },
+        ],
+      });
+      // Dismissing the dialog replaces nothing.
+      const choice = value ?? "skip";
+      if (all.checked) item.batch.decision = choice;
+      return choice;
+    });
+    this.asking = answer;
+    return answer;
+  },
+
+  build() {
+    if (this.panel) return;
+    this.title = h("strong", {});
+    this.summary = h("span", { class: "muted small" });
+    this.bar = h("div", { class: "progress" });
+    this.toggle = h("button", {
+      class: "icon-button small upload-toggle", "aria-label": "Minimize uploads", "aria-expanded": "true",
+      onclick: () => {
+        this.collapsed = !this.collapsed;
+        this.update();
+      },
+    }, icon("chevron"));
+    this.close = h("button", { class: "icon-button small", "aria-label": "Clear uploads", onclick: () => this.clear() }, icon("close"));
+    this.list = h("ul", { class: "upload-list" });
+    // Only the user's own scrolling stops the list from following the uploads.
+    const stop = () => { this.follow = false; };
+    for (const e of ["wheel", "touchmove", "keydown", "pointerdown"]) this.list.addEventListener(e, stop, { passive: true });
+    this.panel = h("section", { class: "uploads", "aria-label": "Uploads" },
+      h("header", {},
+        h("div", { class: "upload-heading" }, this.title, this.summary),
+        h("div", { class: "upload-actions" }, this.toggle, this.close)),
+      this.bar,
+      this.list);
+    document.body.append(this.panel);
+  },
+
+  clear() {
+    for (const item of this.items) item.controller?.abort();
+    this.items = [];
+    this.panel?.remove();
+    this.panel = null;
+  },
+
+  row(item) {
+    item.label = h("span", { class: "truncate" });
+    item.state = h("span", { class: "upload-status" });
+    item.cancel = h("button", {
+      class: "icon-button small", "aria-label": "Cancel upload",
+      onclick: () => {
+        item.status = "cancelled";
+        item.controller?.abort();
+        this.paintItem(item);
+      },
+    }, icon("close"));
+    item.bar = h("div", { class: "progress" });
+    item.meta = h("span", { class: "muted small" });
+    item.li = h("li", { class: "upload-item" }, h("div", { class: "upload-row" }, item.label, item.state, item.cancel), item.bar, item.meta);
+    this.paintItem(item);
+    return item.li;
+  },
+
+  paintItem(item) {
+    if (!item.li) return;
+    // The path inside the upload, not only the file name: a folder holds many index.html.
+    item.label.textContent = item.key.slice(item.prefix.length);
+    item.label.title = `${item.bucket}/${item.key}`;
+    const status = item.status;
+    item.li.className = `upload-item ${status}`;
+    item.cancel.hidden = FINISHED.has(status);
+    item.state.className = `upload-status ${status}`;
+    item.state.replaceChildren(status === "done" ? icon("check", "icon small")
+      : { queued: "Waiting", skipped: "Skipped", cancelled: "Cancelled", failed: "Failed" }[status] ?? "");
+    item.bar.className = `progress ${status}`;
+    const pct = item.size ? Math.min(100, (item.loaded / item.size) * 100) : 100;
+    item.bar.style.setProperty("--progress", `${status === "uploading" ? pct : 0}%`);
+    item.meta.textContent = status === "uploading" ? `${formatBytes(item.loaded)} of ${formatBytes(item.size)}`
+      : status === "failed" ? item.error ?? "" : "";
+    item.meta.hidden = !item.meta.textContent;
+    this.schedule();
+  },
+
+  // The header sums every row, so it is redrawn once a frame however many progress events
+  // arrive.
+  schedule() {
+    if (this.scheduled) return;
+    this.scheduled = true;
+    requestAnimationFrame(() => {
+      this.scheduled = false;
+      this.update();
+    });
+  },
+
+  update() {
+    if (!this.panel) return;
+    let active = 0, done = 0, failed = 0, sent = 0, total = 0;
+    for (const i of this.items) {
+      if (i.status === "queued" || i.status === "uploading") active++;
+      else if (i.status === "done") done++;
+      else if (i.status === "failed") failed++;
+      if (i.status === "skipped" || i.status === "cancelled") continue;
+      total += i.size;
+      sent += i.status === "done" ? i.size : i.loaded;
     }
-    const active = this.items.filter((i) => i.status === "queued" || i.status === "uploading").length;
-    const failed = this.items.filter((i) => i.status === "failed").length;
-    const title = active ? `Uploading ${active} file${active === 1 ? "" : "s"}` : failed ? `${failed} upload${failed === 1 ? "" : "s"} failed` : "Uploads complete";
-    const list = h("ul", { class: "upload-list" }, this.items.slice(-200).reverse().map((item) => {
-      item.bar = h("div", { class: `progress ${item.status}` });
-      item.meta = h("span", { class: "muted small" });
-      const status = {
-        queued: "Waiting",
-        done: "Done",
-        cancelled: "Cancelled",
-        failed: item.error ?? "Failed",
-      }[item.status];
-      const li = h("li", { class: "upload-item" },
-        h("div", { class: "upload-row" },
-          h("span", { class: "truncate", title: `${item.bucket}/${item.key}` }, item.key.split("/").pop()),
-          item.status === "uploading" || item.status === "queued"
-            ? h("button", { class: "icon-button small", "aria-label": "Cancel upload", onclick: () => { item.status = "cancelled"; item.controller.abort(); this.paint(); } }, icon("close"))
-            : h("span", { class: `upload-status ${item.status}` }, item.status === "done" ? icon("check", "icon small") : status)),
-        item.bar,
-        item.status === "uploading" ? item.meta : status && item.status !== "done" ? h("span", { class: "muted small" }, status) : "",
-      );
-      this.paintItem(item);
-      return li;
-    }));
-    const panel = h("section", { class: "uploads", "aria-label": "Uploads" },
-      h("header", {}, h("strong", {}, title),
-        active ? "" : h("button", { class: "icon-button small", "aria-label": "Clear uploads", onclick: () => { this.items = []; this.paint(); } }, icon("close"))),
-      list);
-    if (this.panel) this.panel.replaceWith(panel);
-    else document.body.append(panel);
-    this.panel = panel;
+    const n = this.items.length;
+    this.title.textContent = active ? `Uploading ${active.toLocaleString()} file${active === 1 ? "" : "s"}`
+      : failed ? `${failed.toLocaleString()} upload${failed === 1 ? "" : "s"} failed` : "Uploads complete";
+    this.summary.textContent = `${done.toLocaleString()} of ${n.toLocaleString()} done · ${formatBytes(sent)} of ${formatBytes(total)}`;
+    this.bar.className = `progress upload-total ${active ? "" : failed ? "failed" : "done"}`;
+    this.bar.style.setProperty("--progress", `${total ? Math.min(100, (sent / total) * 100) : 100}%`);
+    this.close.hidden = active > 0;
+    this.panel.classList.toggle("collapsed", this.collapsed);
+    this.toggle.setAttribute("aria-expanded", String(!this.collapsed));
+    this.toggle.setAttribute("aria-label", this.collapsed ? "Restore uploads" : "Minimize uploads");
   },
 };
 
@@ -743,12 +948,131 @@ const DESCRIPTIONS = {
   domain: "Base domains for virtual-hosted-style requests (bucket.domain). One per line.",
   "etag-buffer-limit": "Largest single upload hashed in memory for an MD5 ETag. B, KiB, MiB or GiB.",
   "stale-upload-age": "Unfinished multipart uploads older than this are removed. s, m, h or d; 0 keeps them.",
-  backend: "OpenDAL service the objects are stored in.",
+  backend: "OpenDAL service the objects are stored in, such as fs, s3, azblob or gcs.",
+  "log-format": "text, or json for one object per line.",
   address: "Where the S3 API listens.",
   "console-address": "Where this console listens.",
   "tls-cert": "Certificate chain; replaced without a restart when the file changes.",
   "tls-key": "Private key of the certificate.",
+  "log-level": "A level (trace, debug, info, warn, error, off), then any target=level, comma-separated.",
+  "log-file": "File the log is written to; without it, stderr.",
+  "log-max-size": "Size past which the log file is renamed to <file>.1 and a new one started; 0 never rotates.",
+  "log-max-files": "Rotated log files kept; older ones are removed.",
 };
+
+// The two limits of a key pair, as the add and edit dialogs ask for them.
+function limitFields({ access = "read-write", allow = null } = {}) {
+  const mode = h("select", { class: "input" },
+    h("option", { value: "read-write" }, "Read and write"),
+    h("option", { value: "read-only" }, "Read only"));
+  mode.value = access;
+  const scope = h("textarea", { class: "input mono", rows: 3, spellcheck: "false", placeholder: "photos\nlogs/app/" });
+  scope.value = (allow ?? []).join("\n");
+  return {
+    fields: [
+      field("Permission", mode),
+      field("Limit to", scope, "One bucket, or bucket/folder/, per line; empty for every bucket. A key pair with any limit cannot open Server or Settings, nor create or delete buckets."),
+    ],
+    read: () => {
+      const list = scope.value.split("\n").map((s) => s.trim()).filter(Boolean);
+      return { access: mode.value, allow: list.length ? list : null };
+    },
+  };
+}
+
+function describeLimits(c) {
+  if (!c.allow && c.access !== "read-only") return "Full access";
+  const mode = c.access === "read-only" ? "Read only" : "Read and write";
+  return h("span", {}, mode, " · ", h("span", { class: "mono" }, c.allow ? c.allow.join(", ") : "every bucket"));
+}
+
+// The settings that take a restart: written to the file now, applied when the server starts
+// again. A backend is probed before it is saved, so the restart does not find it broken.
+function restartForm(config, save) {
+  const inputs = {};
+  const rows = config.settings.filter((s) => !s.live).map((s) => {
+    const value = s.value === null || s.value === undefined ? "" : String(s.value);
+    const input = h("input", { class: "input mono", value, disabled: !s.editable, spellcheck: "false" });
+    input.value = value;
+    inputs[s.name] = { input, initial: value };
+    return h("div", { class: "setting" },
+      h("div", { class: "setting-text" },
+        h("div", { class: "setting-name mono" }, s.name, s.locked && h("span", { class: "pill", title: "Set by a flag or environment variable, which outranks the file" }, icon("lock", "icon small"), "Locked")),
+        h("div", { class: "muted small" }, DESCRIPTIONS[s.name])),
+      input);
+  });
+
+  const optsEditable = config.editable && !config.backend_opts_locked;
+  let optsChanged = false;
+  const opts = [];
+  const list = h("div", { class: "opt-list" });
+  const addOpt = ({ name = "", value = "", secret = false } = {}) => {
+    const opt = {
+      secret,
+      name: h("input", { class: "input mono", value: name, placeholder: "root", "aria-label": "Option name", disabled: !optsEditable, spellcheck: "false" }),
+      // A credential's value is never sent to the page; left empty, it keeps the one it has.
+      value: h("input", {
+        class: "input mono", value: value ?? "", type: secret ? "password" : "text", "aria-label": `Value of ${name || "the option"}`,
+        placeholder: secret ? "Unchanged" : "/srv/data", disabled: !optsEditable, spellcheck: "false", autocomplete: "off",
+      }),
+    };
+    opt.row = h("div", { class: "opt-row" }, opt.name, opt.value,
+      h("button", {
+        type: "button", class: "icon-button", "aria-label": `Remove ${name || "option"}`, disabled: !optsEditable,
+        onclick: () => {
+          opts.splice(opts.indexOf(opt), 1);
+          opt.row.remove();
+          optsChanged = true;
+          changed();
+        },
+      }, icon("trash")));
+    opts.push(opt);
+    list.append(opt.row);
+  };
+  config.backend_opts.forEach(addOpt);
+
+  const saveButton = h("button", { class: "button primary", type: "submit", disabled: true }, "Save for restart");
+  const changed = () => {
+    saveButton.disabled = !optsChanged && !Object.values(inputs).some(({ input, initial }) => input.value !== initial);
+  };
+  return h("form", {
+    class: "panel",
+    oninput: (e) => {
+      if (list.contains(e.target)) optsChanged = true;
+      changed();
+    },
+    onsubmit: async (e) => {
+      e.preventDefault();
+      const settings = {};
+      for (const [name, { input, initial }] of Object.entries(inputs)) {
+        if (input.value !== initial) settings[name] = input.value.trim() || null;
+      }
+      const edit = { settings };
+      if (optsChanged) {
+        edit.backend_opts = opts.filter((o) => o.name.value.trim())
+          .map((o) => ({ name: o.name.value.trim(), value: o.secret && !o.value.value ? null : o.value.value }));
+      }
+      saveButton.disabled = true;
+      const probing = "backend" in settings || edit.backend_opts;
+      saveButton.textContent = probing ? "Checking the backend…" : "Saving…";
+      if (!(await save(edit, "Saved. Restart the server to apply."))) {
+        saveButton.textContent = "Save for restart";
+        changed();
+      }
+    },
+  },
+    h("header", { class: "panel-header" }, h("h2", {}, "Restart required"),
+      h("p", { class: "muted small" }, "Saved to the config file now, applied when the server restarts. An empty field returns to the default.")),
+    rows,
+    h("div", { class: "setting opt-setting" },
+      h("div", { class: "setting-text" },
+        h("div", { class: "setting-name mono" }, "backend-opt", config.backend_opts_locked && h("span", { class: "pill", title: "Set by a flag or environment variable, which outranks the file" }, icon("lock", "icon small"), "Locked")),
+        h("div", { class: "muted small" }, "Options of the OpenDAL service, such as root, bucket or endpoint. Values that may be credentials are not shown.")),
+      h("div", { class: "opt-editor" }, list,
+        h("button", { type: "button", class: "button ghost", disabled: !optsEditable, onclick: () => { addOpt(); optsChanged = true; changed(); opts.at(-1).name.focus(); } }, icon("plus"), "Add option"))),
+    h("div", { class: "panel-footer end" }, saveButton),
+  );
+}
 
 function settingsView() {
   const body = h("div", { class: "stack" }, loadingRows(6));
@@ -774,12 +1098,15 @@ function settingsView() {
     }
   };
 
-  const fileKeys = () => config.credentials.filter((c) => !c.locked).map((c) => ({ access_key: c.access_key }));
+  // Each pair with its limits: the server refuses a list without them, which would lift them.
+  const fileKeys = () => config.credentials.filter((c) => !c.locked)
+    .map((c) => ({ access_key: c.access_key, access: c.access, allow: c.allow }));
 
   async function addKey() {
     const pair = generateKeyPair();
     const access = h("input", { class: "input mono", value: pair.accessKey, required: true, spellcheck: "false" });
     const secret = h("input", { class: "input mono", value: pair.secretKey, required: true, minLength: 8, spellcheck: "false" });
+    const limits = limitFields();
     const value = await dialog({
       title: "Add key pair",
       body: [
@@ -787,12 +1114,25 @@ function settingsView() {
         field("Secret key", h("div", { class: "input-group" }, secret,
           h("button", { type: "button", class: "icon-button", "aria-label": "Copy secret key", onclick: () => copyText(secret.value, "Secret key copied") }, icon("copy"))),
         "Copy it now: the console cannot show it again."),
+        limits.fields,
       ],
       actions: [{ label: "Cancel", value: "", kind: "ghost" }, { label: "Add key pair", value: "ok", kind: "primary" }],
     });
     if (value !== "ok") return;
-    await save({ credentials: [...fileKeys(), { access_key: access.value.trim(), secret_key: secret.value }] },
+    await save({ credentials: [...fileKeys(), { access_key: access.value.trim(), secret_key: secret.value, ...limits.read() }] },
       `Added ${access.value.trim()}`);
+  }
+
+  async function editKey(c) {
+    const limits = limitFields(c);
+    const value = await dialog({
+      title: `Limits of ${c.access_key}`,
+      body: limits.fields,
+      actions: [{ label: "Cancel", value: "", kind: "ghost" }, { label: "Save", value: "ok", kind: "primary" }],
+    });
+    if (value !== "ok") return;
+    await save({ credentials: fileKeys().map((k) => (k.access_key === c.access_key ? { ...k, ...limits.read() } : k)) },
+      `Saved the limits of ${c.access_key}`);
   }
 
   async function removeKey(key) {
@@ -805,16 +1145,23 @@ function settingsView() {
     const editable = config.editable;
     const keys = h("section", { class: "panel" },
       h("header", { class: "panel-header row" },
-        h("div", {}, h("h2", {}, "Key pairs"), h("p", { class: "muted small" }, "Every key pair has full access to every bucket.")),
+        h("div", {}, h("h2", {}, "Key pairs"), h("p", { class: "muted small" }, "A key pair reaches every bucket unless it is limited to some.")),
         h("button", { class: "button primary", disabled: !editable, onclick: addKey }, icon("plus"), "Add key pair")),
       h("table", { class: "table" },
-        h("thead", {}, h("tr", {}, h("th", {}, "Access key"), h("th", {}, "Source"), h("th", { class: "col-actions" }))),
+        h("thead", {}, h("tr", {}, h("th", {}, "Access key"), h("th", {}, "Access"), h("th", {}, "Source"), h("th", { class: "col-actions wide" }))),
         h("tbody", {}, config.credentials.map((c) => {
           const self = c.access_key === signedInAs;
           return h("tr", {},
             h("td", {}, h("span", { class: "name-cell" }, icon("key"), h("span", { class: "mono truncate" }, c.access_key), self && h("span", { class: "pill accent" }, "You"))),
+            h("td", { class: "muted" }, describeLimits(c)),
             h("td", { class: "muted" }, c.locked ? h("span", { class: "pill" }, icon("lock", "icon small"), "Environment") : "Config file"),
-            h("td", { class: "col-actions" },
+            h("td", { class: "col-actions wide" },
+              h("button", {
+                class: "icon-button", "aria-label": `Edit the limits of ${c.access_key}`,
+                title: c.locked ? "Set by a flag or environment variable" : self ? "You are signed in with this key" : `Edit the limits of ${c.access_key}`,
+                disabled: !editable || c.locked || self,
+                onclick: () => editKey(c),
+              }, icon("edit")),
               h("button", {
                 class: "icon-button", "aria-label": `Remove ${c.access_key}`,
                 title: c.locked ? "Set by a flag or environment variable" : self ? "You are signed in with this key" : `Remove ${c.access_key}`,
@@ -870,24 +1217,34 @@ function settingsView() {
       h("div", { class: "panel-footer end" }, saveButton),
     );
 
-    const fixed = h("section", { class: "panel" },
-      h("header", { class: "panel-header" }, h("h2", {}, "Restart required"),
-        h("p", { class: "muted small" }, "Changed in the config file, these take effect when the server restarts.")),
-      h("dl", { class: "props wide" }, config.settings.filter((s) => !s.live).flatMap((s) => [
-        h("dt", { class: "mono" }, s.name),
-        h("dd", {}, h("span", { class: "mono" }, s.value ?? "—"), h("div", { class: "muted small" }, DESCRIPTIONS[s.name])),
-      ])));
+    const fixed = restartForm(config, save);
 
     body.replaceChildren(
       editable
-        ? h("div", { class: "banner" }, icon("settings"), h("div", {}, "Changes are written to ", h("span", { class: "mono" }, config.file), " and applied at once. Edits made to the file by hand are picked up within seconds."))
+        ? h("div", { class: "banner" }, icon("settings"), h("div", {}, "Changes are written to ", h("span", { class: "mono" }, config.file), ". Edits made to the file by hand are picked up within seconds."))
         : h("div", { class: "banner warn" }, icon("lock"), h("div", {}, h("strong", {}, "Read only. "), config.reason ?? "")),
+      config.pending_restart.length ? h("div", { class: "banner warn" }, icon("alert"),
+        h("div", {}, h("strong", {}, "Restart to apply: "), h("span", { class: "mono" }, config.pending_restart.join(", ")))) : "",
       keys, form, fixed,
     );
   }
 
+  // Outside `body`, which the server's answer replaces: this one needs no server.
+  const ask = h("input", {
+    type: "checkbox", checked: askBeforeReplacing(),
+    onchange: () => localStorage.setItem(ASK_REPLACE, ask.checked ? "1" : "0"),
+  });
+  const browser = h("section", { class: "panel" },
+    h("header", { class: "panel-header" }, h("h2", {}, "This browser"),
+      h("p", { class: "muted small" }, "Kept in this browser, for every server it signs in to.")),
+    h("label", { class: "setting check-setting" },
+      h("div", { class: "setting-text" },
+        h("div", { class: "setting-name" }, "Ask before replacing"),
+        h("div", { class: "muted small" }, "An upload stops to ask when an object of the same name exists: replace it, skip the file, or keep both under a new name. Off, uploads replace without asking, as S3 clients do.")),
+      ask));
+
   load();
-  return shell("settings", pageHeader("Settings"), body);
+  return shell("settings", pageHeader("Settings"), h("div", { class: "stack" }, body, browser));
 }
 
 // ----- Router -----
@@ -901,8 +1258,8 @@ function route() {
   keyHandler = null;
   const hash = location.hash.slice(1) || "/";
   currentRoute = "";
-  if (hash === "/server") return serverView();
-  if (hash === "/settings") return settingsView();
+  if (hash === "/server" && isAdmin()) return serverView();
+  if (hash === "/settings" && isAdmin()) return settingsView();
   if (hash.startsWith("/b/")) {
     const rest = hash.slice(3);
     const i = rest.indexOf("/");
@@ -915,10 +1272,14 @@ function route() {
 }
 
 function render() {
+  // Taken off the page with everything else and put back, which loses the list's position.
+  const scrolled = uploads.list?.scrollTop ?? 0;
   document.body.replaceChildren(s3 ? route() : loginView());
-  if (uploads.panel) document.body.append(uploads.panel);
+  if (uploads.panel) {
+    document.body.append(uploads.panel);
+    uploads.list.scrollTop = scrolled;
+  }
 }
 
 window.addEventListener("hashchange", render);
-restore();
-render();
+restore().finally(render);

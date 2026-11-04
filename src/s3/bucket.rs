@@ -1,6 +1,7 @@
 //! Bucket operations. A bucket is a directory at the namespace root (design.md "Buckets" and
 //! "Namespace mapping").
 
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use futures::{StreamExt, TryStreamExt};
@@ -10,6 +11,7 @@ use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 use super::naming::{bucket_dir, require_bucket, validate_bucket_name};
 use super::{S3Dal, acl, multipart, unsupported};
+use crate::access::Limit;
 use crate::error::{Ctx, map};
 
 /// S3 reports buckets in its original region with an empty LocationConstraint, and SDKs read
@@ -137,6 +139,9 @@ pub(super) async fn list_buckets(
     dal: &S3Dal,
     req: S3Request<ListBucketsInput>,
 ) -> S3Result<S3Response<ListBucketsOutput>> {
+    // Put there by the server's access check for a key pair with limits, whose listing names
+    // only the buckets it reaches. An embedder without that check lists them all.
+    let limit = req.extensions.get::<Arc<Limit>>().cloned();
     let input = req.input;
     let max_buckets = match input.max_buckets {
         None => usize::MAX,
@@ -163,7 +168,12 @@ pub(super) async fn list_buckets(
             let has_prefix = input.prefix.as_deref().is_none_or(|p| name.starts_with(p));
             let after_token = input.continuation_token.as_deref().is_none_or(|t| name > t);
             // Valid names never start with `.`, so this also drops the reserved `.s3dal/`.
-            if !meta.is_dir() || validate_bucket_name(name).is_err() || !has_prefix || !after_token
+            let reached = limit.as_ref().is_none_or(|l| l.reaches_bucket(name));
+            if !meta.is_dir()
+                || validate_bucket_name(name).is_err()
+                || !has_prefix
+                || !after_token
+                || !reached
             {
                 continue;
             }

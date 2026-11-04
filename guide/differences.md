@@ -11,8 +11,9 @@ database.
 It is not a storage system. The backend owns durability: there is no erasure coding,
 replication, or healing. It also has none of these:
 
-- users, IAM, bucket policies, or ACLs that grant access: every configured key pair has full
-  access to every bucket;
+- users, IAM, bucket policies, or ACLs that grant access: a key pair reaches every bucket, or
+  the buckets and folders its `allow` lists, read-only or read-write (see
+  [Key pairs](../README.md#key-pairs)), and is refused with `AccessDenied` elsewhere;
 - versioning, object lock, server-side encryption, object tags, lifecycle rules.
 
 A request that relies on one of these features is refused with `NotImplemented` rather than

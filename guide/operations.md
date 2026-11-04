@@ -66,10 +66,22 @@ s3dal logs to stderr, one line per request when it ends, and its own warnings an
   means the client went away before the response ended.
 - A 5xx other than 501 is logged at WARN, everything else at INFO.
 
-`--log-format json` writes one JSON object per line, for log collectors. `RUST_LOG` sets the
-levels (default `info,s3s=off`); `RUST_LOG=info,s3s=debug` adds s3s's own account of each
-request's operation and error. The startup log shows the backend profile, which tells which
-metadata the backend stores natively.
+`--log-format json` writes one JSON object per line, for log collectors. The startup log shows
+the backend profile, which tells which metadata the backend stores natively.
+
+`--log-level` sets the levels: one level (`trace`, `debug`, `info`, `warn`, `error`, `off`),
+then any `target=level`, comma-separated, as in `info,s3dal=debug`. The default is `info`.
+s3s's own lines stay off unless a directive names `s3s`: `info,s3s=debug` adds its account of
+each request's operation and error. A word that is not a level, alone or after `=`, is
+refused: a typo such as `verbose` would otherwise turn the log off without a word. The level
+changes without a restart, from the config file or the console.
+
+The log goes to stderr, or with `--log-file` to a file, without colors. Once a line would take
+the file past `--log-max-size` (default `100MiB`), it is renamed to `<file>.1`, the older ones
+move up to `<file>.<log-max-files>` (default 5), the oldest beyond that is removed, and a new
+file is started; a restart appends to the file it finds. `--log-max-size 0` never rotates, for
+logrotate's `copytruncate` or a platform that rotates the file itself. These three take a
+restart. A file s3dal cannot open stops it at startup.
 
 ## HTTP/2
 

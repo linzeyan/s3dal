@@ -10,6 +10,8 @@ use clap::parser::ValueSource;
 use clap::{ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::Deserialize;
 
+use crate::access::{Access, Limit};
+
 #[derive(Debug, Parser)]
 #[command(
     name = "s3dal",
@@ -25,12 +27,16 @@ pub struct Cli {
 pub enum Command {
     /// Serve the S3 API on top of an OpenDAL backend.
     Serve(ServeArgs),
-    /// Check `serve`'s settings, from the same flags, variables and file, and print them with
-    /// secrets redacted.
+    // The first paragraph of each comment is the one line `--help` lists the command with; the
+    // rest shows only in the command's own help.
+    /// Check `serve`'s settings and print them with secrets redacted.
+    ///
+    /// Reads the same flags, variables and config file as `serve`.
     CheckConfig(ServeArgs),
-    /// Exit 0 if the server answers its health check, 1 if not. Without `--url`, asks the server
-    /// that `serve` would start with the same variables and config file, so a container's
-    /// health check needs no arguments.
+    /// Exit 0 if the server answers its health check, 1 if not.
+    ///
+    /// Without `--url`, asks the server that `serve` would start with the same variables and
+    /// config file, so a container's health check needs no arguments.
     Healthcheck(HealthcheckArgs),
     /// Print a new random key pair, in the config file's `[[credentials]]` form.
     Keygen,
@@ -122,9 +128,28 @@ pub struct ServeArgs {
     #[arg(long, env = "S3DAL_TLS_KEY")]
     pub tls_key: Option<PathBuf>,
 
-    /// Log line format on stderr. `RUST_LOG` sets the levels.
+    /// Log line format.
     #[arg(long, env = "S3DAL_LOG_FORMAT", value_enum, default_value = "text")]
     pub log_format: LogFormat,
+
+    /// Log levels: a level (`trace`, `debug`, `info`, `warn`, `error`, `off`), then any
+    /// `target=level`, comma-separated, as in `info,s3dal=debug`. s3s's own lines stay off unless
+    /// a directive names `s3s`.
+    #[arg(long, env = "S3DAL_LOG_LEVEL", default_value = "info", value_parser = parse_log_level)]
+    pub log_level: String,
+
+    /// File the log is written to, instead of stderr.
+    #[arg(long, env = "S3DAL_LOG_FILE")]
+    pub log_file: Option<PathBuf>,
+
+    /// Size past which `--log-file` is renamed to `<file>.1` and a new one started. Accepts a
+    /// byte count or a `KiB` / `MiB` / `GiB` suffix; `0` never rotates.
+    #[arg(long, env = "S3DAL_LOG_MAX_SIZE", default_value = "100MiB", value_parser = parse_size)]
+    pub log_max_size: u64,
+
+    /// Rotated log files kept, `<file>.1` the newest; older ones are removed.
+    #[arg(long, env = "S3DAL_LOG_MAX_FILES", default_value = "5")]
+    pub log_max_files: u32,
 
     /// Address and port of the web console; without it there is none. It speaks HTTPS when the
     /// S3 port does, with the same certificate.
@@ -150,7 +175,6 @@ impl ServeArgs {
     /// that may be a credential redacted, so the output can be pasted into an issue.
     pub fn describe(&self) -> String {
         const REDACTED: &str = "\"<redacted>\"";
-        let secretish = ["key", "secret", "token", "password", "credential", "sas"];
         let path =
             |p: &Option<PathBuf>| p.as_ref().map(|p| format!("{:?}", p.display().to_string()));
         let mut out = vec![
@@ -171,14 +195,20 @@ impl ServeArgs {
             LogFormat::Json => "json",
         };
         out.push(format!("log-format = \"{format}\""));
+        out.push(format!("log-level = {:?}", self.log_level));
+        out.extend(path(&self.log_file).map(|p| format!("log-file = {p}")));
+        out.push(format!(
+            "log-max-size = \"{}\"",
+            format_size(self.log_max_size)
+        ));
+        out.push(format!("log-max-files = {}", self.log_max_files));
         out.extend(
             self.console_address
                 .map(|a| format!("console-address = \"{a}\"")),
         );
         out.push("\n[backend-opt]".into());
         for (name, value) in &self.backend_opts {
-            let lower = name.to_ascii_lowercase();
-            if secretish.iter().any(|s| lower.contains(s)) {
+            if is_secretish(name) {
                 out.push(format!("{name} = {REDACTED}"));
             } else {
                 out.push(format!("{name} = {value:?}"));
@@ -189,6 +219,12 @@ impl ServeArgs {
                 "\n[[credentials]]\naccess-key = {:?}\nsecret-key = {REDACTED}",
                 pair.access_key
             ));
+            if let Some(allow) = &pair.allow {
+                out.push(format!("allow = {allow:?}"));
+            }
+            if pair.access != Access::ReadWrite {
+                out.push(format!("access = \"{}\"", pair.access.as_str()));
+            }
         }
         out.join("\n") + "\n"
     }
@@ -207,10 +243,8 @@ impl ServeArgs {
         self.credentials = match (self.access_key.take(), self.secret_key.take()) {
             (Some(access_key), Some(secret_key)) => {
                 self.fixed_access_key = Some(access_key.clone());
-                vec![KeyPair {
-                    access_key,
-                    secret_key,
-                }]
+                // Without limits: it is the pair that always works, whatever the file says.
+                vec![KeyPair::new(access_key, secret_key)]
             }
             (None, None) => Vec::new(),
             _ => return Err("--access-key and --secret-key must be given together".into()),
@@ -224,13 +258,35 @@ impl ServeArgs {
     }
 }
 
-/// One SigV4 credential. Each pair signs with its own secret; all of them reach the same
-/// buckets, since there is one tenant.
+/// One SigV4 credential. Each pair signs with its own secret, and reaches every bucket unless
+/// `allow` or `access` limits it (see [`crate::access`]).
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct KeyPair {
     pub access_key: String,
     pub secret_key: String,
+    /// Buckets, or folders as `bucket/folder/`, the pair is limited to.
+    #[serde(default)]
+    pub allow: Option<Vec<String>>,
+    #[serde(default)]
+    pub access: Access,
+}
+
+impl KeyPair {
+    /// A pair without limits.
+    pub fn new(access_key: impl Into<String>, secret_key: impl Into<String>) -> Self {
+        Self {
+            access_key: access_key.into(),
+            secret_key: secret_key.into(),
+            allow: None,
+            access: Access::ReadWrite,
+        }
+    }
+
+    pub fn limit(&self) -> Result<Option<Limit>, String> {
+        Limit::of(self.allow.as_deref(), self.access)
+            .map_err(|e| format!("access key {:?}: {e}", self.access_key))
+    }
 }
 
 // Written by hand so that printing a configuration never prints a secret.
@@ -239,13 +295,26 @@ impl fmt::Debug for KeyPair {
         f.debug_struct("KeyPair")
             .field("access_key", &self.access_key)
             .field("secret_key", &"<redacted>")
+            .field("allow", &self.allow)
+            .field("access", &self.access)
             .finish()
     }
+}
+
+/// Backend option names that may hold a credential, whose values are never shown.
+pub(crate) fn is_secretish(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["key", "secret", "token", "password", "credential", "sas"]
+        .iter()
+        .any(|s| lower.contains(s))
 }
 
 /// There is no anonymous mode. Two secrets for one access key would leave which of them
 /// verifies a signature to lookup order, so that is refused rather than resolved.
 pub(crate) fn check_key_pairs(pairs: &[KeyPair]) -> Result<(), String> {
+    for pair in pairs {
+        pair.limit()?;
+    }
     if pairs.is_empty() {
         return Err(
             "no key pair: give --access-key and --secret-key, or [[credentials]] in the config \
@@ -540,6 +609,12 @@ fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size {s:?} overflows"))
 }
 
+/// Checked when the settings are read, at startup and on every reload, so a bad level fails
+/// there with the file named rather than when it is applied.
+fn parse_log_level(s: &str) -> Result<String, String> {
+    crate::logging::filter(s).map(|_| s.to_owned())
+}
+
 fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
@@ -587,9 +662,34 @@ mod tests {
     }
 
     fn pair(access_key: &str, secret_key: &str) -> KeyPair {
-        KeyPair {
-            access_key: access_key.into(),
-            secret_key: secret_key.into(),
+        KeyPair::new(access_key, secret_key)
+    }
+
+    #[test]
+    fn key_pair_limits_come_from_the_file_and_bad_ones_refuse_to_start() {
+        // A limit misread would hand a pair more than the operator meant; refusing the file
+        // is the only safe answer to one that cannot be read.
+        let file = config_file(
+            "backend = \"fs\"\n\
+             [[credentials]]\naccess-key = \"viewer\"\nsecret-key = \"viewer-secret\"\n\
+             allow = [\"photos\", \"logs/app/\"]\naccess = \"read-only\"\n",
+        );
+        let args = serve(&["--config", file.path().to_str().unwrap()]).unwrap();
+        let viewer = &args.credentials[0];
+        assert_eq!(viewer.access, Access::ReadOnly);
+        let limit = viewer.limit().unwrap().unwrap();
+        assert!(limit.reaches_key("logs", "app/x.log") && !limit.reaches_key("logs", "db/x.log"));
+        assert!(!limit.may_write());
+        assert!(args.describe().contains("access = \"read-only\""));
+
+        for bad in ["allow = []", "access = \"write-only\"", "allow = [\"/x\"]"] {
+            let file = config_file(&format!(
+                "backend = \"fs\"\n[[credentials]]\naccess-key = \"a\"\nsecret-key = \"b\"\n{bad}\n"
+            ));
+            assert!(
+                serve(&["--config", file.path().to_str().unwrap()]).is_err(),
+                "{bad}"
+            );
         }
     }
 
@@ -895,6 +995,26 @@ mod tests {
         ];
         let err = Cli::load_from(cmd, argv).unwrap_err();
         assert!(err.to_string().contains("`unknown`"), "{err}");
+    }
+
+    #[test]
+    fn a_log_level_that_does_nothing_is_refused_at_startup() {
+        // `verbose` is valid filter syntax that enables nothing, so a server that took it would
+        // run with less logging than the operator asked for and never say so.
+        let file = config_file("backend = \"fs\"\nlog-level = \"verbose\"\n");
+        let err = serve(&["--config", file.path().to_str().unwrap()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`log-level`") && msg.contains("verbose"),
+            "{msg}"
+        );
+        let keys = ["--backend", "fs", "--access-key", "a", "--secret-key", "b"];
+        assert!(serve(&[&keys[..], &["--log-level", "info,s3dal="]].concat()).is_err());
+        let args = serve(&[&keys[..], &["--log-level", "warn,s3dal=debug"]].concat()).unwrap();
+        assert_eq!(args.log_level, "warn,s3dal=debug");
+        assert_eq!(args.log_max_size, 100 * 1024 * 1024);
+        assert_eq!(args.log_max_files, 5);
+        assert_eq!(args.log_file, None);
     }
 
     #[test]
