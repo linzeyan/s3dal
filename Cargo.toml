@@ -1,6 +1,6 @@
 [package]
 name = "s3dal"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 # s3s 0.17 requires 1.96.
 rust-version = "1.96"
@@ -24,7 +24,7 @@ include = [
 ]
 
 [features]
-default = ["services-s3", "services-azblob", "services-gcs", "client"]
+default = ["services-s3", "services-azblob", "services-gcs", "client", "log-forward"]
 # A remote service brings OpenDAL's HTTP transport with it; fs alone needs none, so each one
 # that s3dal is tested against is a feature that a build can leave out.
 services-s3 = ["opendal/services-s3", "opendal/http-transport-reqwest"]
@@ -43,6 +43,9 @@ client = [
     "tokio/io-std",
     "tokio/io-util",
 ]
+# `--log-forward` over HTTP: Graylog's GELF HTTP input and Elasticsearch's bulk API. Over UDP and
+# TCP it needs nothing more. Every crate it needs is already compiled for OpenDAL's s3 service.
+log-forward = ["dep:percent-encoding", "dep:reqwest"]
 
 [dependencies]
 anyhow = "1"

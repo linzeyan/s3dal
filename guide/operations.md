@@ -76,12 +76,47 @@ each request's operation and error. A word that is not a level, alone or after `
 refused: a typo such as `verbose` would otherwise turn the log off without a word. The level
 changes without a restart, from the config file or the console.
 
-The log goes to stderr, or with `--log-file` to a file, without colors. Once a line would take
+The log goes to stderr, or with `--log-file` to a file, without colors. The file's missing
+directories are created. Once a line would take
 the file past `--log-max-size` (default `100MiB`), it is renamed to `<file>.1`, the older ones
 move up to `<file>.<log-max-files>` (default 5), the oldest beyond that is removed, and a new
 file is started; a restart appends to the file it finds. `--log-max-size 0` never rotates, for
 logrotate's `copytruncate` or a platform that rotates the file itself. These three take a
-restart. A file s3dal cannot open stops it at startup.
+restart. A file s3dal cannot open stops it at startup. In the Docker image, which runs as uid
+65532, `/var/log/s3dal` is writable: `S3DAL_LOG_FILE=/var/log/s3dal/s3dal.log`, with a volume
+on `/var/log/s3dal` to keep it, as [docker-compose.yml](../docker-compose.yml) shows. The
+console's Server page shows where the log goes.
+
+### Sending the log to a collector
+
+`--log-forward` (`S3DAL_LOG_FORWARD`) sends every line to a collector as well, as JSON, while
+stderr or the file keeps it too:
+
+| URL | Sends to |
+|---|---|
+| `gelf+udp://graylog:12201` | A Graylog GELF UDP input; messages past one datagram go in GELF chunks |
+| `gelf+tcp://graylog:12201` | A Graylog GELF TCP input, each message ended by a NUL byte |
+| `gelf+http://graylog:12201/gelf`, `gelf+https://…` | A Graylog GELF HTTP input, one POST per message; the path defaults to `/gelf` |
+| `elasticsearch+https://user:password@es:9200/index`, `elasticsearch+http://…` | The bulk API of Elasticsearch or OpenSearch, one request per batch. The index defaults to `logs-s3dal-default`, a data stream Elasticsearch's built-in `logs-*-*` template takes without setup. A query (`?pipeline=…`) is kept |
+
+- A GELF message carries the line's message as `short_message`, its level as a syslog level,
+  the time it was logged, the container's hostname as `host`, and every other field with a
+  leading `_`: `_status`, `_path`, `_span_id` (the request ID).
+- A bulk document is the line's JSON with its time as `@timestamp`.
+- User and password go in the URL, percent-encoded, and are sent as HTTP Basic
+  authentication. `check-config`, the log and the console never show the password; a URL saved
+  from the console without one keeps the password it had.
+- Sending never holds up a request: lines wait in a queue of 10,000, which a thread of their
+  own empties. While the collector cannot be reached, s3dal retries with a growing pause, up to
+  30 seconds; lines that find the queue full are dropped. Lines the collector refuses (a 4xx
+  answer, or a document the index will not take) are not sent again. stderr, which is never
+  forwarded, says when the collector stops answering and when it answers again, how many lines
+  were dropped meanwhile, and each refusal that differs from the one before.
+- On exit, s3dal logs that it stopped, and why if it was an error, then waits up to 3 seconds
+  for the collector to take the lines still queued; stderr counts any it could not send in
+  that time.
+- A URL with a mistake stops s3dal at startup, as a bad `--log-level` does. A collector that
+  is down does not: it is retried. The setting takes a restart.
 
 ## HTTP/2
 
@@ -106,3 +141,5 @@ connection.
 
 s3dal stops on SIGTERM or SIGINT (Ctrl-C): it stops listening at once, so new connections are
 refused and clients can go elsewhere, and gives in-flight requests up to 10 seconds to finish.
+The log says `stopping` when the signal comes and `stopped` at the end; with a log collector,
+s3dal then gives it up to 3 more seconds to take the last lines.

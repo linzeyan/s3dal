@@ -21,8 +21,19 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::load();
     match cli.command {
         Command::Serve(args) => {
-            init_logging(&args)?;
-            serve(args)
+            let flush = init_logging(&args)?;
+            let served = serve(args);
+            // Into the log as well as onto stderr, where `main` prints it: the file and the
+            // collector would otherwise end without saying why.
+            if let Err(err) = &served {
+                tracing::error!(error = format!("{err:#}"), "s3dal stopped on an error");
+            }
+            // The file and stderr are written as each line comes; only the collector's queue
+            // can still hold the last ones.
+            if let Some(flush) = flush {
+                flush.wait(FLUSH_TIMEOUT);
+            }
+            served
         }
         Command::CheckConfig(args) => {
             print!("{}", args.describe());
@@ -35,9 +46,15 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// How long exiting waits for the collector to take the lines still queued. Requests get 10
+/// seconds to finish on SIGTERM, and Docker's and the compose file's stop grace leave a few
+/// more before SIGKILL; a collector that is down must not use them all.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Behind a reload layer, so a config reload can change `--log-level` without a restart;
-/// `logging::filter` says why s3s is off by default.
-fn init_logging(args: &ServeArgs) -> anyhow::Result<()> {
+/// `logging::filter` says why s3s is off by default. Returns what waits for the collector at
+/// exit, when there is one.
+fn init_logging(args: &ServeArgs) -> anyhow::Result<Option<logging::forward::Flush>> {
     // `--log-level` was checked when the settings were read.
     let filter = logging::filter(&args.log_level).map_err(|e| anyhow::anyhow!(e))?;
     let (filter, handle) = reload::Layer::new(filter);
@@ -63,11 +80,32 @@ fn init_logging(args: &ServeArgs) -> anyhow::Result<()> {
             .with_ansi(terminal && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()))
             .boxed(),
     };
+    // In addition to stderr or the file, not instead: `docker logs` keeps working, and so does
+    // the log while the collector is down. JSON whatever `--log-format` says, flat, with the
+    // request's span, so each field becomes one field of the collector's.
+    let (forward, flush) = match &args.log_forward {
+        Some(url) => {
+            let (writer, flush) = logging::forward::start(url).map_err(|e| anyhow::anyhow!(e))?;
+            let layer = tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_current_span(true)
+                .with_span_list(false)
+                .with_writer(writer);
+            (Some(layer), Some(flush))
+        }
+        None => (None, None),
+    };
     tracing_subscriber::registry()
         .with(filter)
         .with(logs)
+        .with(forward)
         .init();
-    Ok(())
+    if let Some(url) = &args.log_forward {
+        let to = logging::forward::redact(url, "");
+        tracing::info!(%to, "the log is also sent to a collector");
+    }
+    Ok(flush)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -152,6 +190,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let dal = S3Dal::new(op, profile, args.settings());
     tokio::spawn(sweep_stale(dal.clone()));
     let auth = LiveAuth::new(&args.credentials, &args.domain)?;
+    auth.set_public(&args.public_bucket);
     let (address, console_address) = (args.address, args.console_address);
     let live = Arc::new(Live::new(
         std::env::args_os().collect(),
@@ -190,6 +229,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         None => s3.await,
     }
     watcher.abort();
+    tracing::info!("stopped");
     Ok(())
 }
 
@@ -207,6 +247,8 @@ fn shutdown_signal() -> anyhow::Result<impl Future<Output = ()>> {
         }
         #[cfg(not(unix))]
         let _ = tokio::signal::ctrl_c().await;
+        // So the log tells a stop that was asked for from a crash.
+        tracing::info!("stopping: no new connections; requests in flight get 10 seconds");
     })
 }
 

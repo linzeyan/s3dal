@@ -3,6 +3,28 @@
 All notable changes to s3dal are listed here, in the format of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.1] - 2026-11-10
+
+### Added
+
+- `--log-forward`: the log also goes to Graylog (GELF over UDP, TCP or HTTP) or to
+  Elasticsearch and OpenSearch (bulk API, Basic authentication), from a queue that never holds
+  a request up. At exit, s3dal waits up to 3 seconds for the queue to empty.
+- The log says when s3dal is stopping and when it has stopped, and the error it stopped on.
+- Public buckets: `--public-bucket` (`public-bucket = [...]`) lets anyone download a bucket's
+  objects without a key pair; listing and writing still take one. It changes without a
+  restart, and the console's Buckets page switches it, with a link that does not expire.
+- `-v` prints the version, as `-V` and `--version` do.
+- Console: the Server page shows where the log goes, and settings with a fixed set of values
+  (backend, log level, log format, log collector) are menus.
+- The Docker image has `/var/log/s3dal`, writable by its user, for `S3DAL_LOG_FILE`.
+
+### Fixed
+
+- `--log-file` creates the directories it is in, at startup and after a rotation, instead of
+  refusing to start.
+- The README's icon no longer sits on the title's rule.
+
 ## [0.3.0] - 2026-11-04
 
 ### Added

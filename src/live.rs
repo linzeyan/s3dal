@@ -84,6 +84,7 @@ impl Live {
             _ => None,
         };
         self.auth.replace(&args.credentials, &args.domain)?;
+        self.auth.set_public(&args.public_bucket);
         if let (Some(live), Some(certified)) = (&self.cert, certified) {
             live.set(certified);
         }
@@ -133,6 +134,9 @@ fn restart_only_changes(started: &ServeArgs, now: &ServeArgs) -> Vec<&'static st
     }
     if started.log_max_files != now.log_max_files {
         changed.push("log-max-files");
+    }
+    if started.log_forward != now.log_forward {
+        changed.push("log-forward");
     }
     if started.console_address != now.console_address {
         changed.push("console-address");

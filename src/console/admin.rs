@@ -19,21 +19,23 @@ use crate::access::Access;
 use crate::backend;
 use crate::config::{ServeArgs, format_duration, format_size, is_secretish};
 use crate::live::Live;
+use crate::logging::forward;
 
 const PREFIX: &str = "/_s3dal/admin/";
 
 /// The settings a reload applies at once.
-const LIVE: [&str; 5] = [
+const LIVE: [&str; 6] = [
     "region",
     "domain",
     "etag-buffer-limit",
     "stale-upload-age",
     "log-level",
+    "public-bucket",
 ];
 
 /// The settings that take a restart, which the console cannot do: an edit is written to the
 /// file, and the server and settings pages say what waits for the restart.
-const RESTART: [&str; 9] = [
+const RESTART: [&str; 10] = [
     "backend",
     "address",
     "console-address",
@@ -43,6 +45,7 @@ const RESTART: [&str; 9] = [
     "log-file",
     "log-max-size",
     "log-max-files",
+    "log-forward",
 ];
 
 /// A new backend is built and probed before it is written, as at startup: one that fails
@@ -121,6 +124,14 @@ impl AdminRoute {
     /// What the signing pair reaches, so the console shows only what it can do.
     fn whoami(&self, req: &S3Request<Body>) -> Value {
         let limit = self.live.auth().limit(req.credentials.as_ref());
+        // Only those the pair reaches, so a pair limited to one bucket learns no other's name.
+        let public: Vec<String> = self
+            .live
+            .current()
+            .public_bucket
+            .into_iter()
+            .filter(|b| limit.as_ref().is_none_or(|l| l.reaches_bucket(b)))
+            .collect();
         json!({
             "access_key": req.credentials.as_ref().map(|c| c.access_key.as_str()),
             "admin": limit.is_none(),
@@ -128,6 +139,7 @@ impl AdminRoute {
             "allow": limit.as_ref().and_then(|l| l.scopes()).map(|s| {
                 s.iter().map(|s| json!({ "bucket": s.bucket, "prefix": s.prefix })).collect::<Vec<_>>()
             }),
+            "public": public,
         })
     }
 
@@ -142,6 +154,10 @@ impl AdminRoute {
             "console_address": started.console_address.map(|a| a.to_string()),
             "tls": started.tls_cert.is_some(),
             "pending_restart": self.live.pending_restart(),
+            // Where the running server's log goes, which a page cannot otherwise tell: without
+            // a file it is stderr, which in a container is `docker logs`.
+            "log_file": started.log_file.as_ref().map(|p| p.display().to_string()),
+            "log_forward": started.log_forward.as_deref().map(|u| forward::redact(u, "")),
         })
     }
 
@@ -208,6 +224,10 @@ impl AdminRoute {
             match value {
                 Value::Null => {
                     doc.remove(&name);
+                }
+                Value::String(s) if name == "log-forward" => {
+                    let url = forward::keep_password(&s, current.log_forward.as_deref());
+                    doc[name.as_str()] = toml_edit::value(url);
                 }
                 Value::String(s) => doc[name.as_str()] = toml_edit::value(s),
                 Value::Array(items) => {
@@ -416,6 +436,7 @@ fn config_view(live: &Live) -> Value {
             json!(format_duration(args.stale_upload_age)),
         ),
         setting("log-level", json!(args.log_level)),
+        setting("public-bucket", json!(args.public_bucket)),
         setting("backend", json!(args.backend)),
         setting(
             "log-format",
@@ -435,6 +456,13 @@ fn config_view(live: &Live) -> Value {
         setting("log-file", path_value(&args.log_file)),
         setting("log-max-size", json!(format_size(args.log_max_size))),
         setting("log-max-files", json!(args.log_max_files)),
+        // Without its password, which the page never needs: one sent back without it keeps it.
+        {
+            let url = args.log_forward.as_deref();
+            let mut s = setting("log-forward", json!(url.map(|u| forward::redact(u, ""))));
+            s["secret"] = json!(url.is_some_and(forward::has_password));
+            s
+        },
     ];
     let credentials: Vec<Value> = args
         .credentials
@@ -466,6 +494,7 @@ fn config_view(live: &Live) -> Value {
         "settings": settings,
         "backend_opts": backend_opts,
         "backend_opts_locked": args.locked.iter().any(|l| l == "backend-opt"),
+        "backends": backend::schemes(),
         "pending_restart": live.pending_restart(),
         "credentials": credentials,
     })

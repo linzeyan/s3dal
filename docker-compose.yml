@@ -23,8 +23,16 @@ services:
       S3DAL_ACCESS_KEY: ${S3DAL_ACCESS_KEY:?set S3DAL_ACCESS_KEY in .env}
       S3DAL_SECRET_KEY: ${S3DAL_SECRET_KEY:?set S3DAL_SECRET_KEY in .env}
       S3DAL_CONSOLE_ADDRESS: 0.0.0.0:9001
+      # The log goes to `docker compose logs`. To keep it in a file as well, set this and the
+      # `logs` volume below; to send it to Graylog or Elasticsearch, S3DAL_LOG_FORWARD, as in
+      # gelf+udp://graylog:12201 or elasticsearch+https://user:password@es:9200/logs-s3dal-default.
+      # Or leave them out here and set them in the console's Settings, which saves them in the
+      # config volume: a variable set here locks its setting there.
+      #   S3DAL_LOG_FILE: /var/log/s3dal/s3dal.log
+      #   S3DAL_LOG_FORWARD: gelf+udp://graylog:12201
     volumes:
       - data:/data
+      #   - logs:/var/log/s3dal
       # The config file, /etc/s3dal/s3dal.toml: a copy of the image's on first start. To edit it
       # on the host instead, put it at ./config/s3dal.toml and mount the directory in place of
       # the volume, as below; s3dal applies a saved edit within seconds. On Linux the console
@@ -46,3 +54,4 @@ services:
 volumes:
   data:
   config:
+  # logs:

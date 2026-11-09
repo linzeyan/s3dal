@@ -1,4 +1,7 @@
-//! The server's log: levels that a reload can change, and a file that rotates by size.
+//! The server's log: levels that a reload can change, a file that rotates by size, and a
+//! collector it can also be sent to.
+
+pub mod forward;
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -106,7 +109,13 @@ impl RotatingFile {
     }
 }
 
+/// Creates the directories the file goes in, as the fs backend does for its root: a path in a
+/// directory that does not exist yet, such as a fresh volume's `logs/`, is not a mistake to stop
+/// on. Also on every reopen, so a directory removed under a running server comes back.
 fn open_append(path: &Path) -> io::Result<File> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
     OpenOptions::new().create(true).append(true).open(path)
 }
 
@@ -268,6 +277,20 @@ mod tests {
         write(&log, &line(30));
         assert_eq!(len(&numbered(&path, 1)), Some(80));
         assert_eq!(len(&path), Some(30));
+    }
+
+    #[test]
+    fn missing_directories_of_the_log_file_are_created() {
+        // `S3DAL_LOG_FILE=/var/log/s3dal/s3dal.log` on a fresh volume must start the server,
+        // not stop it for a directory nobody had a reason to create by hand.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a/b/s3dal.log");
+        let log = RotatingFile::open(&path, 10, 1).unwrap();
+        write(&log, &line(8));
+        // Removed while the server runs, by a cleanup job, say: the next rotation recreates it.
+        std::fs::remove_dir_all(dir.path().join("a")).unwrap();
+        write(&log, &line(8));
+        assert_eq!(len(&path), Some(8));
     }
 
     #[test]

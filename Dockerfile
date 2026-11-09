@@ -10,10 +10,11 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY docker/about.toml docker/about.hbs ./docker/
-# /data is created here because the runtime image has no shell to create it.
+# /data and the log directory are created here because the runtime image has no shell to create
+# them.
 RUN cargo build --release --locked --bin s3dal \
     && cargo about generate --locked -c docker/about.toml -o THIRD-PARTY-LICENSES docker/about.hbs \
-    && mkdir /data
+    && mkdir /data /log
 
 # distroless/cc carries glibc, libgcc and CA certificates (for HTTPS upstreams), and no shell
 # or package manager. The nonroot tag runs as uid 65532.
@@ -24,6 +25,9 @@ COPY LICENSE NOTICE /usr/share/doc/s3dal/
 COPY --from=build /src/THIRD-PARTY-LICENSES /usr/share/doc/s3dal/
 # A named volume copies this directory's owner when first mounted, so s3dal can write to it.
 COPY --from=build --chown=65532:65532 /data /data
+# For S3DAL_LOG_FILE: s3dal creates a log file's missing directories, but /var/log is root's.
+# Not a volume: the log goes to stderr unless a file is asked for.
+COPY --from=build --chown=65532:65532 /log /var/log/s3dal
 # Keeps objects out of the container's writable layer, which is removed with the container,
 # even when no volume is given.
 VOLUME ["/data"]

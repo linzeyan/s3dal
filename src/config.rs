@@ -11,14 +11,21 @@ use clap::{ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::Deserialize;
 
 use crate::access::{Access, Limit};
+use crate::logging::forward;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "s3dal",
     version,
-    about = "Expose any Apache OpenDAL backend as an S3-compatible endpoint"
+    about = "Expose any Apache OpenDAL backend as an S3-compatible endpoint",
+    disable_version_flag = true
 )]
 pub struct Cli {
+    // clap's own flag is `-V` alone; `-v` is what most tools take, and typing it got an error.
+    /// Print version
+    #[arg(short = 'v', short_alias = 'V', long, action = ArgAction::Version)]
+    version: Option<bool>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -151,6 +158,18 @@ pub struct ServeArgs {
     #[arg(long, env = "S3DAL_LOG_MAX_FILES", default_value = "5")]
     pub log_max_files: u32,
 
+    /// Also send the log to a collector: `gelf+udp://host:12201`, `gelf+tcp://...` or
+    /// `gelf+https://host/gelf` for Graylog, or `elasticsearch+https://user:password@host:9200/index`
+    /// for Elasticsearch and OpenSearch.
+    // Hidden from `--help` as the secret key is: the URL may carry a password.
+    #[arg(long, env = "S3DAL_LOG_FORWARD", hide_env_values = true, value_parser = parse_log_forward)]
+    pub log_forward: Option<String>,
+
+    /// Buckets whose objects anyone may download without a key pair; repeatable, or
+    /// comma-separated. Listing, uploading and deleting still need one.
+    #[arg(long, env = "S3DAL_PUBLIC_BUCKETS", value_delimiter = ',')]
+    pub public_bucket: Vec<String>,
+
     /// Address and port of the web console; without it there is none. It speaks HTTPS when the
     /// S3 port does, with the same certificate.
     #[arg(long, env = "S3DAL_CONSOLE_ADDRESS")]
@@ -203,6 +222,14 @@ impl ServeArgs {
         ));
         out.push(format!("log-max-files = {}", self.log_max_files));
         out.extend(
+            self.log_forward
+                .as_deref()
+                .map(|url| format!("log-forward = {:?}", forward::redact(url, "<redacted>"))),
+        );
+        if !self.public_bucket.is_empty() {
+            out.push(format!("public-bucket = {:?}", self.public_bucket));
+        }
+        out.extend(
             self.console_address
                 .map(|a| format!("console-address = \"{a}\"")),
         );
@@ -253,6 +280,15 @@ impl ServeArgs {
         check_key_pairs(&self.credentials)?;
         if self.tls_cert.is_some() != self.tls_key.is_some() {
             return Err("--tls-cert and --tls-key must be given together".into());
+        }
+        // Whole buckets only: a folder made public would need its own rule for listings and
+        // for keys that merely start like it, which is what `allow` already does for key pairs.
+        for name in &self.public_bucket {
+            if name.is_empty() || name.contains('/') {
+                return Err(format!(
+                    "public bucket {name:?}: expected a bucket name, without a folder"
+                ));
+            }
         }
         Ok(())
     }
@@ -613,6 +649,12 @@ fn parse_size(s: &str) -> Result<u64, String> {
 /// there with the file named rather than when it is applied.
 fn parse_log_level(s: &str) -> Result<String, String> {
     crate::logging::filter(s).map(|_| s.to_owned())
+}
+
+/// Checked when read, as the level is, so a URL with a typo stops the server at startup or
+/// fails the reload, rather than leaving the log unsent.
+fn parse_log_forward(s: &str) -> Result<String, String> {
+    forward::Target::parse(s).map(|_| s.to_owned())
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -1015,6 +1057,49 @@ mod tests {
         assert_eq!(args.log_max_size, 100 * 1024 * 1024);
         assert_eq!(args.log_max_files, 5);
         assert_eq!(args.log_file, None);
+    }
+
+    #[test]
+    fn public_buckets_and_the_log_collector_are_checked_when_read() {
+        // A folder named as a public bucket would open nothing, or more than meant, depending
+        // on how it was read; a collector URL with a typo would leave the log unsent. Both are
+        // refused at startup instead.
+        let keys = ["--backend", "fs", "--access-key", "a", "--secret-key", "b"];
+        let args = serve(&[&keys[..], &["--public-bucket", "site,assets"]].concat()).unwrap();
+        assert_eq!(args.public_bucket, ["site", "assets"]);
+        assert!(serve(&[&keys[..], &["--public-bucket", "site/img"]].concat()).is_err());
+        assert!(serve(&[&keys[..], &["--log-forward", "graylog:12201"]].concat()).is_err());
+
+        let file = config_file(
+            "backend = \"fs\"\npublic-bucket = [\"site\"]\n\
+             log-forward = \"gelf+tcp://graylog:12201\"\n\
+             [[credentials]]\naccess-key = \"a\"\nsecret-key = \"b\"\n",
+        );
+        let args = serve(&["--config", file.path().to_str().unwrap()]).unwrap();
+        assert_eq!(args.public_bucket, ["site"]);
+        assert_eq!(
+            args.log_forward.as_deref(),
+            Some("gelf+tcp://graylog:12201")
+        );
+    }
+
+    #[test]
+    fn check_config_hides_the_collector_password() {
+        let keys = ["--backend", "fs", "--access-key", "a", "--secret-key", "b"];
+        let url = "elasticsearch+https://elastic:COLLECTOR-SECRET@es:9200/logs";
+        let args = serve(&[&keys[..], &["--log-forward", url]].concat()).unwrap();
+        let text = args.describe();
+        assert!(!text.contains("COLLECTOR-SECRET"), "{text}");
+        assert!(text.contains("elastic:<redacted>@es:9200"), "{text}");
+    }
+
+    #[test]
+    fn version_answers_to_both_v_and_capital_v() {
+        // `-v` is what most tools take; refusing it sent people to `--help` to find `-V`.
+        for flag in ["-v", "-V", "--version"] {
+            let err = Cli::try_parse_from(["s3dal", flag]).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::DisplayVersion, "{flag}");
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // The console's single page. Routes live in the URL hash, so the browser's back and forward
 // buttons and bookmarks work, and the server needs only one page.
 
-import { S3 } from "./s3.js";
+import { S3, objectPath } from "./s3.js";
 import {
   confirm,
   copyText,
@@ -23,12 +23,13 @@ const SESSION = "s3dal-session";
 
 let s3 = null;
 let signedInAs = "";
-// What the signed-in pair may reach, from the server: { admin, write, allow }. The page shows
-// only what it can do; the server checks every request regardless.
+// What the signed-in pair may reach, from the server: { admin, write, allow, public }. The page
+// shows only what it can do; the server checks every request regardless.
 let me = null;
 
 const isAdmin = () => me?.admin === true;
 const canWrite = () => me?.write === true;
+const isPublic = (bucket) => me?.public?.includes(bucket) === true;
 
 // The folders of `bucket` the pair is limited to, or null when it reaches the whole bucket.
 function scopesIn(bucket) {
@@ -195,7 +196,10 @@ function bucketsView() {
   const body = h("section", { class: "panel" }, loadingRows());
   const load = async () => {
     try {
-      const buckets = (await s3.listBuckets()).sort((a, b) => a.name.localeCompare(b.name));
+      // The settings tell whether the switch can save: the file may be read only, or the
+      // setting fixed by a flag or variable.
+      const [list, config] = await Promise.all([s3.listBuckets(), isAdmin() ? s3.config() : null]);
+      const buckets = list.sort((a, b) => a.name.localeCompare(b.name));
       if (!buckets.length) {
         body.replaceChildren(isAdmin()
           ? emptyState("bucket", "No buckets yet", "A bucket holds objects. Create one to start uploading.",
@@ -203,13 +207,27 @@ function bucketsView() {
           : emptyState("bucket", "No buckets", "This key pair reaches no existing bucket."));
         return;
       }
+      const setting = config?.settings.find((s) => s.name === "public-bucket");
+      if (setting) me.public = setting.value;
+      const access = (b) => {
+        if (!setting) return isPublic(b.name) ? h("span", { class: "pill accent" }, "Public") : h("span", { class: "muted" }, "Private");
+        const on = isPublic(b.name);
+        const input = h("input", {
+          type: "checkbox", role: "switch", checked: on, disabled: !setting.editable,
+          "aria-label": `Public: ${b.name}`,
+          onchange: () => setPublic(b.name, input.checked, input, load),
+        });
+        const why = setting.locked ? "Set by a flag or environment variable, which outranks the file" : config.reason;
+        return h("label", { class: "switch", title: setting.editable ? "" : why ?? "" }, input, on ? "Public" : "Private");
+      };
       body.replaceChildren(h("table", { class: "table" },
-        h("thead", {}, h("tr", {}, h("th", {}, "Name"), h("th", { class: "col-date" }, "Created"), h("th", { class: "col-actions" }))),
+        h("thead", {}, h("tr", {}, h("th", {}, "Name"), h("th", { class: "col-access" }, "Access"), h("th", { class: "col-date" }, "Created"), h("th", { class: "col-actions" }))),
         h("tbody", {}, buckets.map((b) => h("tr", {},
           h("td", {}, h("a", { class: "name-cell", href: bucketHref(b.name, "") }, icon("bucket"), h("span", { class: "truncate" }, b.name))),
+          h("td", { class: "col-access" }, access(b)),
           h("td", { class: "col-date muted" }, formatDate(b.created)),
           h("td", { class: "col-actions" }, isAdmin() &&
-            h("button", { class: "icon-button", title: `Delete ${b.name}`, "aria-label": `Delete ${b.name}`, onclick: () => deleteBucket(b.name, load) }, icon("trash"))),
+            h("button", { class: "icon-button", title: `Delete ${b.name}`, "aria-label": `Delete ${b.name}`, onclick: () => deleteBucket(b.name, load, setting) }, icon("trash"))),
         ))),
       ));
     } catch (err) {
@@ -246,16 +264,50 @@ async function createBucket() {
   }
 }
 
-async function deleteBucket(name, reload) {
+// Public means anyone may download the bucket's objects without a key pair; listing, uploading
+// and deleting still take one. Made private without asking: that only closes.
+async function setPublic(name, on, input, reload) {
+  if (on && !(await confirm({
+    title: `Make ${name} public?`,
+    message: "Anyone who has the address of an object in it can download it, without signing in. Listing the bucket, uploading and deleting still need a key pair.",
+    action: "Make public",
+  }))) {
+    input.checked = false;
+    return;
+  }
+  const next = on ? [...(me.public ?? []), name] : (me.public ?? []).filter((b) => b !== name);
+  try {
+    await s3.saveConfig({ settings: { "public-bucket": next.length ? next : null } });
+    me.public = next;
+    toast(on ? `${name} is public` : `${name} is private`);
+  } catch (err) {
+    input.checked = !on;
+    fail(err);
+  }
+  reload();
+}
+
+async function deleteBucket(name, reload, publicSetting) {
   const ok = await confirm({ title: `Delete ${name}?`, message: "Only an empty bucket can be deleted. This cannot be undone.", action: "Delete bucket" });
   if (!ok) return;
   try {
     await s3.deleteBucket(name);
     toast(`Deleted ${name}`);
-    reload();
   } catch (err) {
     fail(err);
+    return;
   }
+  // Otherwise a bucket created later under the same name would start out public.
+  if (publicSetting?.editable && isPublic(name)) {
+    const next = me.public.filter((b) => b !== name);
+    try {
+      await s3.saveConfig({ settings: { "public-bucket": next.length ? next : null } });
+      me.public = next;
+    } catch (err) {
+      fail(err);
+    }
+  }
+  reload();
 }
 
 // ----- Objects -----
@@ -472,17 +524,24 @@ function browserView(bucket, prefix) {
   }
 
   async function shareLink(key) {
-    const expiries = [["1 hour", 3600], ["1 day", 86400], ["7 days", 604800]];
+    const open = isPublic(bucket);
+    // A public bucket's objects need no signature, so their plain address never expires; it
+    // stops working when the bucket is made private, which a signed link outlives.
+    const expiries = [...(open ? [["Never, while the bucket is public", 0]] : []), ["1 hour", 3600], ["1 day", 86400], ["7 days", 604800]];
     const select = h("select", { class: "input" }, expiries.map(([label, secs]) => h("option", { value: String(secs) }, label)));
     const value = await dialog({
       title: "Copy a link",
-      body: [h("p", { class: "muted" }, "Anyone with the link can download this object until it expires, without signing in."),
-        field("Expires after", select)],
+      body: [h("p", { class: "muted" }, open
+        ? "This bucket is public: anyone with the link can download this object without signing in."
+        : "Anyone with the link can download this object until it expires, without signing in."),
+      field("Expires after", select)],
       actions: [{ label: "Cancel", value: "", kind: "ghost" }, { label: "Copy link", value: "ok", kind: "primary", autofocus: true }],
     });
     if (value !== "ok") return;
     try {
-      await copyText(await s3.presign(bucket, key, { expires: Number(select.value) }), "Link copied");
+      const secs = Number(select.value);
+      const link = secs ? await s3.presign(bucket, key, { expires: secs }) : `${location.origin}/s3${objectPath(bucket, key)}`;
+      await copyText(link, "Link copied");
     } catch (err) {
       fail(err);
     }
@@ -911,7 +970,8 @@ function serverView() {
   const load = async () => {
     try {
       const info = await s3.info();
-      const stat = (label, value, mono) => h("div", { class: "stat" }, h("div", { class: "stat-label" }, label), h("div", { class: `stat-value ${mono ? "mono" : ""}` }, value));
+      const stat = (label, value, mono, hint) => h("div", { class: "stat" }, h("div", { class: "stat-label" }, label),
+        h("div", { class: `stat-value ${mono ? "mono" : ""}` }, value), hint && h("div", { class: "muted small" }, hint));
       body.replaceChildren(
         info.pending_restart.length ? h("div", { class: "banner warn" }, icon("alert"),
           h("div", {}, h("strong", {}, "Restart to apply: "), info.pending_restart.join(", "),
@@ -923,6 +983,8 @@ function serverView() {
           stat("S3 endpoint", `${info.tls ? "https" : "http"}://${info.address}`, true),
           stat("Console", info.console_address ?? "—", true),
           stat("Region", REGION, true),
+          stat("Log", info.log_file ?? "stderr", true, info.log_file ? "Rotated by size; set in Settings." : "In a container, docker logs shows it. Set a file in Settings."),
+          stat("Log forwarding", info.log_forward ?? "Off", true, info.log_forward ? "" : "Graylog or Elasticsearch, set in Settings."),
         ),
         h("section", { class: "panel" },
           h("header", { class: "panel-header" }, h("h2", {}, "Backend profile"),
@@ -948,17 +1010,184 @@ const DESCRIPTIONS = {
   domain: "Base domains for virtual-hosted-style requests (bucket.domain). One per line.",
   "etag-buffer-limit": "Largest single upload hashed in memory for an MD5 ETag. B, KiB, MiB or GiB.",
   "stale-upload-age": "Unfinished multipart uploads older than this are removed. s, m, h or d; 0 keeps them.",
-  backend: "OpenDAL service the objects are stored in, such as fs, s3, azblob or gcs.",
-  "log-format": "text, or json for one object per line.",
+  backend: "OpenDAL service the objects are stored in. Its options are below.",
+  "log-format": "How each line of the log is written.",
   address: "Where the S3 API listens.",
   "console-address": "Where this console listens.",
   "tls-cert": "Certificate chain; replaced without a restart when the file changes.",
   "tls-key": "Private key of the certificate.",
-  "log-level": "A level (trace, debug, info, warn, error, off), then any target=level, comma-separated.",
-  "log-file": "File the log is written to; without it, stderr.",
+  "log-level": "The least severe lines logged. Custom takes target=level after it, comma-separated, as info,s3dal=debug.",
+  "log-file": "File the log is written to; missing folders are created. Empty, the log goes to stderr, which docker logs and journald show.",
   "log-max-size": "Size past which the log file is renamed to <file>.1 and a new one started; 0 never rotates.",
   "log-max-files": "Rotated log files kept; older ones are removed.",
+  "log-forward": "Also send the log to a collector, as well as to stderr or the file. Lines it cannot take in time are dropped, not waited for.",
 };
+
+const LEVELS = ["trace", "debug", "info", "warn", "error", "off"];
+
+const BACKENDS = { fs: "fs: a local directory", s3: "s3: an S3-compatible service", azblob: "azblob: Azure Blob Storage", gcs: "gcs: Google Cloud Storage" };
+
+const COLLECTORS = [
+  ["", "Off"],
+  ["gelf+udp", "Graylog: GELF over UDP"],
+  ["gelf+tcp", "Graylog: GELF over TCP"],
+  ["gelf+http", "Graylog: GELF over HTTP"],
+  ["gelf+https", "Graylog: GELF over HTTPS"],
+  ["elasticsearch+http", "Elasticsearch, OpenSearch: HTTP"],
+  ["elasticsearch+https", "Elasticsearch, OpenSearch: HTTPS"],
+];
+
+const COLLECTOR_ADDRESSES = {
+  "gelf+udp": "graylog:12201",
+  "gelf+tcp": "graylog:12201",
+  "gelf+http": "graylog:12201/gelf",
+  "gelf+https": "graylog.example.com/gelf",
+  "elasticsearch+http": "elastic@es:9200/logs-s3dal-default",
+  "elasticsearch+https": "elastic@es:9200/logs-s3dal-default",
+};
+
+const PLACEHOLDERS = { "log-file": "stderr", "console-address": "Off", "tls-cert": "None, plain HTTP", "tls-key": "None" };
+
+// The control a setting is edited with: a menu where its values are a fixed set, a text field
+// where they are not. `read()` gives what would be saved, null for the default; it throws on
+// input it cannot turn into a value, with a message for the page.
+function settingControl(s, config) {
+  const disabled = !s.editable;
+  const text = (props = {}) => h("input", { class: "input mono", disabled, spellcheck: "false", autocomplete: "off", ...props });
+  const menu = (options, value) => {
+    const el = h("select", { class: "input", disabled }, options.map(([v, label]) => h("option", { value: v }, label)));
+    el.value = value;
+    return el;
+  };
+  switch (s.name) {
+    case "log-format": {
+      const el = menu([["text", "Text, for people"], ["json", "JSON, one object per line"]], s.value);
+      return { el, read: () => el.value };
+    }
+    case "backend": {
+      // A scheme this page does not list, set in the file by hand, stays selectable.
+      const names = config.backends.includes(s.value) ? config.backends : [...config.backends, s.value];
+      const el = menu(names.map((n) => [n, BACKENDS[n] ?? n]), s.value);
+      return { el, read: () => el.value };
+    }
+    case "log-level":
+      return levelControl(s.value, text, menu);
+    case "log-forward":
+      return collectorControl(s, text, menu);
+    case "domain": {
+      const el = h("textarea", { class: "input mono", rows: 2, disabled, spellcheck: "false" });
+      el.value = (s.value ?? []).join("\n");
+      return {
+        el,
+        read: () => {
+          const list = el.value.split(/[\s,]+/).filter(Boolean);
+          return list.length ? list : null;
+        },
+      };
+    }
+    default: {
+      const el = text({ placeholder: PLACEHOLDERS[s.name] ?? "" });
+      el.value = s.value === null || s.value === undefined ? "" : String(s.value);
+      return { el, read: () => el.value.trim() || null };
+    }
+  }
+}
+
+// A level from the menu; Custom opens a field for directives such as info,s3dal=debug.
+function levelControl(value, text, menu) {
+  const level = value.toLowerCase();
+  const custom = !LEVELS.includes(level);
+  const select = menu([...LEVELS.map((l) => [l, l === "info" ? "info (default)" : l]), ["custom", "Custom…"]], custom ? "custom" : level);
+  const directives = text({ placeholder: "info,s3dal=debug", hidden: !custom, "aria-label": "Log directives" });
+  directives.value = custom ? value : "";
+  select.addEventListener("change", () => {
+    directives.hidden = select.value !== "custom";
+    if (!directives.hidden) {
+      directives.value ||= value;
+      directives.focus();
+    }
+  });
+  return {
+    el: h("div", { class: "control-stack" }, select, directives),
+    read: () => (select.value === "custom" ? directives.value.trim() || null : select.value),
+  };
+}
+
+// The collector as a menu of protocols and an address. The page is never sent the password; a
+// URL saved without one keeps the one the server has, so the field is filled only to change it.
+function collectorControl(s, text, menu) {
+  const at = s.value ? s.value.indexOf("://") : -1;
+  const scheme = at < 0 ? "" : s.value.slice(0, at);
+  const known = COLLECTORS.some(([v]) => v === scheme);
+  const select = menu(known ? COLLECTORS : [...COLLECTORS, [scheme, scheme]], scheme);
+  const address = text({ "aria-label": "Collector address" });
+  address.value = at < 0 ? "" : s.value.slice(at + 3);
+  const password = text({ type: "password", "aria-label": "Collector password" });
+  const paint = () => {
+    const on = select.value !== "";
+    address.hidden = !on;
+    address.placeholder = COLLECTOR_ADDRESSES[select.value] ?? "host:port";
+    password.hidden = !on || !select.value.includes("http");
+    password.placeholder = s.secret && select.value === scheme ? "Password unchanged" : "Password, if it takes one";
+  };
+  select.addEventListener("change", () => {
+    paint();
+    if (!address.hidden) address.focus();
+  });
+  paint();
+  return {
+    el: h("div", { class: "control-stack" }, select, address, password),
+    read: () => {
+      if (!select.value) return null;
+      let rest = address.value.trim();
+      const secret = password.hidden ? "" : password.value;
+      if (secret) {
+        const end = rest.search(/[/?#]/);
+        const authority = end < 0 ? rest : rest.slice(0, end);
+        const user = authority.lastIndexOf("@");
+        if (user < 0) throw new Error("Put the user before the host, as elastic@es:9200, to send a password.");
+        rest = `${authority.slice(0, user).split(":")[0]}:${encodeURIComponent(secret)}${rest.slice(user)}`;
+      }
+      return `${select.value}://${rest}`;
+    },
+  };
+}
+
+// One row of a settings form, and whether its value differs from the one it opened with.
+function settingRow(s, config) {
+  const control = settingControl(s, config);
+  const initial = JSON.stringify(control.read());
+  return {
+    control,
+    changed: () => {
+      try {
+        return JSON.stringify(control.read()) !== initial;
+      } catch {
+        return true;
+      }
+    },
+    row: h("div", { class: "setting" },
+      h("div", { class: "setting-text" },
+        h("div", { class: "setting-name mono" }, s.name, s.locked && h("span", { class: "pill", title: "Set by a flag or environment variable, which outranks the file" }, icon("lock", "icon small"), "Locked")),
+        h("div", { class: "muted small" }, DESCRIPTIONS[s.name])),
+      control.el),
+  };
+}
+
+// The changed settings of a form, as the server takes them; null if one cannot be read, which
+// has been reported.
+function changedSettings(rows) {
+  const settings = {};
+  try {
+    for (const [name, row] of Object.entries(rows)) {
+      if (row.changed()) settings[name] = row.control.read();
+    }
+  } catch (err) {
+    toast(err.message, { kind: "error" });
+    return null;
+  }
+  return settings;
+}
 
 // The two limits of a key pair, as the add and edit dialogs ask for them.
 function limitFields({ access = "read-write", allow = null } = {}) {
@@ -991,15 +1220,8 @@ function describeLimits(c) {
 function restartForm(config, save) {
   const inputs = {};
   const rows = config.settings.filter((s) => !s.live).map((s) => {
-    const value = s.value === null || s.value === undefined ? "" : String(s.value);
-    const input = h("input", { class: "input mono", value, disabled: !s.editable, spellcheck: "false" });
-    input.value = value;
-    inputs[s.name] = { input, initial: value };
-    return h("div", { class: "setting" },
-      h("div", { class: "setting-text" },
-        h("div", { class: "setting-name mono" }, s.name, s.locked && h("span", { class: "pill", title: "Set by a flag or environment variable, which outranks the file" }, icon("lock", "icon small"), "Locked")),
-        h("div", { class: "muted small" }, DESCRIPTIONS[s.name])),
-      input);
+    inputs[s.name] = settingRow(s, config);
+    return inputs[s.name].row;
   });
 
   const optsEditable = config.editable && !config.backend_opts_locked;
@@ -1033,7 +1255,7 @@ function restartForm(config, save) {
 
   const saveButton = h("button", { class: "button primary", type: "submit", disabled: true }, "Save for restart");
   const changed = () => {
-    saveButton.disabled = !optsChanged && !Object.values(inputs).some(({ input, initial }) => input.value !== initial);
+    saveButton.disabled = !optsChanged && !Object.values(inputs).some((row) => row.changed());
   };
   return h("form", {
     class: "panel",
@@ -1041,12 +1263,12 @@ function restartForm(config, save) {
       if (list.contains(e.target)) optsChanged = true;
       changed();
     },
+    // A menu's choice that shows or hides a field fires change, not input, in some browsers.
+    onchange: changed,
     onsubmit: async (e) => {
       e.preventDefault();
-      const settings = {};
-      for (const [name, { input, initial }] of Object.entries(inputs)) {
-        if (input.value !== initial) settings[name] = input.value.trim() || null;
-      }
+      const settings = changedSettings(inputs);
+      if (!settings) return;
       const edit = { settings };
       if (optsChanged) {
         edit.backend_opts = opts.filter((o) => o.name.value.trim())
@@ -1173,36 +1395,21 @@ function settingsView() {
     );
 
     const inputs = {};
-    const liveRows = config.settings.filter((s) => s.live).map((s) => {
-      const value = Array.isArray(s.value) ? s.value.join("\n") : s.value ?? "";
-      const input = s.name === "domain"
-        ? h("textarea", { class: "input mono", rows: 2, value, disabled: !s.editable, spellcheck: "false" })
-        : h("input", { class: "input mono", value, disabled: !s.editable, spellcheck: "false" });
-      input.value = value;
-      inputs[s.name] = { input, initial: value };
-      return h("div", { class: "setting" },
-        h("div", { class: "setting-text" },
-          h("div", { class: "setting-name mono" }, s.name, s.locked && h("span", { class: "pill", title: "Set by a flag or environment variable, which outranks the file" }, icon("lock", "icon small"), "Locked")),
-          h("div", { class: "muted small" }, DESCRIPTIONS[s.name])),
-        input);
+    // Public buckets are switched on the Buckets page, next to the buckets themselves.
+    const liveRows = config.settings.filter((s) => s.live && s.name !== "public-bucket").map((s) => {
+      inputs[s.name] = settingRow(s, config);
+      return inputs[s.name].row;
     });
     const saveButton = h("button", { class: "button primary", type: "submit", disabled: true }, "Save changes");
+    const changed = () => { saveButton.disabled = !Object.values(inputs).some((row) => row.changed()); };
     const form = h("form", {
       class: "panel",
-      oninput: () => { saveButton.disabled = !Object.values(inputs).some(({ input, initial }) => input.value !== initial); },
+      oninput: changed,
+      onchange: changed,
       onsubmit: async (e) => {
         e.preventDefault();
-        const settings = {};
-        for (const [name, { input, initial }] of Object.entries(inputs)) {
-          if (input.value === initial) continue;
-          const v = input.value.trim();
-          if (name === "domain") {
-            const list = v.split(/[\s,]+/).filter(Boolean);
-            settings[name] = list.length ? list : null;
-          } else {
-            settings[name] = v || null;
-          }
-        }
+        const settings = changedSettings(inputs);
+        if (!settings) return;
         saveButton.disabled = true;
         const regionChanged = "region" in settings;
         if (await save({ settings }, "Settings saved and applied") && regionChanged) {
@@ -1231,7 +1438,7 @@ function settingsView() {
 
   // Outside `body`, which the server's answer replaces: this one needs no server.
   const ask = h("input", {
-    type: "checkbox", checked: askBeforeReplacing(),
+    type: "checkbox", role: "switch", checked: askBeforeReplacing(),
     onchange: () => localStorage.setItem(ASK_REPLACE, ask.checked ? "1" : "0"),
   });
   const browser = h("section", { class: "panel" },

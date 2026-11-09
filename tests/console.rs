@@ -46,6 +46,7 @@ impl ConsoleServer {
         let backend = Backend::fs().await;
         let dal = S3Dal::new(backend.op.clone(), backend.profile, args.settings());
         let auth = server::LiveAuth::new(&args.credentials, &args.domain).unwrap();
+        auth.set_public(&args.public_bucket);
         let live = Arc::new(Live::new(argv, args, dal.clone(), auth.clone(), None));
         let service = server::build_service(dal, &auth, Some(live.clone()));
 
@@ -221,6 +222,66 @@ async fn a_console_edit_is_written_to_the_file_and_applied_at_once() {
 }
 
 #[tokio::test]
+async fn a_bucket_made_public_in_the_console_opens_at_once() {
+    // The switch on the Buckets page saves this setting; a public link copied right after must
+    // work, on the S3 port and on the console's own origin, where the console builds it.
+    let server = ConsoleServer::start(CONFIG, &[]).await;
+    let s3 = client(&server.s3, ACCESS_KEY, SECRET_KEY);
+    s3.create_bucket().bucket("site").send().await.unwrap();
+    s3.put_object()
+        .bucket("site")
+        .key("a.txt")
+        .body(b"hello".to_vec().into())
+        .send()
+        .await
+        .unwrap();
+    let (status, _) = raw_request(&server.s3, "GET", "/site/a.txt", &[], b"").await;
+    assert_eq!(status, 403);
+
+    let edit = r#"{"settings":{"public-bucket":["site"]}}"#;
+    let (status, body) = server.api("PUT", "/_s3dal/admin/config", edit).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(server.file_text().contains("public-bucket = [\"site\"]"));
+    for (endpoint, path) in [
+        (&server.s3, "/site/a.txt"),
+        (&server.console, "/s3/site/a.txt"),
+    ] {
+        let (status, body) = raw_request(endpoint, "GET", path, &[], b"").await;
+        assert_eq!((status, body.as_slice()), (200, &b"hello"[..]), "{path}");
+    }
+    let (_, body) = server.api("GET", "/_s3dal/admin/whoami", "").await;
+    assert!(body.contains("\"public\":[\"site\"]"), "{body}");
+}
+
+#[tokio::test]
+async fn the_collector_password_never_reaches_the_page_and_survives_its_edits() {
+    // As with a backend's credentials: the page is never sent the password, so a URL it sends
+    // back without one keeps it rather than blanking it.
+    let config = "backend = \"fs\"\n\
+                  log-forward = \"elasticsearch+https://elastic:COLLECTOR-SECRET@es:9200/logs\"\n\
+                  [[credentials]]\naccess-key = \"s3dal-test-access\"\n\
+                  secret-key = \"s3dal-test-secret\"\n";
+    let server = ConsoleServer::start(config, &[]).await;
+    for path in ["/_s3dal/admin/config", "/_s3dal/admin/info"] {
+        let (status, body) = server.api("GET", path, "").await;
+        assert_eq!(status, 200, "{body}");
+        assert!(!body.contains("COLLECTOR-SECRET"), "{path}: {body}");
+        assert!(body.contains("elastic@es:9200/logs"), "{path}: {body}");
+    }
+    let edit = r#"{"settings":{"log-forward":"elasticsearch+https://elastic@es:9200/other"}}"#;
+    let (status, body) = server.api("PUT", "/_s3dal/admin/config", edit).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        server
+            .file_text()
+            .contains("elasticsearch+https://elastic:COLLECTOR-SECRET@es:9200/other"),
+        "{}",
+        server.file_text()
+    );
+    assert!(server.live.pending_restart().contains(&"log-forward"));
+}
+
+#[tokio::test]
 async fn a_console_edit_the_server_refuses_leaves_the_file_as_it_was() {
     // The file must never hold settings the server does not run with, or the next restart
     // would fail, or start with settings nobody saw take effect.
@@ -235,6 +296,8 @@ async fn a_console_edit_the_server_refuses_leaves_the_file_as_it_was() {
         // Listing pairs without their limits would lift them; the field is required.
         r#"{"credentials":[{"access_key":"s3dal-test-access"}]}"#,
         r#"{"settings":{"log-max-files":"many"}}"#,
+        r#"{"settings":{"log-forward":"graylog:12201"}}"#,
+        r#"{"settings":{"public-bucket":["site/img"]}}"#,
     ] {
         let (status, body) = server.api("PUT", "/_s3dal/admin/config", edit).await;
         assert_eq!(status, 400, "{edit}: {body}");

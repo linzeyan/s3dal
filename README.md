@@ -1,6 +1,6 @@
-<img src="src/console/assets/icon.svg" alt="" width="88" align="right">
+<p align="center"><img src="src/console/assets/icon.svg" alt="" width="96"></p>
 
-# s3dal
+<h1 align="center">s3dal</h1>
 
 s3dal serves the Amazon S3 API on top of an [Apache OpenDAL](https://opendal.apache.org/)
 backend: a local directory, an S3-compatible service, Azure Blob Storage, or Google Cloud
@@ -49,7 +49,9 @@ docker compose up -d
 
 The S3 API is on `http://localhost:9000`; the console on `http://localhost:9001`, where the
 key pair in `.env` signs in. Objects are kept in the volume `data`, the config file in the
-volume `config`. `S3DAL_PORT` and `S3DAL_CONSOLE_PORT` in `.env` move the host ports.
+volume `config`. `S3DAL_PORT` and `S3DAL_CONSOLE_PORT` in `.env` move the host ports. The log
+goes to `docker compose logs`; to keep it in a file as well, or send it to Graylog or
+Elasticsearch, see [Logs](guide/operations.md#logs).
 
 ### Docker
 
@@ -106,9 +108,11 @@ for secrets, which then stay out of shell history and process listings.
 | `--tls-key` | `S3DAL_TLS_KEY` | | PEM private key of the certificate |
 | `--log-format` | `S3DAL_LOG_FORMAT` | `text` | `text`, or `json` for one object per line; see [Logs](guide/operations.md#logs) |
 | `--log-level` | `S3DAL_LOG_LEVEL` | `info` | A level, then any `target=level`, comma-separated, as in `info,s3dal=debug` |
-| `--log-file` | `S3DAL_LOG_FILE` | | File the log is written to; without it, stderr |
+| `--log-file` | `S3DAL_LOG_FILE` | | File the log is written to, its missing directories created; without it, stderr |
 | `--log-max-size` | `S3DAL_LOG_MAX_SIZE` | `100MiB` | Size past which the log file is renamed to `<file>.1` and a new one started; `0` never rotates |
 | `--log-max-files` | `S3DAL_LOG_MAX_FILES` | `5` | Rotated log files kept |
+| `--log-forward` | `S3DAL_LOG_FORWARD` | | Also send the log to Graylog (`gelf+udp://host:12201`, `gelf+tcp://…`, `gelf+https://…`) or Elasticsearch/OpenSearch (`elasticsearch+https://user:password@host:9200/index`); see [Logs](guide/operations.md#logs) |
+| `--public-bucket` | `S3DAL_PUBLIC_BUCKETS` | | A bucket whose objects anyone may download without a key pair; repeatable, or comma-separated. See [Public buckets](#public-buckets) |
 
 `s3dal check-config` takes the same flags, variables and file as `serve`, and prints the
 settings `serve` would run with, secrets redacted, or what is wrong with them.
@@ -148,7 +152,8 @@ paths are relative to the working directory.
 ### Key pairs
 
 There is no anonymous mode: s3dal does not start without a key pair, and every request must be
-signed (SigV4, in headers, as a presigned URL, or as a POST policy).
+signed (SigV4, in headers, as a presigned URL, or as a POST policy). The one exception is a
+download from a [public bucket](#public-buckets).
 
 A pair reaches every bucket unless its `[[credentials]]` table limits it:
 
@@ -165,6 +170,20 @@ limits, and the file's `[[credentials]]` are added to it. That pair cannot be re
 changed from the console, so the operator always keeps a way in. `s3dal keygen` prints a new
 random pair in the file's form.
 
+### Public buckets
+
+A bucket named in `public-bucket` (in the config file, `public-bucket = ["site"]`) serves its
+objects to anyone, without a signature: `GET` and `HEAD` of an object, so
+`http://host:9000/site/logo.png` works in a browser or an `<img>` tag. Nothing else is open:
+listing the bucket, uploading, deleting, and an object's ACL and tags still need a key pair, and
+so does every other bucket. The console's Buckets page switches a bucket between public and
+private, and its "Copy link" offers a link that does not expire for an object in a public
+bucket.
+
+The setting names buckets, not folders, and outlives a bucket: one deleted with an S3 client
+and created again under the same name is public again. The console takes the name off the list
+when it deletes the bucket.
+
 ### Changes while it runs
 
 s3dal watches the config file, and the certificate and key it names, and applies a saved
@@ -172,9 +191,10 @@ change within about two seconds; `kill -HUP` applies it at once. Requests in fli
 cut.
 
 - Applied at once: key pairs, `region`, `domain`, `etag-buffer-limit`, `stale-upload-age`,
-  `log-level`, and a renewed certificate and key.
+  `log-level`, `public-bucket`, and a renewed certificate and key.
 - `backend`, `backend-opt`, `address`, `console-address`, `log-format`, `log-file`,
-  `log-max-size`, `log-max-files`, and turning TLS on or off take a restart. Until then the log, and the console, say a restart is pending.
+  `log-max-size`, `log-max-files`, `log-forward`, and turning TLS on or off take a restart.
+  Until then the log, and the console, say a restart is pending.
 - A file with a mistake changes nothing: the log says what is wrong, and s3dal keeps running
   with the settings it had. `s3dal check-config` shows the same error before you save.
 
@@ -186,11 +206,13 @@ cut.
   in parallel parts, each with a SHA-512 checksum the server verifies and keeps), preview
   images and text, download, delete, copy a link that expires. An upload asks before it
   replaces an object of the same name: replace, skip, or keep both under a new name (turned
-  off in Settings, per browser);
+  off in Settings, per browser); make a bucket public or private;
 - key pairs: add, remove, and set their limits;
 - settings: change those that apply at once, and save the rest, the backend included, for
-  the next restart; a new backend is probed first, so the restart does not find it broken;
-- server: version, uptime, backend and what it stores natively.
+  the next restart; a new backend is probed first, so the restart does not find it broken.
+  A setting with a fixed set of values (backend, log level, log format, log collector) is a
+  menu;
+- server: version, uptime, backend and what it stores natively, and where the log goes.
 
 You sign in with any key pair, and see what it may do: a pair with limits sees only its
 buckets and folders, and no write controls if it is read-only. The console signs each request

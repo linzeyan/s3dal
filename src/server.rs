@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::{Future, poll_fn};
 use std::io;
 use std::path::Path;
@@ -80,6 +80,8 @@ struct Auth {
     limits: HashMap<String, Arc<Limit>>,
     /// `None` without domains: s3s's MultiDomain refuses an empty list.
     domains: Option<MultiDomain>,
+    /// Buckets whose objects an unsigned request may read.
+    public: HashSet<String>,
 }
 
 impl LiveAuth {
@@ -112,12 +114,25 @@ impl LiveAuth {
                     .context("invalid domain for virtual-hosted-style requests")?,
             )
         };
-        *self.0.write().unwrap_or_else(PoisonError::into_inner) = Auth {
-            secrets,
-            limits,
-            domains,
-        };
+        // The public buckets are kept: they are set on their own, by `set_public`.
+        let mut auth = self.0.write().unwrap_or_else(PoisonError::into_inner);
+        auth.secrets = secrets;
+        auth.limits = limits;
+        auth.domains = domains;
         Ok(())
+    }
+
+    /// The buckets whose objects anyone may download, without a key pair. Nothing else about
+    /// them is open: listing them, writing to them and their settings still need a signature.
+    pub fn set_public(&self, buckets: &[String]) {
+        self.0
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .public = buckets.iter().cloned().collect();
+    }
+
+    pub(crate) fn is_public(&self, bucket: &str) -> bool {
+        self.read().public.contains(bucket)
     }
 
     /// The limits of the pair that signed, `None` when it has none.
@@ -219,9 +234,15 @@ impl Access {
 #[async_trait::async_trait]
 impl S3Access for Access {
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
-        // What s3s's default check does; replacing the check must not open anonymous access.
+        // What s3s's default check does, but for downloads from a public bucket; replacing the
+        // check must open no other anonymous access. An object's ACL, tags and attributes are
+        // other operations, so they stay closed.
         if cx.credentials().is_none() {
-            return Err(s3_error!(AccessDenied, "Signature is required"));
+            let download = matches!(cx.s3_op().name(), "GetObject" | "HeadObject")
+                && matches!(cx.s3_path(), S3Path::Object { bucket, .. } if self.0.is_public(bucket));
+            if !download {
+                return Err(s3_error!(AccessDenied, "Signature is required"));
+            }
         }
         // A guard against acting on a bucket another account owns. Buckets here have no owning
         // account id, so the comparison cannot be made, and skipping it would act anyway.

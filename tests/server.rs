@@ -67,6 +67,62 @@ async fn unsigned_requests_are_rejected() {
 }
 
 #[tokio::test]
+async fn a_public_bucket_opens_downloads_and_nothing_else() {
+    // Making a bucket public is for links that need no key, to images on a web page, say. A
+    // listing would hand out every key in it, and a write would let anyone fill the disk, so
+    // those, other buckets, and an object's ACL and tags stay behind a signature.
+    let server = TestServer::start().await;
+    server.create_bucket_dir("site").await;
+    server.create_bucket_dir("private").await;
+    server.plant("site", "logo.png", b"png").await;
+    server.plant("private", "k", b"secret").await;
+    server.auth.set_public(&["site".to_owned()]);
+
+    let (status, body) = raw_request(&server.endpoint, "GET", "/site/logo.png", &[], b"").await;
+    assert_eq!((status, body.as_slice()), (200, &b"png"[..]));
+    let (status, _) = raw_request(&server.endpoint, "HEAD", "/site/logo.png", &[], b"").await;
+    assert_eq!(status, 200);
+    let (status, _) = raw_request(&server.endpoint, "GET", "/site/missing", &[], b"").await;
+    assert_eq!(status, 404);
+    for (method, path) in [
+        ("GET", "/"),
+        ("GET", "/site?list-type=2"),
+        ("GET", "/site"),
+        ("GET", "/site/logo.png?acl"),
+        ("GET", "/site/logo.png?tagging"),
+        ("DELETE", "/site/logo.png"),
+        ("GET", "/private/k"),
+    ] {
+        let (status, _) = raw_request(&server.endpoint, method, path, &[], b"").await;
+        assert_eq!(status, 403, "{method} {path}");
+    }
+    let (status, _) = raw_request(&server.endpoint, "PUT", "/site/new", &[], b"data").await;
+    assert_eq!(status, 403);
+    assert!(!server.exists("site/new").await);
+    assert!(server.exists("site/logo.png").await);
+
+    // Made private again, as a config reload does, it closes at once.
+    server.auth.set_public(&[]);
+    let (status, _) = raw_request(&server.endpoint, "GET", "/site/logo.png", &[], b"").await;
+    assert_eq!(status, 403);
+}
+
+#[tokio::test]
+async fn a_key_pair_reload_keeps_the_public_buckets() {
+    // The two are set apart; replacing the pairs must not quietly close, or open, a bucket.
+    let server = TestServer::start().await;
+    server.create_bucket_dir("site").await;
+    server.plant("site", "a", b"a").await;
+    server.auth.set_public(&["site".to_owned()]);
+    server
+        .auth
+        .replace(&[KeyPair::new(ACCESS_KEY, SECRET_KEY)], &[])
+        .unwrap();
+    let (status, _) = raw_request(&server.endpoint, "GET", "/site/a", &[], b"").await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
 async fn the_health_check_answers_without_a_signature_and_never_shadows_a_signed_request() {
     // Container runtimes and load balancers probe without credentials, and a probe that got 403
     // or 501 could not tell a healthy server from a broken one. Yet a signed request for the same

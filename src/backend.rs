@@ -68,6 +68,22 @@ pub struct Profile {
     pub conditional_writes: bool,
 }
 
+/// The services this build can store objects in, as the console offers them. `memory` is
+/// built in for tests, and left out: it loses every object on restart.
+pub fn schemes() -> Vec<&'static str> {
+    let mut schemes = vec!["fs"];
+    if cfg!(feature = "services-s3") {
+        schemes.push("s3");
+    }
+    if cfg!(feature = "services-azblob") {
+        schemes.push("azblob");
+    }
+    if cfg!(feature = "services-gcs") {
+        schemes.push("gcs");
+    }
+    schemes
+}
+
 /// Builds an operator from an OpenDAL scheme and its options.
 pub fn build_operator(scheme: &str, opts: &[(String, String)]) -> anyhow::Result<Operator> {
     // Registers the services and, for remote ones, the process-wide HTTP transport; without
