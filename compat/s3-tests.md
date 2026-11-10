@@ -17,10 +17,10 @@ How to read it:
 
 | backend | passed / total | pass rate | failed | error | skipped | s3dal source |
 |---|--:|--:|--:|--:|--:|---|
-| azblob-azurite | 283 / 1042 | 27.1% | 601 | 0 | 158 | `53ccbf2` |
-| fs | 281 / 1042 | 26.9% | 603 | 0 | 158 | `53ccbf2` |
-| gcs-fake | 283 / 1042 | 27.1% | 601 | 0 | 158 | `53ccbf2` |
-| s3-rustfs | 283 / 1042 | 27.1% | 601 | 0 | 158 | `53ccbf2` |
+| azblob-azurite | 283 / 1042 | 27.1% | 601 | 0 | 158 | `cd15f63` |
+| fs | 281 / 1042 | 26.9% | 603 | 0 | 158 | `cd15f63` |
+| gcs-fake | 283 / 1042 | 27.1% | 601 | 0 | 158 | `cd15f63` |
+| s3-rustfs | 283 / 1042 | 27.1% | 601 | 0 | 158 | `cd15f63` |
 
 ## Pass rate by category
 

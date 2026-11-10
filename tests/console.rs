@@ -399,22 +399,16 @@ async fn restart_asked(live: &Live) -> bool {
 async fn a_restart_is_refused_while_the_server_would_not_start_again() {
     // A server that stops and then fails to start leaves nothing to fix the settings from,
     // the console included; what would fail must be found while it still runs.
+    // The root as a flag, as `--backend`: scripts/with-rustfs.sh exports S3DAL_BACKEND_OPTS for
+    // the whole run, which outranks the file.
     let root = tempfile::tempdir().unwrap();
-    let config = format!("{CONFIG}\n[backend-opt]\nroot = {:?}\n", root.path());
-    let server = ConsoleServer::start(&config, &[]).await;
+    let root_flag = format!("--backend-opt=root={}", root.path().display());
+    let server = ConsoleServer::start(CONFIG, &[&root_flag]).await;
     let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let not_a_dir = tempfile::NamedTempFile::new().unwrap();
     for (file, says) in [
         (
-            format!("address = \"{}\"\n{config}", taken.local_addr().unwrap()),
+            format!("address = \"{}\"\n{CONFIG}", taken.local_addr().unwrap()),
             "cannot listen on",
-        ),
-        (
-            format!(
-                "{CONFIG}\n[backend-opt]\nroot = {:?}\n",
-                not_a_dir.path().join("x")
-            ),
-            "backend",
         ),
         ("this is not toml".to_owned(), "do not read"),
     ] {
@@ -426,10 +420,22 @@ async fn a_restart_is_refused_while_the_server_would_not_start_again() {
     }
 
     // Once it would, the restart is asked for.
-    std::fs::write(server.file.path(), &config).unwrap();
+    std::fs::write(server.file.path(), CONFIG).unwrap();
     let (status, body) = server.api("POST", "/_s3dal/admin/restart", "").await;
     assert_eq!(status, 200, "{body}");
     assert!(restart_asked(&server.live).await);
+
+    // A backend that does not work, which a start would stop on.
+    let not_a_dir = tempfile::NamedTempFile::new().unwrap();
+    let bad_root = format!(
+        "--backend-opt=root={}",
+        not_a_dir.path().join("x").display()
+    );
+    let server = ConsoleServer::start(CONFIG, &[&bad_root]).await;
+    let (status, body) = server.api("POST", "/_s3dal/admin/restart", "").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("backend"), "{body}");
+    assert!(!restart_asked(&server.live).await);
 }
 
 #[cfg(unix)]
