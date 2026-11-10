@@ -24,8 +24,9 @@ services:
       S3DAL_SECRET_KEY: ${S3DAL_SECRET_KEY:?set S3DAL_SECRET_KEY in .env}
       S3DAL_CONSOLE_ADDRESS: 0.0.0.0:9001
       # The log goes to `docker compose logs`. To keep it in a file as well, set this and the
-      # `logs` volume below; to send it to Graylog or Elasticsearch, S3DAL_LOG_FORWARD, as in
-      # gelf+udp://graylog:12201 or elasticsearch+https://user:password@es:9200/logs-s3dal-default.
+      # `logs` volume below; to send it to a collector (Graylog, Elasticsearch, syslog,
+      # OpenTelemetry, Splunk, any HTTP input), S3DAL_LOG_FORWARD, as in gelf+udp://graylog:12201
+      # or otlp+http://otel-collector:4318; guide/operations.md lists them all.
       # Or leave them out here and set them in the console's Settings, which saves them in the
       # config volume: a variable set here locks its setting there.
       #   S3DAL_LOG_FILE: /var/log/s3dal/s3dal.log

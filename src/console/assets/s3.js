@@ -343,4 +343,10 @@ export class S3 {
     });
     return res.json();
   }
+
+  // Answers once the server has checked that it would start again with the saved settings;
+  // it then stops taking requests and starts again.
+  async restart() {
+    return (await this.request("POST", "/_s3dal/admin/restart")).json();
+  }
 }

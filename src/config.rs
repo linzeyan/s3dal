@@ -159,8 +159,11 @@ pub struct ServeArgs {
     pub log_max_files: u32,
 
     /// Also send the log to a collector: `gelf+udp://host:12201`, `gelf+tcp://...` or
-    /// `gelf+https://host/gelf` for Graylog, or `elasticsearch+https://user:password@host:9200/index`
-    /// for Elasticsearch and OpenSearch.
+    /// `gelf+https://host/gelf` for Graylog; `elasticsearch+https://user:password@host:9200/index`
+    /// for Elasticsearch and OpenSearch; `syslog+udp://host:514`, `syslog+tcp://...` or
+    /// `syslog+tls://host:6514`; `otlp+https://host:4318` for OpenTelemetry;
+    /// `splunk+https://:TOKEN@host:8088` for Splunk HEC; `ndjson+https://host/path` for any HTTP
+    /// input.
     // Hidden from `--help` as the secret key is: the URL may carry a password.
     #[arg(long, env = "S3DAL_LOG_FORWARD", hide_env_values = true, value_parser = parse_log_forward)]
     pub log_forward: Option<String>,

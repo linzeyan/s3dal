@@ -98,14 +98,29 @@ stderr or the file keeps it too:
 | `gelf+tcp://graylog:12201` | A Graylog GELF TCP input, each message ended by a NUL byte |
 | `gelf+http://graylog:12201/gelf`, `gelf+https://…` | A Graylog GELF HTTP input, one POST per message; the path defaults to `/gelf` |
 | `elasticsearch+https://user:password@es:9200/index`, `elasticsearch+http://…` | The bulk API of Elasticsearch or OpenSearch, one request per batch. The index defaults to `logs-s3dal-default`, a data stream Elasticsearch's built-in `logs-*-*` template takes without setup. A query (`?pipeline=…`) is kept |
+| `syslog+udp://rsyslog:514` | A syslog server, RFC 5424, one datagram per message |
+| `syslog+tcp://rsyslog:514`, `syslog+tls://logs.example.com:6514` | A syslog server, RFC 5424, each message framed by its length (RFC 6587 octet counting); over TLS the server's certificate is checked as the system checks one |
+| `otlp+http://otel-collector:4318`, `otlp+https://…` | An OpenTelemetry collector (the OpenTelemetry Collector, Grafana Alloy), or a backend that takes OTLP over HTTP itself, such as Loki 3 at `otlp+http://loki:3100/otlp/v1/logs`; OTLP/HTTP JSON, one request per batch. The path defaults to `/v1/logs` |
+| `splunk+https://:TOKEN@splunk:8088`, `splunk+http://…` | Splunk's HTTP Event Collector, one request per batch; the token takes the password's place, with no user. The path defaults to `/services/collector/event` |
+| `ndjson+https://vector:8080/s3dal`, `ndjson+http://…` | Any HTTP input that takes newline-delimited JSON, such as Vector's `http_server` source: the lines as they are, one request per batch |
 
 - A GELF message carries the line's message as `short_message`, its level as a syslog level,
   the time it was logged, the container's hostname as `host`, and every other field with a
   leading `_`: `_status`, `_path`, `_span_id` (the request ID).
 - A bulk document is the line's JSON with its time as `@timestamp`.
+- A syslog message has the facility `daemon`, the line's level as its severity, the container's
+  hostname, `s3dal` as the app name and the line's JSON as the message, for the server's JSON
+  parser (rsyslog's `mmjsonparse` with `cookie=""`, syslog-ng's `json-parser`).
+- An OTLP record has the line's level as its severity, its message as the body, and every
+  other field as an attribute, the span's joined with a dot (`span.id`); the resource is
+  `service.name=s3dal` with the hostname as `host.name`. Records the collector reports as
+  rejected are not sent again.
+- A Splunk event is the line's JSON with `sourcetype` `_json`, so Splunk extracts its fields.
 - User and password go in the URL, percent-encoded, and are sent as HTTP Basic
-  authentication. `check-config`, the log and the console never show the password; a URL saved
-  from the console without one keeps the password it had.
+  authentication; Splunk's token is sent as `Authorization: Splunk <token>`. A collector that
+  wants another header (an API key) is reached through an OpenTelemetry collector or Vector in
+  front of it. `check-config`, the log and the console never show the password or token; a URL
+  saved from the console without one keeps the one it had.
 - Sending never holds up a request: lines wait in a queue of 10,000, which a thread of their
   own empties. While the collector cannot be reached, s3dal retries with a growing pause, up to
   30 seconds; lines that find the queue full are dropped. Lines the collector refuses (a 4xx
@@ -143,3 +158,7 @@ s3dal stops on SIGTERM or SIGINT (Ctrl-C): it stops listening at once, so new co
 refused and clients can go elsewhere, and gives in-flight requests up to 10 seconds to finish.
 The log says `stopping` when the signal comes and `stopped` at the end; with a log collector,
 s3dal then gives it up to 3 more seconds to take the last lines.
+
+A restart from the console stops the same way, the log saying `restarting` and the settings it
+applies, then runs the same command line again in the same process (`exec`), with the same
+environment. Between the two, while the new start probes the backend, connections are refused.

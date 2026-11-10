@@ -1,5 +1,7 @@
 //! Sends the log to a collector as well as to stderr or the log file: Graylog over GELF (UDP,
-//! TCP or HTTP), or Elasticsearch and OpenSearch over their bulk API.
+//! TCP or HTTP), Elasticsearch and OpenSearch over their bulk API, a syslog server (RFC 5424
+//! over UDP, TCP or TLS), an OpenTelemetry collector (OTLP over HTTP), Splunk's HTTP Event
+//! Collector, or any HTTP input that takes newline-delimited JSON.
 //!
 //! tracing writes each line on the thread that logs it, a request's among them, and a collector
 //! that is slow or down must not hold a request up. So a line only goes into a bounded queue
@@ -20,7 +22,7 @@ use tracing_subscriber::fmt::MakeWriter;
 
 /// Lines held while the collector is unreachable: a few MiB, minutes of a busy server's log.
 const QUEUE: usize = 10_000;
-/// Lines per bulk request, and the most sent before the dropped count is looked at again.
+/// Lines per HTTP request, and the most sent before the dropped count is looked at again.
 const BATCH: usize = 500;
 const TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PAUSE: Duration = Duration::from_secs(30);
@@ -28,18 +30,62 @@ const MAX_PAUSE: Duration = Duration::from_secs(30);
 const UDP_DATAGRAM: usize = 8192;
 const UDP_CHUNK_HEADER: usize = 12;
 const UDP_MAX_CHUNKS: usize = 128;
+/// Syslog over UDP has no chunks: a message is one datagram, which IPv4 bounds here.
+const UDP_MAX: usize = 65_507;
+/// RFC 5424's facility for system daemons, which s3dal is.
+const SYSLOG_DAEMON: u8 = 3;
 
-/// Where the log is sent, as `--log-forward` names it.
+const SCHEMES: [&str; 15] = [
+    "gelf+udp",
+    "gelf+tcp",
+    "gelf+http",
+    "gelf+https",
+    "elasticsearch+http",
+    "elasticsearch+https",
+    "syslog+udp",
+    "syslog+tcp",
+    "syslog+tls",
+    "otlp+http",
+    "otlp+https",
+    "splunk+http",
+    "splunk+https",
+    "ndjson+http",
+    "ndjson+https",
+];
+
+/// Where the log is sent, and in what form, as `--log-forward` names them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Target {
-    /// GELF, one datagram per message, split into chunks past one datagram.
-    GelfUdp(String),
-    /// GELF, each message ended by a NUL byte, on a connection kept open.
-    GelfTcp(String),
-    /// GELF, one POST per message, the way Graylog's HTTP input takes them.
-    GelfHttp(Http),
-    /// The bulk API, one POST per batch.
-    Elasticsearch(Http),
+pub struct Target {
+    pub format: Format,
+    pub transport: Transport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    /// GELF 1.1: over UDP one datagram per message, chunked past one; over TCP each message
+    /// ended by a NUL byte; over HTTP one POST per message.
+    Gelf,
+    /// Elasticsearch's bulk API, one POST per batch.
+    Bulk,
+    /// RFC 5424 with the line's JSON as the message; over TCP and TLS each message framed by
+    /// its length (RFC 6587's octet counting).
+    Syslog,
+    /// OTLP's JSON encoding, one POST per batch.
+    Otlp,
+    /// Splunk HEC events, one POST per batch.
+    Splunk,
+    /// The lines as tracing wrote them, one per line, one POST per batch.
+    Ndjson,
+}
+
+/// Addresses are kept as text and resolved on every connect: the collector's name may resolve
+/// only once its container is up, and to another address after it is replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transport {
+    Udp(String),
+    Tcp(String),
+    Tls(String),
+    Http(Http),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,27 +107,54 @@ impl Target {
         let (scheme, rest) = s
             .split_once("://")
             .ok_or("expected a URL such as gelf+udp://graylog:12201")?;
-        match scheme {
-            "gelf+udp" => host_port(rest).map(Self::GelfUdp),
-            "gelf+tcp" => host_port(rest).map(Self::GelfTcp),
-            "gelf+http" | "gelf+https" => http(scheme, rest, "/gelf").map(Self::GelfHttp),
-            "elasticsearch+http" | "elasticsearch+https" => {
+        let (format, transport) = scheme.split_once('+').unwrap_or((scheme, ""));
+        let (format, transport) = match (format, transport) {
+            ("gelf", "udp") => (Format::Gelf, Transport::Udp(host_port(rest)?)),
+            ("gelf", "tcp") => (Format::Gelf, Transport::Tcp(host_port(rest)?)),
+            ("gelf", "http" | "https") => (
+                Format::Gelf,
+                Transport::Http(http(transport, rest, "/gelf")?),
+            ),
+            ("elasticsearch", "http" | "https") => {
                 // A data stream name that Elasticsearch's built-in `logs-*-*` template matches,
                 // so the index needs no setup there.
-                let mut http = http(scheme, rest, "/logs-s3dal-default")?;
+                let mut http = http(transport, rest, "/logs-s3dal-default")?;
                 http.url = bulk_url(&http.url);
-                Ok(Self::Elasticsearch(http))
+                (Format::Bulk, Transport::Http(http))
             }
-            other => Err(format!(
-                "unknown collector {other:?}; use gelf+udp, gelf+tcp, gelf+http, gelf+https, \
-                 elasticsearch+http or elasticsearch+https"
-            )),
-        }
+            ("syslog", "udp") => (Format::Syslog, Transport::Udp(host_port(rest)?)),
+            ("syslog", "tcp") => (Format::Syslog, Transport::Tcp(host_port(rest)?)),
+            ("syslog", "tls") => (Format::Syslog, tls(host_port(rest)?)?),
+            // The path every OTLP/HTTP receiver takes logs on.
+            ("otlp", "http" | "https") => (
+                Format::Otlp,
+                Transport::Http(http(transport, rest, "/v1/logs")?),
+            ),
+            ("splunk", "http" | "https") => {
+                let http = http(transport, rest, "/services/collector/event")?;
+                // Without it every request is refused; found now, the typo is fixed in a minute.
+                if http.password.as_deref().is_none_or(str::is_empty) {
+                    return Err("expected the HEC token in place of a password, as \
+                                splunk+https://:TOKEN@splunk:8088"
+                        .into());
+                }
+                (Format::Splunk, Transport::Http(http))
+            }
+            // An HTTP input's path is its own to choose; `/` is left as it is.
+            ("ndjson", "http" | "https") => {
+                (Format::Ndjson, Transport::Http(http(transport, rest, "/")?))
+            }
+            _ => {
+                return Err(format!(
+                    "unknown collector {scheme:?}; use {}",
+                    SCHEMES.join(", ")
+                ));
+            }
+        };
+        Ok(Self { format, transport })
     }
 }
 
-/// Kept as text and resolved on every connect: the collector's name may resolve only once its
-/// container is up, and to another address after it is replaced.
 fn host_port(rest: &str) -> Result<String, String> {
     let addr = rest.strip_suffix('/').unwrap_or(rest);
     let valid = addr
@@ -91,6 +164,14 @@ fn host_port(rest: &str) -> Result<String, String> {
         return Err("expected host:port after ://".into());
     }
     Ok(addr.to_owned())
+}
+
+/// The host of `host:port`, as a certificate names it: an IPv6 address without its brackets.
+#[cfg(feature = "log-forward")]
+fn host_of(addr: &str) -> &str {
+    addr.rsplit_once(':')
+        .map_or(addr, |(host, _)| host)
+        .trim_matches(['[', ']'])
 }
 
 /// `.../index` to `.../index/_bulk`, with any query (`?pipeline=...`) kept after it.
@@ -108,9 +189,8 @@ fn bulk_url(url: &str) -> String {
 }
 
 #[cfg(feature = "log-forward")]
-fn http(scheme: &str, rest: &str, default_path: &str) -> Result<Http, String> {
+fn http(transport: &str, rest: &str, default_path: &str) -> Result<Http, String> {
     use percent_encoding::percent_decode_str;
-    let transport = scheme.split_once('+').map_or(scheme, |(_, t)| t);
     let mut url =
         reqwest::Url::parse(&format!("{transport}://{rest}")).map_err(|e| e.to_string())?;
     if url.host_str().is_none_or(str::is_empty) {
@@ -136,14 +216,52 @@ fn http(_: &str, _: &str, _: &str) -> Result<Http, String> {
     Err("this build of s3dal has no HTTP log forwarding (the `log-forward` feature)".into())
 }
 
+/// A name the certificate can be checked against, refused now rather than at every connect.
+#[cfg(feature = "log-forward")]
+fn tls(addr: String) -> Result<Transport, String> {
+    tokio_rustls::rustls::pki_types::ServerName::try_from(host_of(&addr)).map_err(|e| {
+        format!(
+            "{:?} cannot be checked against a certificate: {e}",
+            host_of(&addr)
+        )
+    })?;
+    Ok(Transport::Tls(addr))
+}
+
+#[cfg(not(feature = "log-forward"))]
+fn tls(_: String) -> Result<Transport, String> {
+    Err("this build of s3dal has no TLS log forwarding (the `log-forward` feature)".into())
+}
+
 /// The parts of a URL around its password, by hand rather than with a URL parser: `redact`
 /// must work in every build, and the password must go even from a URL a parser refuses.
 struct Parts<'a> {
-    /// Up to and including `://`, and the user.
-    head: &'a str,
+    /// Up to and including `://`.
+    scheme: &'a str,
+    /// Empty when there is none, as in Splunk's `:TOKEN@host`.
+    user: &'a str,
     password: Option<&'a str>,
-    /// From the `@` on.
-    tail: &'a str,
+    /// The host on, after the `@` when there is one.
+    rest: &'a str,
+}
+
+impl Parts<'_> {
+    fn join(&self, password: Option<&str>) -> String {
+        let Self {
+            scheme, user, rest, ..
+        } = self;
+        match password {
+            Some(password) => format!("{scheme}{user}:{password}@{rest}"),
+            None if user.is_empty() => format!("{scheme}{rest}"),
+            None => format!("{scheme}{user}@{rest}"),
+        }
+    }
+
+    fn host(&self) -> &str {
+        self.rest
+            .find(['/', '?', '#'])
+            .map_or(self.rest, |i| &self.rest[..i])
+    }
 }
 
 fn parts(url: &str) -> Option<Parts<'_>> {
@@ -151,15 +269,19 @@ fn parts(url: &str) -> Option<Parts<'_>> {
     let authority_end = url[start..]
         .find(['/', '?', '#'])
         .map_or(url.len(), |i| start + i);
-    let at = start + url[start..authority_end].rfind('@')?;
-    let (head, password) = match url[start..at].find(':') {
-        Some(colon) => (&url[..start + colon], Some(&url[start + colon + 1..at])),
-        None => (&url[..at], None),
+    let (userinfo, rest) = match url[start..authority_end].rfind('@') {
+        Some(at) => (&url[start..start + at], &url[start + at + 1..]),
+        None => ("", &url[start..]),
+    };
+    let (user, password) = match userinfo.split_once(':') {
+        Some((user, password)) => (user, Some(password)),
+        None => (userinfo, None),
     };
     Some(Parts {
-        head,
+        scheme: &url[..start],
+        user,
         password,
-        tail: &url[at..],
+        rest,
     })
 }
 
@@ -167,16 +289,7 @@ fn parts(url: &str) -> Option<Parts<'_>> {
 /// `check-config`, the log and the console, none of which should show it.
 pub fn redact(url: &str, mask: &str) -> String {
     match parts(url) {
-        Some(Parts {
-            head,
-            password: Some(_),
-            tail,
-        }) if mask.is_empty() => format!("{head}{tail}"),
-        Some(Parts {
-            head,
-            password: Some(_),
-            tail,
-        }) => format!("{head}:{mask}{tail}"),
+        Some(p) if p.password.is_some() => p.join((!mask.is_empty()).then_some(mask)),
         _ => url.to_owned(),
     }
 }
@@ -192,13 +305,11 @@ pub fn keep_password(new: &str, current: Option<&str>) -> String {
     let (Some(n), Some(c)) = (parts(new), current.and_then(parts)) else {
         return new.to_owned();
     };
-    let host = |tail: &str| {
-        tail.find(['/', '?', '#'])
-            .map_or(tail.to_owned(), |i| tail[..i].to_owned())
-    };
     match (n.password, c.password) {
-        (None, Some(password)) if n.head == c.head && host(n.tail) == host(c.tail) => {
-            format!("{}:{password}{}", n.head, n.tail)
+        (None, Some(password))
+            if n.scheme == c.scheme && n.user == c.user && n.host() == c.host() =>
+        {
+            n.join(Some(password))
         }
         _ => new.to_owned(),
     }
@@ -267,7 +378,7 @@ struct Line {
 /// not start without the forwarding it was told to do; an unreachable collector is retried.
 pub fn start(url: &str) -> Result<(Forwarder, Flush), String> {
     let target = Target::parse(url)?;
-    let sink = Sink::new(&target)?;
+    let collector = Collector::new(target)?;
     let (queue, lines) = mpsc::sync_channel(QUEUE);
     let dropped = Arc::new(AtomicU64::new(0));
     let progress = Arc::new(Progress::default());
@@ -279,7 +390,7 @@ pub fn start(url: &str) -> Result<(Forwarder, Flush), String> {
     let (counter, sent) = (dropped.clone(), progress.clone());
     std::thread::Builder::new()
         .name("s3dal-log-forward".into())
-        .spawn(move || run(sink, &lines, &counter, &sent, &shown))
+        .spawn(move || run(collector, &lines, &counter, &sent, &shown))
         .map_err(|e| format!("cannot start the log forwarding thread: {e}"))?;
     let forwarder = Forwarder {
         queue,
@@ -321,7 +432,7 @@ impl<'a> MakeWriter<'a> for Forwarder {
 }
 
 fn run(
-    mut sink: Sink,
+    mut collector: Collector,
     lines: &Receiver<Line>,
     dropped: &AtomicU64,
     progress: &Progress,
@@ -334,11 +445,11 @@ fn run(
     while let Ok(first) = lines.recv() {
         let mut batch = vec![first];
         batch.extend(lines.try_iter().take(BATCH - 1));
-        let payloads = sink.encode(&batch, &host);
+        let payloads = collector.encode(&batch, &host);
         let mut pause = Duration::from_secs(1);
         let mut i = 0;
         while i < payloads.len() {
-            match sink.deliver(&payloads[i]) {
+            match collector.deliver(&payloads[i]) {
                 Ok(()) => {
                     if failing {
                         eprintln!("s3dal: sending the log to {shown} again");
@@ -382,37 +493,73 @@ enum Failure {
     Refused(String),
 }
 
+struct Collector {
+    format: Format,
+    sink: Sink,
+}
+
 enum Sink {
     Udp {
         addr: String,
         socket: Option<(UdpSocket, SocketAddr)>,
     },
-    Tcp {
+    /// TCP, or TLS over it, on a connection kept open.
+    Stream {
         addr: String,
-        stream: Option<TcpStream>,
+        #[cfg(feature = "log-forward")]
+        tls: Option<Arc<tokio_rustls::rustls::ClientConfig>>,
+        conn: Option<Conn>,
     },
     #[cfg(feature = "log-forward")]
     Http {
         runtime: tokio::runtime::Runtime,
         client: reqwest::Client,
         http: Http,
-        bulk: bool,
     },
 }
 
-impl Sink {
-    fn new(target: &Target) -> Result<Self, String> {
-        Ok(match target {
-            Target::GelfUdp(addr) => Self::Udp {
-                addr: addr.clone(),
-                socket: None,
-            },
-            Target::GelfTcp(addr) => Self::Tcp {
-                addr: addr.clone(),
-                stream: None,
+enum Conn {
+    Plain(TcpStream),
+    #[cfg(feature = "log-forward")]
+    Tls(Box<tokio_rustls::rustls::StreamOwned<tokio_rustls::rustls::ClientConnection, TcpStream>>),
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.write(buf),
+            #[cfg(feature = "log-forward")]
+            Self::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(s) => s.flush(),
+            #[cfg(feature = "log-forward")]
+            Self::Tls(s) => s.flush(),
+        }
+    }
+}
+
+impl Collector {
+    fn new(target: Target) -> Result<Self, String> {
+        let sink = match target.transport {
+            Transport::Udp(addr) => Sink::Udp { addr, socket: None },
+            Transport::Tcp(addr) => Sink::Stream {
+                addr,
+                #[cfg(feature = "log-forward")]
+                tls: None,
+                conn: None,
             },
             #[cfg(feature = "log-forward")]
-            Target::GelfHttp(http) | Target::Elasticsearch(http) => Self::Http {
+            Transport::Tls(addr) => Sink::Stream {
+                addr,
+                tls: Some(tls_config()?),
+                conn: None,
+            },
+            #[cfg(feature = "log-forward")]
+            Transport::Http(http) => Sink::Http {
                 runtime: tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -421,32 +568,41 @@ impl Sink {
                     .timeout(TIMEOUT)
                     .build()
                     .map_err(|e| format!("cannot build the log forwarding client: {e}"))?,
-                http: http.clone(),
-                bulk: matches!(target, Target::Elasticsearch(_)),
+                http,
             },
             #[cfg(not(feature = "log-forward"))]
-            Target::GelfHttp(_) | Target::Elasticsearch(_) => unreachable!("refused by parse"),
+            Transport::Tls(_) | Transport::Http(_) => unreachable!("refused by parse"),
+        };
+        Ok(Self {
+            format: target.format,
+            sink,
         })
     }
 
-    /// What `deliver` sends for a batch: one GELF message per line, or one bulk request body.
+    /// What `deliver` sends for a batch: one message per line, or one request body for all.
     fn encode(&self, batch: &[Line], host: &str) -> Vec<Vec<u8>> {
-        #[cfg(feature = "log-forward")]
-        if let Self::Http { bulk: true, .. } = self {
-            let mut body = Vec::new();
-            for line in batch {
-                body.extend_from_slice(b"{\"create\":{}}\n");
-                body.extend_from_slice(&bulk_doc(&line.json));
-                body.push(b'\n');
+        match self.format {
+            Format::Gelf => batch.iter().map(|line| gelf(line, host)).collect(),
+            Format::Syslog => batch.iter().map(|line| syslog(line, host)).collect(),
+            #[cfg(feature = "log-forward")]
+            Format::Bulk => vec![bulk(batch)],
+            #[cfg(feature = "log-forward")]
+            Format::Otlp => vec![otlp(batch, host)],
+            #[cfg(feature = "log-forward")]
+            Format::Splunk => vec![splunk(batch, host)],
+            #[cfg(feature = "log-forward")]
+            Format::Ndjson => vec![ndjson(batch)],
+            #[cfg(not(feature = "log-forward"))]
+            Format::Bulk | Format::Otlp | Format::Splunk | Format::Ndjson => {
+                unreachable!("refused by parse")
             }
-            return vec![body];
         }
-        batch.iter().map(|line| gelf(line, host)).collect()
     }
 
     fn deliver(&mut self, payload: &[u8]) -> Result<(), Failure> {
-        match self {
-            Self::Udp { addr, socket } => {
+        let format = self.format;
+        match &mut self.sink {
+            Sink::Udp { addr, socket } => {
                 if socket.is_none() {
                     let to = resolve(addr)?;
                     let local: SocketAddr = if to.is_ipv4() {
@@ -458,10 +614,18 @@ impl Sink {
                     *socket = Some((s, to));
                 }
                 let (s, to) = socket.as_ref().expect("bound above");
-                let Some(datagrams) = udp_datagrams(payload) else {
+                let datagrams = match format {
+                    Format::Gelf => udp_datagrams(payload),
+                    _ => (payload.len() <= UDP_MAX).then(|| vec![payload.to_vec()]),
+                };
+                let Some(datagrams) = datagrams else {
+                    let tcp = if format == Format::Gelf {
+                        "gelf+tcp"
+                    } else {
+                        "syslog+tcp"
+                    };
                     return Err(Failure::Refused(format!(
-                        "a message of {} bytes is longer than GELF over UDP can carry; use \
-                         gelf+tcp",
+                        "a message of {} bytes is longer than UDP can carry; use {tcp}",
                         payload.len()
                     )));
                 };
@@ -474,28 +638,40 @@ impl Sink {
                 }
                 Ok(())
             }
-            Self::Tcp { addr, stream } => {
-                if stream.is_none() {
-                    let to = resolve(addr)?;
-                    let s = TcpStream::connect_timeout(&to, TIMEOUT)
-                        .map_err(|e| Failure::Retry(e.to_string()))?;
-                    let _ = s.set_write_timeout(Some(TIMEOUT));
-                    *stream = Some(s);
+            Sink::Stream {
+                addr,
+                #[cfg(feature = "log-forward")]
+                tls,
+                conn,
+            } => {
+                if conn.is_none() {
+                    #[cfg(feature = "log-forward")]
+                    let tls = tls.as_ref();
+                    #[cfg(not(feature = "log-forward"))]
+                    let tls = None::<()>;
+                    *conn = Some(connect(addr, tls)?);
                 }
-                let s = stream.as_mut().expect("connected above");
-                let sent = s.write_all(payload).and_then(|()| s.write_all(&[0]));
-                sent.map_err(|e| {
-                    *stream = None;
+                let c = conn.as_mut().expect("connected above");
+                // One write per message: over TLS each write is a record of its own.
+                let mut framed = Vec::with_capacity(payload.len() + 8);
+                if format == Format::Syslog {
+                    framed.extend_from_slice(format!("{} ", payload.len()).as_bytes());
+                }
+                framed.extend_from_slice(payload);
+                if format == Format::Gelf {
+                    framed.push(0);
+                }
+                c.write_all(&framed).and_then(|()| c.flush()).map_err(|e| {
+                    *conn = None;
                     Failure::Retry(e.to_string())
                 })
             }
             #[cfg(feature = "log-forward")]
-            Self::Http {
+            Sink::Http {
                 runtime,
                 client,
                 http,
-                bulk,
-            } => runtime.block_on(post(client, http, *bulk, payload.to_vec())),
+            } => runtime.block_on(post(client, http, format, payload.to_vec())),
         }
     }
 }
@@ -508,24 +684,83 @@ fn resolve(addr: &str) -> Result<SocketAddr, Failure> {
 }
 
 #[cfg(feature = "log-forward")]
+type TlsConfig<'a> = Option<&'a Arc<tokio_rustls::rustls::ClientConfig>>;
+#[cfg(not(feature = "log-forward"))]
+type TlsConfig<'a> = Option<()>;
+
+fn connect(addr: &str, tls: TlsConfig<'_>) -> Result<Conn, Failure> {
+    let retry = |e: &dyn std::fmt::Display| Failure::Retry(e.to_string());
+    let to = resolve(addr)?;
+    let s = TcpStream::connect_timeout(&to, TIMEOUT).map_err(|e| retry(&e))?;
+    let _ = s.set_write_timeout(Some(TIMEOUT));
+    // The TLS handshake reads; a collector that stops answering it must not hang the thread.
+    let _ = s.set_read_timeout(Some(TIMEOUT));
+    let Some(config) = tls else {
+        return Ok(Conn::Plain(s));
+    };
+    #[cfg(feature = "log-forward")]
+    {
+        use tokio_rustls::rustls::pki_types::ServerName;
+        use tokio_rustls::rustls::{ClientConnection, StreamOwned};
+        let name = ServerName::try_from(host_of(addr).to_owned()).map_err(|e| retry(&e))?;
+        let conn = ClientConnection::new(config.clone(), name).map_err(|e| retry(&e))?;
+        let mut stream = StreamOwned::new(conn, s);
+        // Now rather than on the first write, so a certificate the collector's name does not
+        // match is what stderr reports, not a failed write.
+        while stream.conn.is_handshaking() {
+            stream
+                .conn
+                .complete_io(&mut stream.sock)
+                .map_err(|e| retry(&e))?;
+        }
+        Ok(Conn::Tls(Box::new(stream)))
+    }
+    #[cfg(not(feature = "log-forward"))]
+    {
+        let () = config;
+        unreachable!("refused by parse")
+    }
+}
+
+/// Certificates checked as the system checks them, as reqwest does for the HTTPS collectors.
+#[cfg(feature = "log-forward")]
+fn tls_config() -> Result<Arc<tokio_rustls::rustls::ClientConfig>, String> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+    use tokio_rustls::rustls::ClientConfig;
+    use tokio_rustls::rustls::crypto::aws_lc_rs;
+    let config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .and_then(BuilderVerifierExt::with_platform_verifier)
+        .map_err(|e| format!("cannot set up TLS for the log collector: {e}"))?
+        .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
+#[cfg(feature = "log-forward")]
 async fn post(
     client: &reqwest::Client,
     http: &Http,
-    bulk: bool,
+    format: Format,
     body: Vec<u8>,
 ) -> Result<(), Failure> {
-    let content_type = if bulk {
-        "application/x-ndjson"
-    } else {
-        "application/json"
+    let content_type = match format {
+        Format::Bulk | Format::Ndjson => "application/x-ndjson",
+        _ => "application/json",
     };
     let mut req = client
         .post(&http.url)
         .header(reqwest::header::CONTENT_TYPE, content_type)
         .body(body);
-    if let Some(user) = &http.user {
-        req = req.basic_auth(user, http.password.as_ref());
-    }
+    req = match (format, &http.user, &http.password) {
+        // HEC takes its token in a header of its own rather than as Basic authentication.
+        (Format::Splunk, _, Some(token)) => {
+            req.header(reqwest::header::AUTHORIZATION, format!("Splunk {token}"))
+        }
+        (_, None, None) => req,
+        (_, user, password) => {
+            req.basic_auth(user.as_deref().unwrap_or_default(), password.as_ref())
+        }
+    };
     let res = req
         .send()
         .await
@@ -533,12 +768,14 @@ async fn post(
     let status = res.status();
     let text = res.text().await.unwrap_or_default();
     if status.is_success() {
-        // A bulk request succeeds as a whole and may still have refused some documents, a
-        // field whose type the index maps differently, say.
-        return match bulk.then(|| bulk_error(&text)).flatten() {
-            Some(e) => Err(Failure::Refused(e)),
-            None => Ok(()),
+        // A request may succeed as a whole and still have refused some lines: a field whose
+        // type the index maps differently, say.
+        let refused = match format {
+            Format::Bulk => bulk_error(&text),
+            Format::Otlp => otlp_error(&text),
+            _ => None,
         };
+        return refused.map_or(Ok(()), |e| Err(Failure::Refused(e)));
     }
     let msg = format!("{status}: {}", text.chars().take(300).collect::<String>());
     if status.as_u16() == 429 || status.is_server_error() {
@@ -564,6 +801,26 @@ fn bulk_error(text: &str) -> Option<String> {
     Some(first)
 }
 
+/// OTLP's partial success: the records it rejected, with its reason.
+#[cfg(feature = "log-forward")]
+fn otlp_error(text: &str) -> Option<String> {
+    let doc: Value = serde_json::from_str(text).ok()?;
+    let partial = doc.get("partialSuccess")?;
+    // An int64, which JSON may carry as a string or a number.
+    let rejected = match partial.get("rejectedLogRecords")? {
+        Value::String(s) => s.parse().ok()?,
+        n => n.as_u64()?,
+    };
+    if rejected == 0 {
+        return None;
+    }
+    let reason = partial
+        .get("errorMessage")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some(format!("{rejected} records rejected: {reason}"))
+}
+
 /// A line as tracing's JSON layer wrote it, or, should it not parse, its text as the message.
 fn object(json: &[u8]) -> Map<String, Value> {
     match serde_json::from_slice(json) {
@@ -575,15 +832,47 @@ fn object(json: &[u8]) -> Map<String, Value> {
     }
 }
 
-/// A bulk document: the line's fields as they are, its time as `@timestamp`, the field
+/// The line's message as text, `-` when it has none: GELF requires one.
+fn message(fields: &mut Map<String, Value>) -> String {
+    match fields.remove("message") {
+        Some(Value::String(s)) if !s.is_empty() => s,
+        Some(other) if !other.is_null() => other.to_string(),
+        _ => "-".to_owned(),
+    }
+}
+
+/// A tracing level as a syslog severity, which GELF uses too.
+fn severity(level: Option<&Value>) -> u8 {
+    match level.and_then(Value::as_str) {
+        Some("ERROR") => 3,
+        Some("WARN") => 4,
+        Some("INFO") => 6,
+        _ => 7,
+    }
+}
+
+/// Seconds since the epoch with milliseconds, as GELF and Splunk take the time.
+fn seconds(at: SystemTime) -> Value {
+    let at = at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let millis = u64::try_from(at.as_millis()).unwrap_or(u64::MAX);
+    serde_json::Number::from_f64(millis as f64 / 1000.0).map_or(Value::Null, Value::Number)
+}
+
+/// A bulk request body: each line's fields as they are, its time as `@timestamp`, the field
 /// Elasticsearch's log templates and Kibana sort by.
 #[cfg(feature = "log-forward")]
-fn bulk_doc(json: &[u8]) -> Vec<u8> {
-    let mut doc = object(json);
-    if let Some(ts) = doc.remove("timestamp") {
-        doc.insert("@timestamp".into(), ts);
+fn bulk(batch: &[Line]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for line in batch {
+        let mut doc = object(&line.json);
+        if let Some(ts) = doc.remove("timestamp") {
+            doc.insert("@timestamp".into(), ts);
+        }
+        body.extend_from_slice(b"{\"create\":{}}\n");
+        body.extend_from_slice(&serde_json::to_vec(&doc).expect("a JSON map serializes"));
+        body.push(b'\n');
     }
-    serde_json::to_vec(&doc).expect("a JSON map serializes")
+    body
 }
 
 /// A GELF 1.1 message. Its own fields are fixed; every other one is an additional field, named
@@ -591,28 +880,13 @@ fn bulk_doc(json: &[u8]) -> Vec<u8> {
 fn gelf(line: &Line, host: &str) -> Vec<u8> {
     let mut fields = object(&line.json);
     fields.remove("timestamp");
-    let level = match fields.remove("level").as_ref().and_then(Value::as_str) {
-        Some("ERROR") => 3,
-        Some("WARN") => 4,
-        Some("INFO") => 6,
-        _ => 7,
-    };
-    let message = match fields.remove("message") {
-        Some(Value::String(s)) if !s.is_empty() => s,
-        Some(other) if !other.is_null() => other.to_string(),
-        _ => "-".to_owned(),
-    };
-    let at = line.at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let level = severity(fields.remove("level").as_ref());
+    let message = message(&mut fields);
     let mut out = Map::new();
     out.insert("version".into(), "1.1".into());
     out.insert("host".into(), host.into());
     out.insert("short_message".into(), message.into());
-    // Seconds with milliseconds, as GELF takes it.
-    let millis = u64::try_from(at.as_millis()).unwrap_or(u64::MAX);
-    out.insert(
-        "timestamp".into(),
-        serde_json::Number::from_f64(millis as f64 / 1000.0).map_or(Value::Null, Value::Number),
-    );
+    out.insert("timestamp".into(), seconds(line.at));
     out.insert("level".into(), level.into());
     for (key, value) in fields {
         additional(&mut out, "", &key, value);
@@ -656,6 +930,157 @@ fn additional(out: &mut Map<String, Value>, prefix: &str, key: &str, value: Valu
     }
 }
 
+/// An RFC 5424 message: the line's level as the severity, the time tracing wrote, this host,
+/// the process id, and the line's JSON as the message, for the collector to parse as JSON.
+fn syslog(line: &Line, host: &str) -> Vec<u8> {
+    let json = String::from_utf8_lossy(&line.json);
+    let json = json.trim_end();
+    let fields = object(json.as_bytes());
+    let pri = SYSLOG_DAEMON * 8 + severity(fields.get("level"));
+    // RFC 3339 with microseconds, which RFC 5424 takes as it is.
+    let time = fields
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty() && !t.contains(' '))
+        .unwrap_or("-");
+    // Printable ASCII without spaces, or the field would end early.
+    let host = if !host.is_empty() && host.bytes().all(|b| b.is_ascii_graphic()) {
+        host
+    } else {
+        "-"
+    };
+    let pid = std::process::id();
+    format!("<{pri}>1 {time} {host} s3dal {pid} - - {json}").into_bytes()
+}
+
+/// One OTLP request for the batch: s3dal and this host as the resource, each line a log record
+/// with its level as the severity, its message as the body, and every other field an
+/// attribute, nested ones (the request's span) joined with `.`, as `span.id`.
+#[cfg(feature = "log-forward")]
+fn otlp(batch: &[Line], host: &str) -> Vec<u8> {
+    use serde_json::json;
+    let records: Vec<Value> = batch
+        .iter()
+        .map(|line| {
+            let mut fields = object(&line.json);
+            fields.remove("timestamp");
+            let level = fields.remove("level");
+            let level = level.as_ref().and_then(Value::as_str).unwrap_or_default();
+            let number = match level {
+                "TRACE" => 1,
+                "DEBUG" => 5,
+                "INFO" => 9,
+                "WARN" => 13,
+                "ERROR" => 17,
+                _ => 0,
+            };
+            let body = message(&mut fields);
+            let mut attributes = Vec::new();
+            for (key, value) in fields {
+                otlp_attributes(&mut attributes, "", key, value);
+            }
+            let at = line.at.duration_since(UNIX_EPOCH).unwrap_or_default();
+            json!({
+                "timeUnixNano": at.as_nanos().to_string(),
+                "severityNumber": number,
+                "severityText": level,
+                "body": { "stringValue": body },
+                "attributes": attributes,
+            })
+        })
+        .collect();
+    let attribute =
+        |key: &str, value: &str| json!({ "key": key, "value": { "stringValue": value } });
+    let body = json!({ "resourceLogs": [{
+        "resource": { "attributes": [
+            attribute("service.name", "s3dal"),
+            attribute("service.version", env!("CARGO_PKG_VERSION")),
+            attribute("host.name", host),
+        ] },
+        "scopeLogs": [{ "scope": { "name": "s3dal" }, "logRecords": records }],
+    }] });
+    serde_json::to_vec(&body).expect("a JSON value serializes")
+}
+
+#[cfg(feature = "log-forward")]
+fn otlp_attributes(out: &mut Vec<Value>, prefix: &str, key: String, value: Value) {
+    let key = if prefix.is_empty() {
+        key
+    } else {
+        format!("{prefix}.{key}")
+    };
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                otlp_attributes(out, &key, k, v);
+            }
+        }
+        value => {
+            if let Some(value) = any_value(value) {
+                out.push(serde_json::json!({ "key": key, "value": value }));
+            }
+        }
+    }
+}
+
+/// OTLP's AnyValue, with an int64 as a string, as protobuf's JSON mapping writes it.
+#[cfg(feature = "log-forward")]
+fn any_value(value: Value) -> Option<Value> {
+    use serde_json::json;
+    Some(match value {
+        Value::Null => return None,
+        Value::Bool(b) => json!({ "boolValue": b }),
+        Value::Number(n) => match n.as_i64() {
+            Some(i) => json!({ "intValue": i.to_string() }),
+            None => json!({ "doubleValue": n.as_f64() }),
+        },
+        Value::String(s) => json!({ "stringValue": s }),
+        Value::Array(items) => {
+            let values: Vec<Value> = items.into_iter().filter_map(any_value).collect();
+            json!({ "arrayValue": { "values": values } })
+        }
+        Value::Object(map) => {
+            let values: Vec<Value> = map
+                .into_iter()
+                .filter_map(|(k, v)| any_value(v).map(|v| json!({ "key": k, "value": v })))
+                .collect();
+            json!({ "kvlistValue": { "values": values } })
+        }
+    })
+}
+
+/// HEC events, one per line: its time, this host, and the line's fields as the event, typed
+/// `_json` so Splunk extracts them.
+#[cfg(feature = "log-forward")]
+fn splunk(batch: &[Line], host: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    for line in batch {
+        let mut event = object(&line.json);
+        event.remove("timestamp");
+        let doc = serde_json::json!({
+            "time": seconds(line.at),
+            "host": host,
+            "source": "s3dal",
+            "sourcetype": "_json",
+            "event": event,
+        });
+        body.extend_from_slice(&serde_json::to_vec(&doc).expect("a JSON value serializes"));
+        body.push(b'\n');
+    }
+    body
+}
+
+/// The lines as tracing wrote them, each on a line of its own.
+#[cfg(feature = "log-forward")]
+fn ndjson(batch: &[Line]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for line in batch {
+        body.extend_from_slice(line.json.trim_ascii_end());
+        body.push(b'\n');
+    }
+    body
+}
+
 /// The message as datagrams: itself, or GELF chunks of it, each with the magic bytes, a message
 /// id, its number and the count. `None` when it takes more chunks than GELF allows.
 fn udp_datagrams(message: &[u8]) -> Option<Vec<Vec<u8>>> {
@@ -684,8 +1109,8 @@ fn udp_datagrams(message: &[u8]) -> Option<Vec<Vec<u8>>> {
     )
 }
 
-/// The `host` GELF requires: in a container, its hostname, which Docker sets to the container
-/// id, as `docker ps` shows it.
+/// The host a collector files the lines under: in a container, its hostname, which Docker sets
+/// to the container id, as `docker ps` shows it.
 fn hostname() -> String {
     std::env::var("HOSTNAME")
         .ok()
@@ -704,13 +1129,22 @@ mod tests {
     fn collector_urls_are_checked_when_read() {
         // A typo found at startup is fixed in a minute; one found when the logs are needed is
         // found too late.
+        let target = |format, transport| Ok(Target { format, transport });
         assert_eq!(
             Target::parse("gelf+udp://graylog:12201"),
-            Ok(Target::GelfUdp("graylog:12201".into()))
+            target(Format::Gelf, Transport::Udp("graylog:12201".into()))
         );
         assert_eq!(
             Target::parse("gelf+tcp://[::1]:12201/"),
-            Ok(Target::GelfTcp("[::1]:12201".into()))
+            target(Format::Gelf, Transport::Tcp("[::1]:12201".into()))
+        );
+        assert_eq!(
+            Target::parse("syslog+udp://rsyslog:514"),
+            target(Format::Syslog, Transport::Udp("rsyslog:514".into()))
+        );
+        assert_eq!(
+            Target::parse("syslog+tcp://rsyslog:514"),
+            target(Format::Syslog, Transport::Tcp("rsyslog:514".into()))
         );
         for bad in [
             "graylog:12201",
@@ -719,6 +1153,8 @@ mod tests {
             "gelf+udp://graylog:0",
             "gelf+tcp://graylog:12201/path",
             "syslog://host:514",
+            "syslog+http://host:514",
+            "otlp+udp://collector:4318",
         ] {
             assert!(Target::parse(bad).is_err(), "{bad} accepted");
         }
@@ -727,26 +1163,60 @@ mod tests {
     #[cfg(feature = "log-forward")]
     #[test]
     fn http_collectors_get_their_paths_and_credentials() {
-        let Ok(Target::Elasticsearch(es)) =
-            Target::parse("elasticsearch+https://elastic:p%40ss@es:9200")
-        else {
-            panic!("not parsed as Elasticsearch")
+        let http = |url| match Target::parse(url) {
+            Ok(Target {
+                format,
+                transport: Transport::Http(http),
+            }) => (format, http),
+            other => panic!("{url}: {other:?}"),
         };
+        let (format, es) = http("elasticsearch+https://elastic:p%40ss@es:9200");
         // The credentials go in a header, decoded, never in the URL that errors may print.
+        assert_eq!(format, Format::Bulk);
         assert_eq!(es.url, "https://es:9200/logs-s3dal-default/_bulk");
         assert_eq!(es.user.as_deref(), Some("elastic"));
         assert_eq!(es.password.as_deref(), Some("p@ss"));
-        let Ok(Target::Elasticsearch(es)) =
-            Target::parse("elasticsearch+http://es:9200/app-logs?pipeline=s3dal")
-        else {
-            panic!("not parsed as Elasticsearch")
-        };
+        let (_, es) = http("elasticsearch+http://es:9200/app-logs?pipeline=s3dal");
         assert_eq!(es.url, "http://es:9200/app-logs/_bulk?pipeline=s3dal");
-        let Ok(Target::GelfHttp(gelf)) = Target::parse("gelf+http://graylog:12201") else {
-            panic!("not parsed as GELF over HTTP")
-        };
-        assert_eq!(gelf.url, "http://graylog:12201/gelf");
-        assert!(Target::parse("elasticsearch+https://").is_err());
+        assert_eq!(
+            http("gelf+http://graylog:12201").1.url,
+            "http://graylog:12201/gelf"
+        );
+        // OTLP receivers take logs at one path; an HTTP input's path is its own.
+        let (format, otlp) = http("otlp+http://otel-collector:4318");
+        assert_eq!(
+            (format, otlp.url.as_str()),
+            (Format::Otlp, "http://otel-collector:4318/v1/logs")
+        );
+        assert_eq!(
+            http("ndjson+http://vector:8080").1.url,
+            "http://vector:8080/"
+        );
+        assert_eq!(
+            http("ndjson+https://logs.example/in").1.url,
+            "https://logs.example/in"
+        );
+        let (format, hec) = http("splunk+https://:hec-token@splunk:8088");
+        assert_eq!(format, Format::Splunk);
+        assert_eq!(hec.url, "https://splunk:8088/services/collector/event");
+        assert_eq!(
+            (hec.user, hec.password.as_deref()),
+            (None, Some("hec-token"))
+        );
+        for bad in [
+            "elasticsearch+https://",
+            // Every request would be refused.
+            "splunk+https://splunk:8088",
+        ] {
+            assert!(Target::parse(bad).is_err(), "{bad} accepted");
+        }
+        assert_eq!(
+            Target::parse("syslog+tls://logs.example.com:6514"),
+            Ok(Target {
+                format: Format::Syslog,
+                transport: Transport::Tls("logs.example.com:6514".into())
+            })
+        );
     }
 
     #[test]
@@ -782,6 +1252,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_token_without_a_user_is_hidden_and_kept_the_same_way() {
+        // Splunk's token has no user before it; shown without it, the URL must not keep a
+        // dangling `@`, and sent back so, it must get its token back.
+        let url = "splunk+https://:hec-token@splunk:8088";
+        assert_eq!(redact(url, ""), "splunk+https://splunk:8088");
+        assert_eq!(
+            redact(url, "<redacted>"),
+            "splunk+https://:<redacted>@splunk:8088"
+        );
+        assert_eq!(keep_password("splunk+https://splunk:8088", Some(url)), url);
+        assert_eq!(
+            keep_password("splunk+https://splunk.evil:8088", Some(url)),
+            "splunk+https://splunk.evil:8088"
+        );
+        // Nothing to keep from a URL that never had a password.
+        assert_eq!(
+            keep_password("gelf+tcp://g:1", Some("gelf+udp://g:1")),
+            "gelf+tcp://g:1"
+        );
+    }
+
     fn line(json: &str) -> Line {
         Line {
             at: UNIX_EPOCH + Duration::from_millis(1_762_000_000_123),
@@ -813,29 +1305,115 @@ mod tests {
         assert!(msg.get("_timestamp").is_none() && msg.get("_level").is_none());
     }
 
+    #[test]
+    fn a_log_line_becomes_a_syslog_message() {
+        // rsyslog and syslog-ng read the header by position: a space in the wrong place shifts
+        // every field after it. The message is the JSON, for their JSON parsers.
+        let json =
+            r#"{"timestamp":"2026-11-10T08:00:00.123456Z","level":"ERROR","message":"boom"}"#;
+        let msg = String::from_utf8(syslog(&line(&format!("{json}\n")), "box")).unwrap();
+        let pid = std::process::id();
+        // daemon (3) * 8 + err (3)
+        assert_eq!(
+            msg,
+            format!("<27>1 2026-11-10T08:00:00.123456Z box s3dal {pid} - - {json}")
+        );
+        let msg = String::from_utf8(syslog(&line("not json"), "a host")).unwrap();
+        assert!(msg.starts_with("<31>1 - - s3dal "), "{msg}");
+    }
+
     #[cfg(feature = "log-forward")]
     #[test]
-    fn a_log_line_becomes_a_bulk_document() {
-        let doc: Value = serde_json::from_slice(&bulk_doc(
-            br#"{"timestamp":"2026-11-10T00:00:00Z","level":"INFO"}"#,
-        ))
-        .unwrap();
+    fn a_batch_becomes_a_bulk_request() {
+        let body = bulk(&[line(
+            r#"{"timestamp":"2026-11-10T00:00:00Z","level":"INFO"}"#,
+        )]);
+        let body = String::from_utf8(body).unwrap();
+        let mut lines = body.lines();
+        assert_eq!(lines.next(), Some(r#"{"create":{}}"#));
+        let doc: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
         assert_eq!(doc["@timestamp"], "2026-11-10T00:00:00Z");
         assert!(doc.get("timestamp").is_none());
     }
 
     #[cfg(feature = "log-forward")]
     #[test]
-    fn lines_reach_elasticsearch_in_a_bulk_request_with_the_password_in_a_header() {
+    fn a_batch_becomes_one_otlp_request() {
+        // Collectors drop records whose attribute values are not AnyValues, and Grafana and
+        // the others filter on severity and service.name.
+        let body: Value = serde_json::from_slice(&otlp(
+            &[
+                line(r#"{"level":"WARN","message":"request","status":503,"span":{"id":"5A0A"}}"#),
+                line(r#"{"level":"INFO","message":"ok","complete":true,"ratio":0.5}"#),
+            ],
+            "box",
+        ))
+        .unwrap();
+        let resource = &body["resourceLogs"][0];
+        assert_eq!(
+            resource["resource"]["attributes"][0],
+            serde_json::json!({"key":"service.name","value":{"stringValue":"s3dal"}})
+        );
+        let records = resource["scopeLogs"][0]["logRecords"].as_array().unwrap();
+        assert_eq!(records.len(), 2);
+        let first = &records[0];
+        assert_eq!(first["timeUnixNano"], "1762000000123000000");
+        assert_eq!(
+            (
+                first["severityNumber"].as_u64(),
+                first["severityText"].as_str()
+            ),
+            (Some(13), Some("WARN"))
+        );
+        assert_eq!(first["body"]["stringValue"], "request");
+        let attrs = first["attributes"].as_array().unwrap();
+        assert!(
+            attrs.contains(&serde_json::json!({"key":"status","value":{"intValue":"503"}})),
+            "{attrs:?}"
+        );
+        assert!(
+            attrs.contains(&serde_json::json!({"key":"span.id","value":{"stringValue":"5A0A"}})),
+            "{attrs:?}"
+        );
+        let attrs = records[1]["attributes"].as_array().unwrap();
+        assert!(attrs.contains(&serde_json::json!({"key":"complete","value":{"boolValue":true}})));
+        assert!(attrs.contains(&serde_json::json!({"key":"ratio","value":{"doubleValue":0.5}})));
+        // A partial success names what it rejected; a whole one is none.
+        assert_eq!(
+            otlp_error(r#"{"partialSuccess":{"rejectedLogRecords":"2","errorMessage":"too old"}}"#),
+            Some("2 records rejected: too old".into())
+        );
+        assert_eq!(otlp_error(r#"{"partialSuccess":{}}"#), None);
+        assert_eq!(otlp_error("{}"), None);
+    }
+
+    #[cfg(feature = "log-forward")]
+    #[test]
+    fn a_batch_becomes_splunk_events_and_plain_lines() {
+        let body = splunk(
+            &[line(r#"{"timestamp":"x","level":"INFO","message":"hi"}"#)],
+            "box",
+        );
+        let event: Value = serde_json::from_slice(body.strip_suffix(b"\n").unwrap()).unwrap();
+        assert_eq!(event["time"], 1_762_000_000.123);
+        assert_eq!(
+            (event["host"].as_str(), event["sourcetype"].as_str()),
+            (Some("box"), Some("_json"))
+        );
+        assert_eq!(
+            event["event"],
+            serde_json::json!({"level":"INFO","message":"hi"})
+        );
+        // As tracing wrote them, one per line, however each ended.
+        let body = ndjson(&[line("{\"a\":1}\n"), line("{\"b\":2}")]);
+        assert_eq!(body, b"{\"a\":1}\n{\"b\":2}\n");
+    }
+
+    /// Accepts one HTTP request on `listener`, answers it with `answer`, and returns its head,
+    /// lowercased, and its body.
+    #[cfg(feature = "log-forward")]
+    fn take_request(listener: &std::net::TcpListener, answer: &str) -> (Vec<String>, String) {
         use std::io::{BufRead, BufReader, Read};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (forwarder, _) =
-            start(&format!("elasticsearch+http://elastic:p%40ss@{addr}/app")).unwrap();
-        forwarder
-            .make_writer()
-            .write_all(br#"{"timestamp":"2026-11-10T00:00:00Z","level":"INFO","message":"hi"}"#)
-            .unwrap();
         let (conn, _) = listener.accept().unwrap();
         conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut reader = BufReader::new(conn.try_clone().unwrap());
@@ -856,21 +1434,57 @@ mod tests {
             .unwrap();
         let mut body = vec![0; len];
         reader.read_exact(&mut body).unwrap();
-        (&conn)
-            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 16\r\n\r\n{\"errors\":false}")
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{answer}",
+            answer.len()
+        );
+        (&conn).write_all(response.as_bytes()).unwrap();
+        (head, String::from_utf8(body).unwrap())
+    }
+
+    #[cfg(feature = "log-forward")]
+    #[test]
+    fn lines_reach_elasticsearch_in_a_bulk_request_with_the_password_in_a_header() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (forwarder, _) =
+            start(&format!("elasticsearch+http://elastic:p%40ss@{addr}/app")).unwrap();
+        forwarder
+            .make_writer()
+            .write_all(br#"{"timestamp":"2026-11-10T00:00:00Z","level":"INFO","message":"hi"}"#)
             .unwrap();
+        let (head, body) = take_request(&listener, r#"{"errors":false}"#);
         assert_eq!(head[0], "post /app/_bulk http/1.1");
         // "elastic:p@ss", decoded from the URL before it is encoded for the header.
         assert!(
             head.contains(&"authorization: basic zwxhc3rpyzpwqhnz".to_owned()),
             "{head:?}"
         );
-        let body = String::from_utf8(body).unwrap();
         let mut lines = body.lines();
         assert_eq!(lines.next(), Some(r#"{"create":{}}"#));
         let doc: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
-        assert_eq!(doc["@timestamp"], "2026-11-10T00:00:00Z");
         assert_eq!(doc["message"], "hi");
+    }
+
+    #[cfg(feature = "log-forward")]
+    #[test]
+    fn splunk_gets_its_token_in_its_own_header() {
+        // HEC refuses Basic authentication; the token goes as `Splunk <token>`.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (forwarder, _) = start(&format!("splunk+http://:hec-token@{addr}")).unwrap();
+        forwarder
+            .make_writer()
+            .write_all(br#"{"level":"INFO","message":"hi"}"#)
+            .unwrap();
+        let (head, body) = take_request(&listener, r#"{"text":"Success","code":0}"#);
+        assert_eq!(head[0], "post /services/collector/event http/1.1");
+        assert!(
+            head.contains(&"authorization: splunk hec-token".to_owned()),
+            "{head:?}"
+        );
+        let event: Value = serde_json::from_str(body.trim_end()).unwrap();
+        assert_eq!(event["event"]["message"], "hi");
     }
 
     #[test]
@@ -904,6 +1518,40 @@ mod tests {
         let begun = std::time::Instant::now();
         assert!(!flush.wait(Duration::from_millis(300)));
         assert!(begun.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn syslog_over_tcp_frames_each_message_by_its_length() {
+        use std::io::Read;
+        // Octet counting needs no delimiter that a message could hold, and it is the framing
+        // rsyslog and syslog-ng take on a TCP input without setup.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (forwarder, flush) = start(&format!("syslog+tcp://{addr}")).unwrap();
+        for message in ["one", "two\nlines"] {
+            let line = serde_json::json!({ "level": "INFO", "message": message }).to_string();
+            forwarder.make_writer().write_all(line.as_bytes()).unwrap();
+        }
+        let (mut conn, _) = listener.accept().unwrap();
+        assert!(flush.wait(Duration::from_secs(10)));
+        drop(forwarder);
+        let mut all = String::new();
+        conn.read_to_string(&mut all).unwrap();
+        let mut rest = all.as_str();
+        let mut messages = Vec::new();
+        while !rest.is_empty() {
+            let (len, after) = rest.split_once(' ').unwrap();
+            let len: usize = len.parse().unwrap();
+            messages.push(&after[..len]);
+            rest = &after[len..];
+        }
+        assert_eq!(messages.len(), 2, "{all:?}");
+        assert!(messages[0].starts_with("<30>1 "), "{}", messages[0]);
+        assert!(
+            messages[1].ends_with(r#""message":"two\nlines"}"#),
+            "{}",
+            messages[1]
+        );
     }
 
     #[test]

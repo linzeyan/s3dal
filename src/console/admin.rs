@@ -33,8 +33,8 @@ const LIVE: [&str; 6] = [
     "public-bucket",
 ];
 
-/// The settings that take a restart, which the console cannot do: an edit is written to the
-/// file, and the server and settings pages say what waits for the restart.
+/// The settings that take a restart: an edit is written to the file, and the server and
+/// settings pages say what waits for the restart, which they offer to do.
 const RESTART: [&str; 10] = [
     "backend",
     "address",
@@ -110,6 +110,10 @@ impl S3Route for AdminRoute {
                 let signer = req.credentials.as_ref().map(|c| c.access_key.as_str());
                 self.apply(edit, signer).await?;
                 config_view(&self.live)
+            }
+            (&Method::POST, "restart") => {
+                self.restart().await?;
+                json!({ "restarting": true })
             }
             _ => return Err(s3_error!(MethodNotAllowed, "no such settings request")),
         };
@@ -259,6 +263,52 @@ impl AdminRoute {
         }
         Ok(())
     }
+
+    /// Asks the server to start again, once it is clear that it would: a start that fails
+    /// leaves nothing serving, this console included, to put the settings right from.
+    async fn restart(&self) -> S3Result<()> {
+        if !cfg!(unix) {
+            return Err(s3_error!(
+                NotImplemented,
+                "restarting from the console needs a Unix system"
+            ));
+        }
+        let args = self
+            .live
+            .read()
+            .map_err(|e| s3_error!(InvalidArgument, "the settings do not read: {e:#}"))?;
+        preflight(&args, self.live.started()).await?;
+        self.live.request_restart();
+        Ok(())
+    }
+}
+
+/// Tries what a start does that can fail, while the server still runs. The addresses it holds
+/// are free again once it stops; any other must be free now.
+async fn preflight(args: &ServeArgs, started: &ServeArgs) -> S3Result<()> {
+    let refuse =
+        |what: String| s3_error!(InvalidArgument, "the server would not start again: {what}");
+    crate::server::LiveAuth::new(&args.credentials, &args.domain)
+        .map_err(|e| refuse(format!("{e:#}")))?;
+    crate::logging::filter(&args.log_level).map_err(refuse)?;
+    if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
+        crate::server::tls_acceptor(cert, key).map_err(|e| refuse(format!("{e:#}")))?;
+    }
+    if let Some(path) = &args.log_file {
+        crate::logging::RotatingFile::open(path, args.log_max_size, args.log_max_files)
+            .map_err(|e| refuse(format!("cannot open the log file {}: {e}", path.display())))?;
+    }
+    let held = |port: u16| {
+        port == started.address.port() || started.console_address.is_some_and(|a| a.port() == port)
+    };
+    for addr in std::iter::once(args.address).chain(args.console_address) {
+        if !held(addr.port()) {
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(|e| refuse(format!("cannot listen on {addr}: {e}")))?;
+        }
+    }
+    check_backend(&args.backend, &args.backend_opts).await
 }
 
 /// The file's key pairs as the edit lists them. A pair listed without a secret keeps the one it

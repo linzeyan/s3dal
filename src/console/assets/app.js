@@ -973,9 +973,7 @@ function serverView() {
       const stat = (label, value, mono, hint) => h("div", { class: "stat" }, h("div", { class: "stat-label" }, label),
         h("div", { class: `stat-value ${mono ? "mono" : ""}` }, value), hint && h("div", { class: "muted small" }, hint));
       body.replaceChildren(
-        info.pending_restart.length ? h("div", { class: "banner warn" }, icon("alert"),
-          h("div", {}, h("strong", {}, "Restart to apply: "), info.pending_restart.join(", "),
-            h("div", { class: "muted small" }, "These settings changed in the config file but take effect when the server restarts."))) : "",
+        pendingBanner(info.pending_restart, "These settings changed in the config file but take effect when the server restarts."),
         h("section", { class: "stats" },
           stat("Version", info.version),
           stat("Backend", info.backend, true),
@@ -984,7 +982,7 @@ function serverView() {
           stat("Console", info.console_address ?? "—", true),
           stat("Region", REGION, true),
           stat("Log", info.log_file ?? "stderr", true, info.log_file ? "Rotated by size; set in Settings." : "In a container, docker logs shows it. Set a file in Settings."),
-          stat("Log forwarding", info.log_forward ?? "Off", true, info.log_forward ? "" : "Graylog or Elasticsearch, set in Settings."),
+          stat("Log forwarding", info.log_forward ?? "Off", true, info.log_forward ? "" : "Graylog, Elasticsearch, syslog, OpenTelemetry, Splunk or any HTTP input; set in Settings."),
         ),
         h("section", { class: "panel" },
           h("header", { class: "panel-header" }, h("h2", {}, "Backend profile"),
@@ -1001,6 +999,119 @@ function serverView() {
   };
   load();
   return shell("server", pageHeader("Server"), body);
+}
+
+// ----- Restart -----
+
+// How long the page waits for the server to answer again: it probes the backend before it
+// listens, which a remote one may take a while to answer.
+const RESTART_WAIT_MS = 120_000;
+
+// What waits for a restart, with the button that does it.
+function pendingBanner(pending, detail) {
+  if (!pending.length) return "";
+  return h("div", { class: "banner warn" }, icon("alert"),
+    h("div", { class: "banner-text" }, h("strong", {}, "Restart to apply: "), h("span", { class: "mono" }, pending.join(", ")),
+      detail && h("div", { class: "muted small" }, detail)),
+    h("button", { class: "button", type: "button", onclick: () => restartServer() }, icon("refresh"), "Restart now"));
+}
+
+// While the server restarts the page has nothing to talk to; a modal says so, and keeps clicks
+// from failing one by one meanwhile.
+function restartingDialog() {
+  const status = h("span", {});
+  const el = h("dialog", { class: "dialog", "aria-busy": "true" },
+    h("h2", {}, "Restarting the server"),
+    h("div", { class: "dialog-body" }, h("p", { class: "restart-status", role: "status" }, icon("refresh", "icon spin"), status)));
+  // Nothing to do but wait: Escape would only hide that the page cannot work meanwhile.
+  el.addEventListener("cancel", (e) => e.preventDefault());
+  document.body.append(el);
+  el.showModal();
+  return { say: (text) => { status.textContent = text; }, close: () => el.remove() };
+}
+
+// Whether the restarted server answers within the wait. The old process answers until it
+// stops, so an answer counts only from a process up no longer than the wait has been.
+async function cameBack(since) {
+  while (Date.now() - since < RESTART_WAIT_MS) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    try {
+      const info = await s3.info();
+      if (info.uptime_secs * 1000 <= Date.now() - since + 1000) return true;
+    } catch {
+      // Not listening yet.
+    }
+  }
+  return false;
+}
+
+// Where the console is after the restart, when that is not this page: a new port, HTTPS turned
+// on or off, or no console at all. The page cannot follow it there.
+function consoleMoves(config, info) {
+  const pending = config.pending_restart;
+  if (!pending.includes("console-address") && !pending.includes("tls-cert")) return null;
+  const value = (name) => config.settings.find((s) => s.name === name)?.value ?? null;
+  const address = value("console-address");
+  if (!address) return "The console is off after the restart; turn it on again in the config file.";
+  const portOf = (a) => a?.slice(a.lastIndexOf(":") + 1) ?? "";
+  // The port the browser sees may be mapped, by Docker say; it changes only if the setting's does.
+  const port = portOf(address) === portOf(info.console_address) ? location.port : portOf(address);
+  const scheme = value("tls-cert") ? "https:" : "http:";
+  if (port === location.port && scheme === location.protocol) return null;
+  const url = `${scheme}//${location.hostname}${port ? `:${port}` : ""}/`;
+  return h("span", {}, "The console moves to ", h("a", { href: url }, url), ": this page cannot follow it there.");
+}
+
+// Restarts the server once confirmed, after it has checked that it would start, and waits for
+// it to answer again.
+async function restartServer() {
+  let config, info;
+  try {
+    [config, info] = await Promise.all([s3.config(), s3.info()]);
+  } catch (err) {
+    fail(err);
+    return;
+  }
+  if (!config.pending_restart.length) {
+    render();
+    toast("Nothing waits for a restart.");
+    return;
+  }
+  const moves = consoleMoves(config, info);
+  const ok = await confirm({
+    title: "Restart the server?",
+    message: [
+      "s3dal stops taking requests, gives those in flight 10 seconds, and starts again with the saved ",
+      h("span", { class: "mono" }, config.pending_restart.join(", ")),
+      ". Clients are refused until it is back: a few seconds, or as long as the backend takes to answer.",
+      moves && h("span", { class: "restart-note" }, moves),
+    ],
+    action: "Restart",
+    danger: false,
+  });
+  if (!ok) return;
+  const waiting = restartingDialog();
+  waiting.say("Checking that the server would start with these settings…");
+  try {
+    await s3.restart();
+  } catch (err) {
+    waiting.close();
+    fail(err);
+    return;
+  }
+  const since = Date.now();
+  if (moves) {
+    waiting.close();
+    await dialog({ title: "Restarting", body: h("p", {}, moves), actions: [{ label: "OK", value: "ok", kind: "primary", autofocus: true }] });
+    return;
+  }
+  waiting.say("Waiting for the server to start again…");
+  const back = await cameBack(since);
+  waiting.close();
+  // Before the toast: painting the page replaces everything in the body, toasts included.
+  render();
+  if (back) toast("Restarted with the saved settings");
+  else toast("The server has not answered for 2 minutes. Its log says why.", { kind: "error" });
 }
 
 // ----- Settings -----
@@ -1035,6 +1146,15 @@ const COLLECTORS = [
   ["gelf+https", "Graylog: GELF over HTTPS"],
   ["elasticsearch+http", "Elasticsearch, OpenSearch: HTTP"],
   ["elasticsearch+https", "Elasticsearch, OpenSearch: HTTPS"],
+  ["syslog+udp", "Syslog: RFC 5424 over UDP"],
+  ["syslog+tcp", "Syslog: RFC 5424 over TCP"],
+  ["syslog+tls", "Syslog: RFC 5424 over TLS"],
+  ["otlp+http", "OpenTelemetry: OTLP over HTTP"],
+  ["otlp+https", "OpenTelemetry: OTLP over HTTPS"],
+  ["splunk+http", "Splunk: HTTP Event Collector over HTTP"],
+  ["splunk+https", "Splunk: HTTP Event Collector over HTTPS"],
+  ["ndjson+http", "Any HTTP input: NDJSON over HTTP"],
+  ["ndjson+https", "Any HTTP input: NDJSON over HTTPS"],
 ];
 
 const COLLECTOR_ADDRESSES = {
@@ -1044,6 +1164,15 @@ const COLLECTOR_ADDRESSES = {
   "gelf+https": "graylog.example.com/gelf",
   "elasticsearch+http": "elastic@es:9200/logs-s3dal-default",
   "elasticsearch+https": "elastic@es:9200/logs-s3dal-default",
+  "syslog+udp": "rsyslog:514",
+  "syslog+tcp": "rsyslog:514",
+  "syslog+tls": "logs.example.com:6514",
+  "otlp+http": "otel-collector:4318",
+  "otlp+https": "otel.example.com",
+  "splunk+http": "splunk:8088",
+  "splunk+https": "splunk.example.com:8088",
+  "ndjson+http": "vector:8080/s3dal",
+  "ndjson+https": "logs.example.com/s3dal",
 };
 
 const PLACEHOLDERS = { "log-file": "stderr", "console-address": "Off", "tls-cert": "None, plain HTTP", "tls-key": "None" };
@@ -1123,12 +1252,17 @@ function collectorControl(s, text, menu) {
   const address = text({ "aria-label": "Collector address" });
   address.value = at < 0 ? "" : s.value.slice(at + 3);
   const password = text({ type: "password", "aria-label": "Collector password" });
+  // Splunk's HEC takes a token, with no user before it.
+  const isToken = () => select.value.startsWith("splunk+");
   const paint = () => {
     const on = select.value !== "";
     address.hidden = !on;
     address.placeholder = COLLECTOR_ADDRESSES[select.value] ?? "host:port";
     password.hidden = !on || !select.value.includes("http");
-    password.placeholder = s.secret && select.value === scheme ? "Password unchanged" : "Password, if it takes one";
+    password.setAttribute("aria-label", isToken() ? "Collector token" : "Collector password");
+    password.placeholder = s.secret && select.value === scheme
+      ? (isToken() ? "Token unchanged" : "Password unchanged")
+      : (isToken() ? "HEC token" : "Password, if it takes one");
   };
   select.addEventListener("change", () => {
     paint();
@@ -1145,8 +1279,9 @@ function collectorControl(s, text, menu) {
         const end = rest.search(/[/?#]/);
         const authority = end < 0 ? rest : rest.slice(0, end);
         const user = authority.lastIndexOf("@");
-        if (user < 0) throw new Error("Put the user before the host, as elastic@es:9200, to send a password.");
-        rest = `${authority.slice(0, user).split(":")[0]}:${encodeURIComponent(secret)}${rest.slice(user)}`;
+        if (user >= 0) rest = `${authority.slice(0, user).split(":")[0]}:${encodeURIComponent(secret)}${rest.slice(user)}`;
+        else if (isToken()) rest = `:${encodeURIComponent(secret)}@${rest}`;
+        else throw new Error("Put the user before the host, as elastic@es:9200, to send a password.");
       }
       return `${select.value}://${rest}`;
     },
@@ -1253,9 +1388,12 @@ function restartForm(config, save) {
   };
   config.backend_opts.forEach(addOpt);
 
-  const saveButton = h("button", { class: "button primary", type: "submit", disabled: true }, "Save for restart");
+  // Save first in the footer: Enter in a field submits with the first button, and must not
+  // restart the server.
+  const saveButton = h("button", { class: "button", type: "submit", disabled: true }, "Save");
+  const restartButton = h("button", { class: "button primary", type: "submit", disabled: true }, "Save and restart");
   const changed = () => {
-    saveButton.disabled = !optsChanged && !Object.values(inputs).some((row) => row.changed());
+    saveButton.disabled = restartButton.disabled = !optsChanged && !Object.values(inputs).some((row) => row.changed());
   };
   return h("form", {
     class: "panel",
@@ -1274,13 +1412,18 @@ function restartForm(config, save) {
         edit.backend_opts = opts.filter((o) => o.name.value.trim())
           .map((o) => ({ name: o.name.value.trim(), value: o.secret && !o.value.value ? null : o.value.value }));
       }
-      saveButton.disabled = true;
+      const restart = e.submitter === restartButton;
+      const busy = restart ? restartButton : saveButton;
+      const label = busy.textContent;
+      saveButton.disabled = restartButton.disabled = true;
       const probing = "backend" in settings || edit.backend_opts;
-      saveButton.textContent = probing ? "Checking the backend…" : "Saving…";
-      if (!(await save(edit, "Saved. Restart the server to apply."))) {
-        saveButton.textContent = "Save for restart";
+      busy.textContent = probing ? "Checking the backend…" : "Saving…";
+      if (!(await save(edit, restart ? "Saved" : "Saved. Restart the server to apply."))) {
+        busy.textContent = label;
         changed();
+        return;
       }
+      if (restart) await restartServer();
     },
   },
     h("header", { class: "panel-header" }, h("h2", {}, "Restart required"),
@@ -1292,7 +1435,7 @@ function restartForm(config, save) {
         h("div", { class: "muted small" }, "Options of the OpenDAL service, such as root, bucket or endpoint. Values that may be credentials are not shown.")),
       h("div", { class: "opt-editor" }, list,
         h("button", { type: "button", class: "button ghost", disabled: !optsEditable, onclick: () => { addOpt(); optsChanged = true; changed(); opts.at(-1).name.focus(); } }, icon("plus"), "Add option"))),
-    h("div", { class: "panel-footer end" }, saveButton),
+    h("div", { class: "panel-footer end" }, saveButton, restartButton),
   );
 }
 
@@ -1430,8 +1573,7 @@ function settingsView() {
       editable
         ? h("div", { class: "banner" }, icon("settings"), h("div", {}, "Changes are written to ", h("span", { class: "mono" }, config.file), ". Edits made to the file by hand are picked up within seconds."))
         : h("div", { class: "banner warn" }, icon("lock"), h("div", {}, h("strong", {}, "Read only. "), config.reason ?? "")),
-      config.pending_restart.length ? h("div", { class: "banner warn" }, icon("alert"),
-        h("div", {}, h("strong", {}, "Restart to apply: "), h("span", { class: "mono" }, config.pending_restart.join(", ")))) : "",
+      pendingBanner(config.pending_restart),
       keys, form, fixed,
     );
   }

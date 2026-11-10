@@ -28,6 +28,7 @@ pub struct Live {
     dal: S3Dal,
     auth: LiveAuth,
     cert: Option<LiveCert>,
+    restart: tokio::sync::Notify,
 }
 
 impl Live {
@@ -45,7 +46,25 @@ impl Live {
             dal,
             auth,
             cert,
+            restart: tokio::sync::Notify::new(),
         }
+    }
+
+    /// The settings as a start would read them now, from the command line, the environment
+    /// and the config file.
+    pub fn read(&self) -> anyhow::Result<ServeArgs> {
+        Cli::serve_from(&self.argv).map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
+    /// Asks the server to stop and start again, which `main` does once the requests in flight
+    /// are done.
+    pub fn request_restart(&self) {
+        self.restart.notify_one();
+    }
+
+    /// Resolves once a restart is asked for, even if it was asked before this was called.
+    pub async fn restart_requested(&self) {
+        self.restart.notified().await;
     }
 
     /// The settings as last read, which may include changes that wait for a restart; see
@@ -76,7 +95,7 @@ impl Live {
     /// leaves the server as it was.
     pub fn reload(&self) -> anyhow::Result<()> {
         let mut current = self.lock();
-        let args = Cli::serve_from(&self.argv).map_err(|err| anyhow::anyhow!("{err}"))?;
+        let args = self.read()?;
         // A certificate is replaced only on a server that started with one: turning TLS on or
         // off changes what the listener speaks, which takes a restart.
         let certified = match (&self.cert, &args.tls_cert, &args.tls_key) {

@@ -72,32 +72,36 @@ impl ConsoleServer {
         }
     }
 
-    /// A request signed as the browser signs it: for the path the S3 service sees, sent under
-    /// the console's `/s3` prefix.
     async fn api(&self, method: &str, path: &str, body: &str) -> (u16, String) {
-        let payload: String = Sha256::digest(body.as_bytes())
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        let headers = signed_headers(&self.console, method, path, "", &[], &payload);
-        let headers: Vec<(&str, &str)> = headers
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let (status, body) = raw_request(
-            &self.console,
-            method,
-            &format!("/s3{path}"),
-            &headers,
-            body.as_bytes(),
-        )
-        .await;
-        (status, String::from_utf8_lossy(&body).into_owned())
+        console_api(&self.console, method, path, body).await
     }
 
     fn file_text(&self) -> String {
         std::fs::read_to_string(self.file.path()).unwrap()
     }
+}
+
+/// A request signed as the browser signs it: for the path the S3 service sees, sent under the
+/// console's `/s3` prefix.
+async fn console_api(console: &str, method: &str, path: &str, body: &str) -> (u16, String) {
+    let payload: String = Sha256::digest(body.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let headers = signed_headers(console, method, path, "", &[], &payload);
+    let headers: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let (status, body) = raw_request(
+        console,
+        method,
+        &format!("/s3{path}"),
+        &headers,
+        body.as_bytes(),
+    )
+    .await;
+    (status, String::from_utf8_lossy(&body).into_owned())
 }
 
 #[tokio::test]
@@ -379,4 +383,120 @@ async fn the_console_cannot_lock_out_its_own_session_or_override_the_environment
         "{body}"
     );
     assert_eq!(server.file_text(), CONFIG);
+}
+
+/// Whether the server was asked to restart, looking for a moment.
+async fn restart_asked(live: &Live) -> bool {
+    tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        live.restart_requested(),
+    )
+    .await
+    .is_ok()
+}
+
+#[tokio::test]
+async fn a_restart_is_refused_while_the_server_would_not_start_again() {
+    // A server that stops and then fails to start leaves nothing to fix the settings from,
+    // the console included; what would fail must be found while it still runs.
+    let root = tempfile::tempdir().unwrap();
+    let config = format!("{CONFIG}\n[backend-opt]\nroot = {:?}\n", root.path());
+    let server = ConsoleServer::start(&config, &[]).await;
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let not_a_dir = tempfile::NamedTempFile::new().unwrap();
+    for (file, says) in [
+        (
+            format!("address = \"{}\"\n{config}", taken.local_addr().unwrap()),
+            "cannot listen on",
+        ),
+        (
+            format!(
+                "{CONFIG}\n[backend-opt]\nroot = {:?}\n",
+                not_a_dir.path().join("x")
+            ),
+            "backend",
+        ),
+        ("this is not toml".to_owned(), "do not read"),
+    ] {
+        std::fs::write(server.file.path(), &file).unwrap();
+        let (status, body) = server.api("POST", "/_s3dal/admin/restart", "").await;
+        assert_eq!(status, 400, "{file}: {body}");
+        assert!(body.contains(says), "{file}: {body}");
+        assert!(!restart_asked(&server.live).await, "{file}");
+    }
+
+    // Once it would, the restart is asked for.
+    std::fs::write(server.file.path(), &config).unwrap();
+    let (status, body) = server.api("POST", "/_s3dal/admin/restart", "").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(restart_asked(&server.live).await);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_restart_runs_the_same_process_again_with_the_saved_settings() {
+    // A restart by exiting would leave a server started by hand, or by Docker without a
+    // restart policy, stopped for good; in the same process the PID stays, as a container's
+    // PID 1 must.
+    use tokio::io::AsyncBufReadExt;
+    let root = tempfile::tempdir().unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        file.path(),
+        format!(
+            "backend = \"fs\"\naddress = \"127.0.0.1:0\"\nconsole-address = \"127.0.0.1:0\"\n\
+             [backend-opt]\nroot = {:?}\n",
+            root.path()
+        ),
+    )
+    .unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_s3dal"))
+        .arg("serve")
+        .arg("--config")
+        .arg(file.path())
+        .env_clear()
+        .env("S3DAL_ACCESS_KEY", ACCESS_KEY)
+        .env("S3DAL_SECRET_KEY", SECRET_KEY)
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let mut log = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
+    // The console's URL from the line that says where it listens, and that line.
+    let mut console_line = async move || {
+        let wait = async {
+            while let Some(line) = log.next_line().await.unwrap() {
+                if let Some(at) = line.find("console on ") {
+                    let url = line[at + "console on ".len()..]
+                        .split(['"', ' '])
+                        .next()
+                        .unwrap()
+                        .to_owned();
+                    return (url, line);
+                }
+            }
+            panic!("s3dal exited");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), wait)
+            .await
+            .expect("s3dal said where the console is")
+    };
+    let (console, first) = console_line().await;
+    assert!(!first.starts_with('{'), "{first}");
+
+    let edit = r#"{"settings":{"log-format":"json"}}"#;
+    let (status, body) = console_api(&console, "PUT", "/_s3dal/admin/config", edit).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = console_api(&console, "POST", "/_s3dal/admin/restart", "").await;
+    assert_eq!(status, 200, "{body}");
+
+    // The log now comes as JSON: the settings the first start did not have.
+    let (console, line) = console_line().await;
+    assert!(line.starts_with('{'), "{line}");
+    assert_eq!(child.id(), pid);
+    assert!(child.try_wait().unwrap().is_none());
+    let (status, body) = console_api(&console, "GET", "/_s3dal/admin/info", "").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"pending_restart\":[]"), "{body}");
 }

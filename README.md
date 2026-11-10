@@ -111,7 +111,7 @@ for secrets, which then stay out of shell history and process listings.
 | `--log-file` | `S3DAL_LOG_FILE` | | File the log is written to, its missing directories created; without it, stderr |
 | `--log-max-size` | `S3DAL_LOG_MAX_SIZE` | `100MiB` | Size past which the log file is renamed to `<file>.1` and a new one started; `0` never rotates |
 | `--log-max-files` | `S3DAL_LOG_MAX_FILES` | `5` | Rotated log files kept |
-| `--log-forward` | `S3DAL_LOG_FORWARD` | | Also send the log to Graylog (`gelf+udp://host:12201`, `gelf+tcp://…`, `gelf+https://…`) or Elasticsearch/OpenSearch (`elasticsearch+https://user:password@host:9200/index`); see [Logs](guide/operations.md#logs) |
+| `--log-forward` | `S3DAL_LOG_FORWARD` | | Also send the log to Graylog (`gelf+udp://host:12201`, `gelf+tcp://…`, `gelf+https://…`), Elasticsearch/OpenSearch (`elasticsearch+https://user:password@host:9200/index`), syslog (`syslog+udp://host:514`, `syslog+tcp://…`, `syslog+tls://…`), OpenTelemetry (`otlp+https://host:4318`), Splunk HEC (`splunk+https://:TOKEN@host:8088`) or any HTTP input (`ndjson+https://host/path`); see [Logs](guide/operations.md#sending-the-log-to-a-collector) |
 | `--public-bucket` | `S3DAL_PUBLIC_BUCKETS` | | A bucket whose objects anyone may download without a key pair; repeatable, or comma-separated. See [Public buckets](#public-buckets) |
 
 `s3dal check-config` takes the same flags, variables and file as `serve`, and prints the
@@ -194,7 +194,8 @@ cut.
   `log-level`, `public-bucket`, and a renewed certificate and key.
 - `backend`, `backend-opt`, `address`, `console-address`, `log-format`, `log-file`,
   `log-max-size`, `log-max-files`, `log-forward`, and turning TLS on or off take a restart.
-  Until then the log, and the console, say a restart is pending.
+  Until then the log, and the console, say a restart is pending; the console can restart the
+  server, as below.
 - A file with a mistake changes nothing: the log says what is wrong, and s3dal keeps running
   with the settings it had. `s3dal check-config` shows the same error before you save.
 
@@ -212,6 +213,12 @@ cut.
   the next restart; a new backend is probed first, so the restart does not find it broken.
   A setting with a fixed set of values (backend, log level, log format, log collector) is a
   menu;
+- restart: "Save and restart", or "Restart now" while saved settings wait for one. s3dal
+  first checks that it would start again with them (the config file reads, the certificate
+  loads, the log file opens, a new address is free, the backend answers) and refuses with the
+  reason if not. Then it stops as on SIGTERM and runs its own command line again in the same
+  process, so its PID stays and a container goes on running; the page waits for it and
+  reloads. Unix only;
 - server: version, uptime, backend and what it stores natively, and where the log goes.
 
 You sign in with any key pair, and see what it may do: a pair with limits sees only its

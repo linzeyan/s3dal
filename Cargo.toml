@@ -1,6 +1,6 @@
 [package]
 name = "s3dal"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 # s3s 0.17 requires 1.96.
 rust-version = "1.96"
@@ -43,9 +43,10 @@ client = [
     "tokio/io-std",
     "tokio/io-util",
 ]
-# `--log-forward` over HTTP: Graylog's GELF HTTP input and Elasticsearch's bulk API. Over UDP and
-# TCP it needs nothing more. Every crate it needs is already compiled for OpenDAL's s3 service.
-log-forward = ["dep:percent-encoding", "dep:reqwest"]
+# `--log-forward` over HTTP (GELF, Elasticsearch's bulk API, OTLP, Splunk HEC, NDJSON) and syslog
+# over TLS. Over UDP and TCP it needs nothing more. Every crate it needs is already compiled for
+# OpenDAL's s3 service.
+log-forward = ["dep:percent-encoding", "dep:reqwest", "dep:rustls-platform-verifier"]
 
 [dependencies]
 anyhow = "1"
@@ -80,6 +81,9 @@ reqsign-core = { version = "3.3.2", default-features = false, optional = true }
 # Already compiled for OpenDAL's s3 service, with these features: the client's HTTP transport,
 # with streamed bodies for uploads and downloads larger than memory.
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"], optional = true }
+# Already compiled for reqwest, which checks HTTPS certificates with it. Syslog over TLS checks
+# the collector's the same way.
+rustls-platform-verifier = { version = "0.7.1", optional = true }
 s3s = "0.17.0"
 # Already compiled for s3s, which decodes and encodes x-amz-meta-* values with it; s3dal stores
 # them in the same encoded form.

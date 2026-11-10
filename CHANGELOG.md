@@ -3,6 +3,20 @@
 All notable changes to s3dal are listed here, in the format of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.2] - 2026-11-10
+
+### Added
+
+- `--log-forward` sends to more collectors: syslog (RFC 5424 over UDP, TCP or TLS), OTLP over
+  HTTP for OpenTelemetry collectors (`otlp+https://…`), Splunk's HTTP Event Collector
+  (`splunk+https://:TOKEN@…`), and any HTTP input that takes newline-delimited JSON
+  (`ndjson+https://…`).
+- Console: settings that take a restart have "Save" and "Save and restart", and the "Restart to
+  apply" banner a "Restart now" button. s3dal first checks that it would start again with the
+  saved settings and refuses with the reason if not; it then stops as on SIGTERM and runs the
+  same command line again in the same process, keeping its PID. The page waits for it, or says
+  where the console has moved to. Unix only.
+
 ## [0.3.1] - 2026-11-10
 
 ### Added

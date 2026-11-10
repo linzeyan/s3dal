@@ -583,6 +583,7 @@ textarea.input {
 
 .panel-footer.end {
   justify-content: flex-end;
+  gap: 8px;
 }
 
 .panel-footer .button.wide {
@@ -784,6 +785,42 @@ a.name-cell:hover span,
 
 .banner.warn .icon {
   color: #b7791f;
+}
+
+.banner-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.banner > .button {
+  flex: none;
+  align-self: center;
+}
+
+.banner > .button .icon {
+  margin-top: 0;
+  color: inherit;
+}
+
+.restart-status {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.restart-note {
+  display: block;
+  margin-top: 10px;
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .stats {

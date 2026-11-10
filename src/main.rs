@@ -33,7 +33,10 @@ fn main() -> anyhow::Result<()> {
             if let Some(flush) = flush {
                 flush.wait(FLUSH_TIMEOUT);
             }
-            served
+            match served? {
+                Stop::Asked => Ok(()),
+                Stop::Restart => Err(restart()),
+            }
         }
         Command::CheckConfig(args) => {
             print!("{}", args.describe());
@@ -171,8 +174,35 @@ fn limit_malloc_arenas() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn limit_malloc_arenas() {}
 
+/// Why the server stopped serving.
+#[derive(Clone, Copy)]
+enum Stop {
+    /// A signal: the process exits.
+    Asked,
+    /// The console asked for a restart.
+    Restart,
+}
+
+/// The same command line again, in this process: its PID stays, so a container whose PID 1 it
+/// is runs on, and a supervisor sees no exit to act on. The environment, which may hold
+/// settings, stays too. Returns only if the program could not be run.
+#[cfg(unix)]
+fn restart() -> anyhow::Error {
+    use std::os::unix::process::CommandExt;
+    let mut argv = std::env::args_os();
+    let program = argv.next().unwrap_or_else(|| "s3dal".into());
+    let err = std::process::Command::new(&program).args(argv).exec();
+    anyhow::anyhow!("cannot restart as {}: {err}", program.to_string_lossy())
+}
+
+/// The console refuses to restart here, so this is never reached.
+#[cfg(not(unix))]
+fn restart() -> anyhow::Error {
+    anyhow::anyhow!("restarting needs a Unix system")
+}
+
 #[tokio::main]
-async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+async fn serve(args: ServeArgs) -> anyhow::Result<Stop> {
     // Before the probe, which can take a while on a remote backend, so a bad certificate fails
     // at once.
     let (tls, cert) = match (&args.tls_cert, &args.tls_key) {
@@ -217,20 +247,40 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     };
 
     let watcher = tokio::spawn(live::watch(live.clone()));
-    // One signal stops both listeners, each draining its own requests.
-    let shutdown = shutdown_signal()?.shared();
-    let s3 = server::serve(listener, service.clone(), tls.clone(), shutdown.clone());
+    // One signal, or a restart, stops both listeners, each draining its own requests.
+    let signal = shutdown_signal()?;
+    let restart = {
+        let live = live.clone();
+        async move {
+            live.restart_requested().await;
+            let settings = live.pending_restart();
+            tracing::info!(
+                ?settings,
+                "restarting: no new connections; requests in flight get 10 seconds"
+            );
+        }
+    };
+    let stop = async move {
+        tokio::select! {
+            () = signal => Stop::Asked,
+            () = restart => Stop::Restart,
+        }
+    }
+    .shared();
+    let shutdown = || stop.clone().map(|_| ());
+    let s3 = server::serve(listener, service.clone(), tls.clone(), shutdown());
     match console {
         Some(listener) => {
             let console = Arc::new(Console::new(live));
-            let pages = server::serve_console(listener, service, console, tls, shutdown);
+            let pages = server::serve_console(listener, service, console, tls, shutdown());
             tokio::join!(s3, pages);
         }
         None => s3.await,
     }
     watcher.abort();
     tracing::info!("stopped");
-    Ok(())
+    // Resolved already: the listeners stopped on it.
+    Ok(stop.await)
 }
 
 /// Ctrl-C, or SIGTERM: what Docker, systemd and Kubernetes stop a service with. Without a
