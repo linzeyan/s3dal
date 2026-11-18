@@ -3,28 +3,49 @@
 
 mod acl;
 mod bucket;
+mod bucket_state;
+mod cache;
 mod copy;
 mod delete_objects;
 mod fs;
+mod lifecycle;
 mod list;
 mod multipart;
 mod naming;
+mod notification;
 mod object;
 mod precondition;
 mod store;
+pub(crate) mod swap;
+mod thumbnail;
+mod tier;
+mod tier_sweep;
 mod tmp;
 mod unsupported;
 mod upload;
+mod usage;
+mod version;
 
-use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::{Duration, SystemTime};
 
 use opendal::Operator;
+use opendal_layer_observe_metrics_common::MetricsLayer;
 use s3s::dto::*;
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result};
 
+pub use bucket_state::Quota;
+pub use lifecycle::Expired;
+pub(crate) use lifecycle::ExpiredKind;
+pub(crate) use tier::SkipReason;
+pub use tier_sweep::TierSweep;
+pub use usage::BucketUsage;
+
 use crate::backend::Profile;
 use crate::config::Settings;
+use crate::events::{Hub, ObjectEvent, Subscriber};
+use crate::metrics::Metrics;
+use crate::notify::{self, Notifier};
 
 /// Cheap to clone: work that must outlive a request, such as a keep-alive
 /// CompleteMultipartUpload, takes its own handle.
@@ -39,19 +60,188 @@ pub struct S3Dal {
     /// Keyed by upload directory: one Complete of an upload at a time.
     upload_locks: Arc<store::KeyLocks>,
     proofs: Arc<list::Proofs>,
+    versions: Arc<version::Sequence>,
+    bucket_states: Arc<bucket_state::Cache>,
+    events: Arc<Hub>,
+    usage: Arc<usage::Tracker>,
+    lifecycle_runs: Arc<lifecycle::Runs>,
+    metrics: Arc<Metrics>,
+    /// Sized once, at startup: `cache-size` takes a restart.
+    cache: Option<Arc<cache::Cache>>,
+    notifier: Arc<Notifier>,
+    /// The task matching object events to notification rules, while any target is configured;
+    /// without one nothing subscribes, so requests build no events for it.
+    dispatcher: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    /// The cold tiers, fixed at startup (see [`Self::with_tiers`]); empty without `[[tier]]`.
+    tiers: Arc<[crate::tier::Tier]>,
 }
 
 impl S3Dal {
-    /// `profile` must come from [`crate::backend::probe`] on the same operator.
+    /// `profile` must come from [`crate::backend::probe`] on the same operator. With
+    /// notification targets in `settings`, call it on a Tokio runtime, which sends to them.
     pub fn new(op: Operator, profile: Profile, settings: Settings) -> Self {
-        Self {
-            op,
+        let metrics = Arc::new(Metrics::new());
+        let targets = settings.notify.clone();
+        let cache = cache::Cache::new(settings.cache_size, &op, metrics.clone()).map(Arc::new);
+        let dal = Self {
+            op: op.layer(MetricsLayer::new(metrics.backend())),
             profile,
             settings: Arc::new(RwLock::new(Arc::new(settings))),
             locks: Arc::default(),
             upload_locks: Arc::default(),
             proofs: Arc::default(),
+            versions: Arc::default(),
+            bucket_states: Arc::default(),
+            events: Arc::new(Hub::new()),
+            usage: Arc::default(),
+            lifecycle_runs: Arc::default(),
+            metrics,
+            cache,
+            notifier: Arc::default(),
+            dispatcher: Arc::default(),
+            tiers: Arc::new([]),
+        };
+        dal.configure_notifications(&targets);
+        dal
+    }
+
+    /// The server with `tiers`, from [`crate::tier::connect`] or [`crate::tier::Tier::open`] on
+    /// this server's operator. A write naming a tier's storage class keeps its bytes there; a
+    /// stub naming a tier not given here fails its reads.
+    pub fn with_tiers(mut self, tiers: Vec<crate::tier::Tier>) -> Self {
+        for tier in &tiers {
+            self.metrics.tier(&tier.name);
         }
+        self.tiers = tiers.into();
+        self
+    }
+
+    /// Sends notifications to `targets` from now on, starting the dispatcher with the first
+    /// target and stopping it with the last.
+    fn configure_notifications(&self, targets: &[notify::Target]) {
+        let mut dispatcher = self
+            .dispatcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if targets.is_empty() && dispatcher.is_none() && self.notifier.is_empty() {
+            return;
+        }
+        self.notifier.configure(targets, &self.metrics);
+        match (targets.is_empty(), dispatcher.as_ref()) {
+            (false, None) => {
+                // Subscribed here, before the task first runs, so no event between this call
+                // and its start is missed.
+                let task = notification::dispatch(self.clone(), self.subscribe());
+                *dispatcher = Some(tokio::spawn(task).abort_handle());
+            }
+            (true, Some(task)) => {
+                task.abort();
+                *dispatcher = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// The object events of this process from now on (F3): one per change to a key that took
+    /// effect, written or removed, through any handle of this server.
+    pub fn subscribe(&self) -> Subscriber {
+        self.events.subscribe(self.metrics.clone())
+    }
+
+    /// Announces a change to a key once it has committed; a change that failed or was refused
+    /// announces nothing. Its usage counts towards the bucket's quota before the request
+    /// answers, so the next write sees it, whether anyone listens or not.
+    pub(crate) fn emit(&self, event: ObjectEvent) {
+        if let Some(change) = event.usage {
+            self.usage.apply(self, &event.bucket, event.at, change);
+        }
+        if self.events.heard() {
+            self.events.send(event);
+        }
+    }
+
+    /// The bucket's quota, `None` without one.
+    pub async fn bucket_quota(&self, bucket: &str) -> S3Result<Option<Quota>> {
+        naming::require_bucket(self, bucket).await?;
+        Ok(bucket_state::get(self, bucket).await?.quota.clone())
+    }
+
+    /// Sets the bucket's quota, or with `None` removes it. Stored with the bucket, as
+    /// [`Self::set_bucket_public`] is. A bucket that had no quota is counted at once, rather
+    /// than at the next usage scan: until a quota is set, its writes are not counted as they
+    /// happen.
+    pub async fn set_bucket_quota(&self, bucket: &str, quota: Option<Quota>) -> S3Result<()> {
+        naming::require_bucket(self, bucket).await?;
+        let had = bucket_state::get(self, bucket).await?.quota.is_some();
+        bucket_state::update(self, bucket, |s| s.quota = quota.clone()).await?;
+        if had || quota.is_none() {
+            // Read again, so the metrics show the new limits at once.
+            self.usage.stale(bucket);
+            usage::current(self, bucket).await?;
+            return Ok(());
+        }
+        usage::scan(self, bucket).await.map(drop)
+    }
+
+    /// What the bucket holds as far as this process knows: the last usage scan plus the
+    /// changes this process made since, in a bucket with a quota (see `usage-scan-interval`).
+    pub async fn bucket_usage(&self, bucket: &str) -> S3Result<BucketUsage> {
+        naming::require_bucket(self, bucket).await?;
+        usage::current(self, bucket).await
+    }
+
+    /// [`Self::bucket_usage`] and the quota of every bucket, by name.
+    pub async fn buckets_usage(&self) -> S3Result<Vec<(String, BucketUsage, Option<Quota>)>> {
+        usage::all(self).await
+    }
+
+    /// Counts what every bucket holds and records it for every instance sharing the backend;
+    /// the background job `usage-scan`. Returns how many buckets it counted.
+    pub async fn scan_usage(&self) -> anyhow::Result<usize> {
+        usage::scan_all(self).await
+    }
+
+    /// Applies every bucket's lifecycle rules as of `now`: expires the objects, versions and
+    /// delete markers they name and aborts the uploads, each announced as an object event.
+    /// `now` is a parameter so tests can move the clock ahead; the background job `lifecycle`
+    /// passes the time and applies each bucket once a day. Returns what was removed.
+    pub async fn apply_lifecycle(&self, now: SystemTime) -> anyhow::Result<Expired> {
+        lifecycle::apply(self, now, false).await
+    }
+
+    /// [`Self::apply_lifecycle`] for the buckets not yet applied today with the rules they have
+    /// now, in this process; the background job `lifecycle`.
+    pub async fn apply_due_lifecycle(&self, now: SystemTime) -> anyhow::Result<Expired> {
+        lifecycle::apply(self, now, true).await
+    }
+
+    /// Whether anyone may download the bucket's objects, GET and HEAD, without a key pair.
+    /// Listing it, writing to it and its other settings still take a signature.
+    pub async fn bucket_public(&self, bucket: &str) -> S3Result<bool> {
+        naming::require_bucket(self, bucket).await?;
+        Ok(bucket_state::get(self, bucket).await?.public)
+    }
+
+    /// Opens the bucket's objects to downloads without a key pair, or closes them. Stored with
+    /// the bucket in the backend: other instances sharing it follow within seconds, and a bucket
+    /// deleted and created again under the name starts private.
+    pub async fn set_bucket_public(&self, bucket: &str, public: bool) -> S3Result<()> {
+        naming::require_bucket(self, bucket).await?;
+        bucket_state::update(self, bucket, |s| s.public = public).await
+    }
+
+    /// [`Self::bucket_public`] for an unsigned request, without looking for the bucket: a
+    /// bucket that does not exist has no state, so it is not public.
+    pub(crate) async fn opens_downloads(&self, bucket: &str) -> S3Result<bool> {
+        if naming::validate_bucket_name(bucket).is_err() {
+            return Ok(false);
+        }
+        Ok(bucket_state::get(self, bucket).await?.public)
+    }
+
+    /// What the server counts, from requests to backend operations.
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
     }
 
     pub fn settings(&self) -> Arc<Settings> {
@@ -63,8 +253,10 @@ impl S3Dal {
             .clone()
     }
 
-    /// Applies to requests that start from now on, and to the next stale-upload sweep.
+    /// Applies to requests that start from now on, and to the next stale-upload sweep;
+    /// notification targets apply at once (see [`Notifier::configure`]).
     pub fn set_settings(&self, settings: Settings) {
+        self.configure_notifications(&settings.notify);
         *self
             .settings
             .write()
@@ -86,6 +278,20 @@ impl S3Dal {
     /// root. Returns how many it removed; on other backends there are none.
     pub async fn sweep_stale_temp_files(&self, age: Duration) -> anyhow::Result<usize> {
         tmp::sweep(self, age).await
+    }
+
+    /// Removes the tier objects no stub names that are older than `tier_sweep::TIER_GRACE` as of
+    /// `now`, and counts and reports the stubs whose tier object is gone; the background job
+    /// `tier-sweep`. `now` is a parameter so tests can move the clock past the grace.
+    pub async fn sweep_tiers(&self, now: SystemTime) -> anyhow::Result<TierSweep> {
+        tier_sweep::sweep(self, now).await
+    }
+
+    /// Removes the cached thumbnails whose object is gone or was overwritten since; the
+    /// background job `thumbnail-sweep`. Returns how many it removed.
+    #[cfg(feature = "thumbnail")]
+    pub async fn sweep_thumbnails(&self) -> anyhow::Result<usize> {
+        thumbnail::sweep(self).await
     }
 }
 
@@ -130,7 +336,14 @@ impl S3 for S3Dal {
         &self,
         req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
-        bucket::get_bucket_versioning(self, req).await
+        version::get_bucket_versioning(self, req).await
+    }
+
+    async fn put_bucket_versioning(
+        &self,
+        req: S3Request<PutBucketVersioningInput>,
+    ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        version::put_bucket_versioning(self, req).await
     }
 
     async fn get_bucket_policy(
@@ -163,12 +376,21 @@ impl S3 for S3Dal {
         &self,
         req: S3Request<GetBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
-        bucket::unset_configuration(
-            self,
-            &req.input.bucket,
-            S3ErrorCode::NoSuchLifecycleConfiguration,
-        )
-        .await
+        lifecycle::get_bucket_lifecycle_configuration(self, req).await
+    }
+
+    async fn put_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<PutBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        lifecycle::put_bucket_lifecycle_configuration(self, req).await
+    }
+
+    async fn delete_bucket_lifecycle(
+        &self,
+        req: S3Request<DeleteBucketLifecycleInput>,
+    ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        lifecycle::delete_bucket_lifecycle(self, req).await
     }
 
     async fn get_bucket_tagging(
@@ -258,7 +480,14 @@ impl S3 for S3Dal {
         &self,
         req: S3Request<GetBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
-        bucket::empty_configuration(self, &req.input.bucket).await
+        notification::get_bucket_notification_configuration(self, req).await
+    }
+
+    async fn put_bucket_notification_configuration(
+        &self,
+        req: S3Request<PutBucketNotificationConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
+        notification::put_bucket_notification_configuration(self, req).await
     }
 
     async fn get_bucket_accelerate_configuration(

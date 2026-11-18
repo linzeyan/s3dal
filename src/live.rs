@@ -103,7 +103,7 @@ impl Live {
             _ => None,
         };
         self.auth.replace(&args.credentials, &args.domain)?;
-        self.auth.set_public(&args.public_bucket);
+        crate::config::warn_expired(&args.credentials);
         if let (Some(live), Some(certified)) = (&self.cert, certified) {
             live.set(certified);
         }
@@ -163,6 +163,13 @@ fn restart_only_changes(started: &ServeArgs, now: &ServeArgs) -> Vec<&'static st
     if started.tls_cert.is_some() != now.tls_cert.is_some() {
         changed.push("tls-cert");
     }
+    if started.cache_size != now.cache_size {
+        changed.push("cache-size");
+    }
+    // A tier is an operator, probed and claimed at startup, as the primary backend is.
+    if started.tiers != now.tiers {
+        changed.push("tier");
+    }
     changed
 }
 
@@ -220,4 +227,56 @@ pub async fn watch(live: std::sync::Arc<Live>) -> anyhow::Result<()> {
 /// modification time might not show.
 fn snapshot(paths: &[PathBuf]) -> Vec<Option<Vec<u8>>> {
     paths.iter().map(|p| std::fs::read(p).ok()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_cache_size_waits_for_a_restart() {
+        // The cache is sized when the server starts; an operator who changed the setting must
+        // learn that it is not in effect yet rather than believe it is.
+        let args = |size: &str| {
+            Cli::serve_from([
+                "s3dal",
+                "serve",
+                "--backend=s3",
+                "--access-key=a",
+                "--secret-key=b",
+                &format!("--cache-size={size}"),
+            ])
+            .unwrap()
+        };
+        assert_eq!(
+            restart_only_changes(&args("64MiB"), &args("128MiB")),
+            ["cache-size"]
+        );
+        assert!(restart_only_changes(&args("64MiB"), &args("64MiB")).is_empty());
+    }
+
+    #[test]
+    fn a_changed_tier_waits_for_a_restart() {
+        // Tiers are built, probed and claimed at startup; an edited [[tier]] must show as pending
+        // rather than be believed in effect.
+        let args = |root: &str| {
+            let mut args = Cli::serve_from([
+                "s3dal",
+                "serve",
+                "--backend=fs",
+                "--access-key=a",
+                "--secret-key=b",
+            ])
+            .unwrap();
+            args.tiers = vec![crate::config::TierConfig {
+                name: "hdd".into(),
+                storage_class: "STANDARD_IA".into(),
+                backend: "fs".into(),
+                backend_opts: vec![("root".into(), root.into())],
+            }];
+            args
+        };
+        assert_eq!(restart_only_changes(&args("/a"), &args("/b")), ["tier"]);
+        assert!(restart_only_changes(&args("/a"), &args("/a")).is_empty());
+    }
 }

@@ -76,7 +76,7 @@ async fn a_public_bucket_opens_downloads_and_nothing_else() {
     server.create_bucket_dir("private").await;
     server.plant("site", "logo.png", b"png").await;
     server.plant("private", "k", b"secret").await;
-    server.auth.set_public(&["site".to_owned()]);
+    server.dal.set_bucket_public("site", true).await.unwrap();
 
     let (status, body) = raw_request(&server.endpoint, "GET", "/site/logo.png", &[], b"").await;
     assert_eq!((status, body.as_slice()), (200, &b"png"[..]));
@@ -101,25 +101,261 @@ async fn a_public_bucket_opens_downloads_and_nothing_else() {
     assert!(!server.exists("site/new").await);
     assert!(server.exists("site/logo.png").await);
 
-    // Made private again, as a config reload does, it closes at once.
-    server.auth.set_public(&[]);
+    // Made private again, it closes at once on the instance that made it so.
+    server.dal.set_bucket_public("site", false).await.unwrap();
     let (status, _) = raw_request(&server.endpoint, "GET", "/site/logo.png", &[], b"").await;
     assert_eq!(status, 403);
 }
 
 #[tokio::test]
-async fn a_key_pair_reload_keeps_the_public_buckets() {
-    // The two are set apart; replacing the pairs must not quietly close, or open, a bucket.
-    let server = TestServer::start().await;
-    server.create_bucket_dir("site").await;
-    server.plant("site", "a", b"a").await;
-    server.auth.set_public(&["site".to_owned()]);
-    server
-        .auth
-        .replace(&[KeyPair::new(ACCESS_KEY, SECRET_KEY)], &[])
+async fn a_bucket_made_public_on_one_instance_opens_on_another_within_seconds() {
+    // Several instances may share a backend behind a load balancer; a public link must work
+    // whichever of them answers, without a restart or a config edit on each.
+    let a = TestServer::start().await;
+    let b = TestServer::start_on(Backend::sharing(&a), Settings::default()).await;
+    a.create_bucket_dir("site").await;
+    a.plant("site", "logo.png", b"png").await;
+    // `b` looks first, and remembers the bucket as private.
+    let (status, _) = raw_request(&b.endpoint, "GET", "/site/logo.png", &[], b"").await;
+    assert_eq!(status, 403);
+
+    a.dal.set_bucket_public("site", true).await.unwrap();
+    let changed = std::time::Instant::now();
+    let opened = loop {
+        let (status, body) = raw_request(&b.endpoint, "GET", "/site/logo.png", &[], b"").await;
+        if status == 200 {
+            assert_eq!(body, b"png");
+            break changed.elapsed();
+        }
+        assert_eq!(status, 403);
+        assert!(
+            changed.elapsed() < Duration::from_secs(10),
+            "still private on the other instance"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    // The cache window, 5 s, and the time a request takes.
+    assert!(opened < Duration::from_secs(7), "{opened:?}");
+
+    // Deleting the bucket takes its state along: one created again under the name is private.
+    b.client
+        .delete_object()
+        .bucket("site")
+        .key("logo.png")
+        .send()
+        .await
         .unwrap();
-    let (status, _) = raw_request(&server.endpoint, "GET", "/site/a", &[], b"").await;
-    assert_eq!(status, 200);
+    b.client
+        .delete_bucket()
+        .bucket("site")
+        .send()
+        .await
+        .unwrap();
+    b.client
+        .create_bucket()
+        .bucket("site")
+        .send()
+        .await
+        .unwrap();
+    b.plant("site", "logo.png", b"png").await;
+    let (status, _) = raw_request(&b.endpoint, "GET", "/site/logo.png", &[], b"").await;
+    assert_eq!(status, 403);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_instances_changing_one_bucket_keep_both_changes() {
+    // The bucket's settings share one file. Instance `a` reads it to make the bucket public,
+    // and `b` enables versioning before `a` writes it back. Written as `a` read it, the file
+    // would lose `b`'s change; `a` must notice and apply its change again on top. On fs, where
+    // one process serves the root, `b` instead waits until `a` is done.
+    let base = TestServer::start().await;
+    let b = TestServer::start_on(Backend::sharing(&base), Settings::default()).await;
+    base.create_bucket_dir("site").await;
+
+    type Change = JoinHandle<Result<(), String>>;
+    let landed: Arc<Mutex<Option<Change>>> = Arc::default();
+    let hook = {
+        let (client, landed) = (b.client.clone(), landed.clone());
+        let runtime = tokio::runtime::Handle::current();
+        move || {
+            let (done, wait) = std::sync::mpsc::channel();
+            let task = runtime.spawn(async move {
+                let result = client
+                    .put_bucket_versioning()
+                    .bucket("site")
+                    .versioning_configuration(
+                        aws_sdk_s3::types::VersioningConfiguration::builder()
+                            .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                            .build(),
+                    )
+                    .send()
+                    .await
+                    .map(drop)
+                    .map_err(|e| format!("{e:?}"));
+                let _ = done.send(());
+                result
+            });
+            // Long enough for `b`'s write to land where nothing holds it back.
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+            *landed.lock().unwrap() = Some(task);
+        }
+    };
+    let mut backend = Backend::sharing(&base);
+    backend.op = backend.op.layer(interleave::BeforeWrite::new(
+        ".s3dal/buckets/site.json",
+        hook,
+    ));
+    let a = TestServer::start_on(backend, Settings::default()).await;
+
+    a.dal.set_bucket_public("site", true).await.unwrap();
+    let b_change = landed.lock().unwrap().take().expect("`b` changed the file");
+    b_change.await.unwrap().unwrap();
+
+    // A third instance has nothing cached: it reads what the backend holds.
+    let c = TestServer::start_on(Backend::sharing(&base), Settings::default()).await;
+    assert!(c.dal.bucket_public("site").await.unwrap());
+    let versioning = c
+        .client
+        .get_bucket_versioning()
+        .bucket("site")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        versioning.status(),
+        Some(&aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+    );
+}
+
+/// An OpenDAL layer that runs a hook, once, right before the first write to one path reaches
+/// the backend: what another instance does between this one's read of a file and its write.
+mod interleave {
+    use std::fmt;
+    use std::sync::{Arc, Mutex};
+
+    use opendal::raw::*;
+    use opendal::{Capability, OperationContext, Result};
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    #[derive(Clone)]
+    pub struct BeforeWrite {
+        path: String,
+        hook: Arc<Mutex<Option<Hook>>>,
+    }
+
+    impl BeforeWrite {
+        pub fn new(path: &str, hook: impl FnOnce() + Send + 'static) -> Self {
+            Self {
+                path: path.to_owned(),
+                hook: Arc::new(Mutex::new(Some(Box::new(hook)))),
+            }
+        }
+    }
+
+    impl fmt::Debug for BeforeWrite {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BeforeWrite")
+                .field("path", &self.path)
+                .finish()
+        }
+    }
+
+    impl Layer for BeforeWrite {
+        fn apply_service(&self, inner: Servicer) -> Servicer {
+            Arc::new(BeforeWriteService {
+                inner,
+                layer: self.clone(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct BeforeWriteService {
+        inner: Servicer,
+        layer: BeforeWrite,
+    }
+
+    impl Service for BeforeWriteService {
+        type Reader = oio::Reader;
+        type Writer = oio::Writer;
+        type Lister = oio::Lister;
+        type Deleter = oio::Deleter;
+        type Copier = oio::Copier;
+        type Composer = oio::Composer;
+
+        fn info(&self) -> ServiceInfo {
+            self.inner.info()
+        }
+
+        fn capability(&self) -> Capability {
+            self.inner.capability()
+        }
+
+        async fn create_dir(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpCreateDir,
+        ) -> Result<RpCreateDir> {
+            self.inner.create_dir(ctx, path, args).await
+        }
+
+        async fn stat(&self, ctx: &OperationContext, path: &str, args: OpStat) -> Result<RpStat> {
+            self.inner.stat(ctx, path, args).await
+        }
+
+        fn read(&self, ctx: &OperationContext, path: &str, args: OpRead) -> Result<oio::Reader> {
+            self.inner.read(ctx, path, args)
+        }
+
+        fn write(&self, ctx: &OperationContext, path: &str, args: OpWrite) -> Result<oio::Writer> {
+            if path == self.layer.path {
+                let hook = self.layer.hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            self.inner.write(ctx, path, args)
+        }
+
+        fn delete(&self, ctx: &OperationContext) -> Result<oio::Deleter> {
+            self.inner.delete(ctx)
+        }
+
+        fn list(&self, ctx: &OperationContext, path: &str, args: OpList) -> Result<oio::Lister> {
+            self.inner.list(ctx, path, args)
+        }
+
+        fn copy(
+            &self,
+            ctx: &OperationContext,
+            from: &str,
+            to: &str,
+            args: OpCopy,
+        ) -> Result<oio::Copier> {
+            self.inner.copy(ctx, from, to, args)
+        }
+
+        async fn rename(
+            &self,
+            ctx: &OperationContext,
+            from: &str,
+            to: &str,
+            args: OpRename,
+        ) -> Result<RpRename> {
+            self.inner.rename(ctx, from, to, args).await
+        }
+
+        async fn presign(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpPresign,
+        ) -> Result<RpPresign> {
+            self.inner.presign(ctx, path, args).await
+        }
+    }
 }
 
 #[tokio::test]
@@ -586,6 +822,291 @@ async fn a_key_pair_with_limits_reaches_only_its_buckets_and_folders() {
         .send()
         .await
         .unwrap();
+}
+
+/// Refused with 403 `AccessDenied`. An answer to HEAD has no body to carry the code, so there
+/// only the status is seen.
+macro_rules! refused {
+    ($what:literal, $req:expr) => {{
+        let err = $req.send().await.map(|_| ()).unwrap_err();
+        let status = err.raw_response().map(|r| r.status().as_u16());
+        assert!(
+            status == Some(403) && err.code().is_none_or(|c| c == "AccessDenied"),
+            "{}: {err:?}",
+            $what
+        );
+    }};
+}
+
+#[tokio::test]
+async fn a_write_only_pair_drops_objects_and_learns_nothing_back() {
+    // A drop box: whoever holds the pair hands objects in, by one PUT or by a multipart upload
+    // it can resume and abort, and gets nothing out: no download, no listing, not even whether
+    // a key exists; and it deletes nothing, so what was dropped stays for whoever empties it.
+    let mut dropper = pair("dropper", "dropper-secret");
+    dropper.allow = Some(vec!["inbox".into()]);
+    dropper.access = s3dal::access::Access::WriteOnly;
+    let keys = [pair("admin", "admin-secret"), dropper];
+    let server =
+        TestServer::start_serving(Backend::from_env().await, Settings::default(), &keys, None)
+            .await;
+    let admin = client(&server.endpoint, "admin", "admin-secret");
+    let dropper = client(&server.endpoint, "dropper", "dropper-secret");
+    for bucket in ["inbox", "other"] {
+        admin.create_bucket().bucket(bucket).send().await.unwrap();
+    }
+    for (bucket, key) in [("inbox", "earlier.txt"), ("other", "secret.txt")] {
+        admin
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"not yours"))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    dropper
+        .put_object()
+        .bucket("inbox")
+        .key("report.txt")
+        .body(ByteStream::from_static(b"dropped"))
+        .send()
+        .await
+        .unwrap();
+    let upload = dropper
+        .create_multipart_upload()
+        .bucket("inbox")
+        .key("big.bin")
+        .send()
+        .await
+        .unwrap();
+    let id = upload.upload_id().unwrap();
+    let part = dropper
+        .upload_part()
+        .bucket("inbox")
+        .key("big.bin")
+        .upload_id(id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"part one"))
+        .send()
+        .await
+        .unwrap();
+    // Resuming an upload starts from the parts already sent.
+    let listed = dropper
+        .list_parts()
+        .bucket("inbox")
+        .key("big.bin")
+        .upload_id(id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.parts().len(), 1);
+    dropper
+        .complete_multipart_upload()
+        .bucket("inbox")
+        .key("big.bin")
+        .upload_id(id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(part.e_tag().unwrap())
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let abandoned = dropper
+        .create_multipart_upload()
+        .bucket("inbox")
+        .key("abandoned.bin")
+        .send()
+        .await
+        .unwrap();
+    dropper
+        .abort_multipart_upload()
+        .bucket("inbox")
+        .key("abandoned.bin")
+        .upload_id(abandoned.upload_id().unwrap())
+        .send()
+        .await
+        .unwrap();
+
+    refused!(
+        "GET",
+        dropper.get_object().bucket("inbox").key("report.txt")
+    );
+    refused!(
+        "HEAD",
+        dropper.head_object().bucket("inbox").key("report.txt")
+    );
+    refused!("HEAD of the bucket", dropper.head_bucket().bucket("inbox"));
+    refused!("ListBuckets", dropper.list_buckets());
+    refused!("ListObjectsV2", dropper.list_objects_v2().bucket("inbox"));
+    refused!("ListObjects", dropper.list_objects().bucket("inbox"));
+    refused!(
+        "ListObjectVersions",
+        dropper.list_object_versions().bucket("inbox")
+    );
+    refused!(
+        "ListMultipartUploads",
+        dropper.list_multipart_uploads().bucket("inbox")
+    );
+    refused!(
+        "GetBucketLocation",
+        dropper.get_bucket_location().bucket("inbox")
+    );
+    refused!(
+        "GetObjectAttributes",
+        dropper
+            .get_object_attributes()
+            .bucket("inbox")
+            .key("report.txt")
+            .object_attributes(aws_sdk_s3::types::ObjectAttributes::ObjectSize)
+    );
+    refused!(
+        "DeleteObject",
+        dropper.delete_object().bucket("inbox").key("earlier.txt")
+    );
+    let delete = aws_sdk_s3::types::Delete::builder()
+        .objects(
+            aws_sdk_s3::types::ObjectIdentifier::builder()
+                .key("earlier.txt")
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    refused!(
+        "DeleteObjects",
+        dropper.delete_objects().bucket("inbox").delete(delete)
+    );
+    // A copy reads its source: inside the box it would show what another dropper left, and
+    // from outside it would carry anything out.
+    refused!(
+        "a copy inside its bucket",
+        dropper
+            .copy_object()
+            .bucket("inbox")
+            .key("mine.txt")
+            .copy_source("inbox/earlier.txt")
+    );
+    refused!(
+        "a copy from another bucket",
+        dropper
+            .copy_object()
+            .bucket("inbox")
+            .key("stolen.txt")
+            .copy_source("other/secret.txt")
+    );
+    refused!(
+        "a PUT outside its bucket",
+        dropper
+            .put_object()
+            .bucket("other")
+            .key("x.txt")
+            .body(ByteStream::from_static(b"x"))
+    );
+
+    // What it dropped arrived whole, and nothing it tried to delete is gone.
+    for (key, body) in [
+        ("report.txt", &b"dropped"[..]),
+        ("big.bin", b"part one"),
+        ("earlier.txt", b"not yours"),
+    ] {
+        let got = admin
+            .get_object()
+            .bucket("inbox")
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(&got.body.collect().await.unwrap().into_bytes()[..], body);
+    }
+    let uploads = admin
+        .list_multipart_uploads()
+        .bucket("inbox")
+        .send()
+        .await
+        .unwrap();
+    assert!(uploads.uploads().is_empty(), "{uploads:?}");
+}
+
+fn rfc3339(t: SystemTime) -> String {
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::from(t).format(&Rfc3339).unwrap()
+}
+
+#[tokio::test]
+async fn an_expired_pair_is_answered_as_an_unknown_key_from_its_instant_on() {
+    // A pair handed out for a while must stop at the instant named, with no reload, and look to
+    // its client exactly like a key that never existed: SDKs do not retry that answer. A pair
+    // already expired does not keep the server from starting.
+    let mut old = pair("old", "old-secret");
+    old.expires = Some(s3dal::access::Expiry::parse("2001-01-01T00:00:00Z").unwrap());
+    let mut keys = [
+        pair("admin", "admin-secret"),
+        pair("temporary", "temporary-secret"),
+        old,
+    ];
+    let server =
+        TestServer::start_serving(Backend::from_env().await, Settings::default(), &keys, None)
+            .await;
+    // Set once the server runs, as a reload would, so a slow start (the backend probe on a busy
+    // machine) does not use up the pair's few seconds before the test does.
+    let ends = SystemTime::now() + Duration::from_secs(3);
+    keys[1].expires = Some(s3dal::access::Expiry::parse(&rfc3339(ends)).unwrap());
+    server.auth.replace(&keys, &[]).unwrap();
+    let temporary = client(&server.endpoint, "temporary", "temporary-secret");
+    temporary
+        .create_bucket()
+        .bucket("bkt")
+        .send()
+        .await
+        .unwrap();
+    temporary
+        .put_object()
+        .bucket("bkt")
+        .key("k")
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap();
+    // Signed while the pair was good, used after: the URL's own expiry is not what decides.
+    let presigned = temporary
+        .get_object()
+        .bucket("bkt")
+        .key("k")
+        .presigned(presign_for(600))
+        .await
+        .unwrap();
+
+    let unknown = client(&server.endpoint, "nobody", "nobody-secret")
+        .list_buckets()
+        .send()
+        .await
+        .unwrap_err();
+    let old = client(&server.endpoint, "old", "old-secret")
+        .list_buckets()
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(old.code(), Some("InvalidAccessKeyId"), "{old:?}");
+    assert_eq!(old.message(), unknown.message());
+
+    if let Ok(left) = ends.duration_since(SystemTime::now()) {
+        tokio::time::sleep(left + Duration::from_millis(100)).await;
+    }
+    let err = temporary.list_buckets().send().await.unwrap_err();
+    assert_eq!(err.code(), Some("InvalidAccessKeyId"), "{err:?}");
+    let (status, body) = send_presigned(&server, &presigned, None, b"").await;
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("<Code>InvalidAccessKeyId</Code>"), "{body}");
 }
 
 #[tokio::test]

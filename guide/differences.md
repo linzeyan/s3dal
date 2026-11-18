@@ -12,13 +12,21 @@ It is not a storage system. The backend owns durability: there is no erasure cod
 replication, or healing. It also has none of these:
 
 - users, IAM, bucket policies, or ACLs that grant access: a key pair reaches every bucket, or
-  the buckets and folders its `allow` lists, read-only or read-write (see
-  [Key pairs](../README.md#key-pairs)), and is refused with `AccessDenied` elsewhere;
-- versioning, object lock, server-side encryption, object tags, lifecycle rules.
+  the buckets and folders its `allow` lists, read-only, write-only or read-write, until its
+  optional expiry (see [Key pairs](../README.md#key-pairs)), and is refused with `AccessDenied`
+  elsewhere. An expired pair gets `InvalidAccessKeyId`, as an unknown one does;
+- object lock, server-side encryption, object tags;
+- lifecycle filters on tags, and lifecycle transitions (`Transition`,
+  `NoncurrentVersionTransition`) on a server without [cold tiers](backends.md#cold-tiers). s3dal
+  applies lifecycle expiration rules (see [Other differences](#other-differences)), and
+  transitions into its tiers, not these.
 
 A request that relies on one of these features is refused with `NotImplemented` rather than
 answered as if it had been applied, so a client never believes an object is encrypted, locked,
-or tagged when it is not.
+tagged, or moved to another storage class when it is not. A lifecycle configuration with any
+rule that has a tag filter, or a transition on a server without tiers, is refused whole, and
+nothing of it is stored; with tiers, a transition to a class no tier has is refused the same
+way, with `InvalidStorageClass`.
 
 ## Keys and folders
 
@@ -87,11 +95,66 @@ backend directly sees how s3dal stored them:
   `s3dal_2detag`.
 - A metadata value that is not printable ASCII is stored RFC 2047-encoded, as S3 carries it in
   a header.
+- A cold object, one written to a [cold tier](backends.md#cold-tiers), is an empty file (or
+  object) in the primary backend: another tool reading the primary sees zero bytes, and its
+  bytes are in the tier, at the place its `s3dal-tier` and `s3dal-tier-id` metadata names. A
+  backup of the primary alone holds none of them (see
+  [Cold tiers](operations.md#cold-tiers)). On an S3 primary the stub's metadata takes about 140
+  bytes of the upstream's limit on user metadata (2 KB on AWS), so an object whose own metadata
+  nearly fills it cannot be written to a tier there; the write gets the upstream's error.
 
 ## Other differences
 
-- There is no versioning: `versionId=null` is accepted, any other version ID gets
-  `NoSuchVersion`, and ListObjectVersions lists every object as version `null`.
+- Versioning: a bucket that never had it keeps one version per key, `null`, and any other
+  version ID gets `NoSuchVersion`. Once enabled, replaced versions and delete markers are kept
+  under `.s3dal/versions/` in the backend, where other tools see them as ordinary files. On S3,
+  Azure Blob and GCS backends, a version that becomes current again because the newer one was
+  deleted reports the time of that change as its Last-Modified. MFA delete is refused. A write
+  that collides with one through another
+  s3dal instance sharing the backend may answer `503 SlowDown`, which SDKs retry.
+- Bucket settings S3 keeps per bucket, versioning and whether the bucket is public (an s3dal
+  setting, not an ACL or a policy), are kept in `.s3dal/buckets/<bucket>.json` in the backend.
+  Each instance reads a bucket's file at most every 5 seconds, so a change made through another
+  instance sharing the backend applies here within that time. Two instances changing settings
+  of one bucket at once keep both changes where the backend checks write conditions; elsewhere
+  (fs, which one process serves) the process keeps them apart.
+- Bucket quotas are an s3dal setting; S3 has none. A write that would take a bucket past its
+  [quota](../README.md#bucket-quotas) gets `403 QuotaExceeded`, a code S3 never sends; clients
+  treat it as any other access error and do not retry it. In a bucket with a quota, a PUT or form upload without a
+  `Content-Length` gets `411 MissingContentLength`, as its size must be known before its body is
+  read. Writes through other instances sharing the backend count from the next usage count, so
+  such a bucket can go past its quota for a while (see
+  [Bucket usage](operations.md#bucket-usage)).
+- Lifecycle rules: Expiration (`Days`, `Date`, `ExpiredObjectDeleteMarker`),
+  NoncurrentVersionExpiration (`NoncurrentDays`, `NewerNoncurrentVersions`) and
+  AbortIncompleteMultipartUpload, filtered by prefix and object size. Times are AWS's: a rule of
+  N days applies from the first midnight UTC after creation plus N days; NoncurrentDays count
+  from when a version was replaced or deleted. One instance of those sharing the backend (the
+  `lifecycle` [background job](operations.md#background-jobs)) applies each bucket's rules
+  once a day, soon after midnight UTC, and again within the hour of a change to them, so an
+  object goes during the day its rule names rather than at midnight exactly; AWS also takes up
+  to a day or two. Each pass lists the whole bucket. `x-amz-expiration` is sent on PUT, GET and
+  HEAD of a current version, not on CopyObject or CompleteMultipartUpload.
+- Event notifications go to webhooks the operator configures (`[[notify]]`), never to SQS, SNS
+  or Lambda: a configuration's ARN must be `arn:s3dal:sqs:<region>:<id>:webhook`, in any of the
+  queue, topic and Lambda lists, and an ARN naming no configured target is refused with
+  `InvalidArgument`, as AWS refuses a destination it cannot validate
+  (`x-amz-skip-destination-validation` does not change that). EventBridge, and the events s3dal
+  never sends (restore, replication, tagging, ACL, Intelligent-Tiering, reduced redundancy),
+  are refused with `NotImplemented`. Overlapping rules are not refused:
+  each one sends. There is no `s3:TestEvent` message. Only changes made through s3dal are
+  announced: objects written or removed by other tools on the backend, or by an instance of an
+  older s3dal sharing it, produce no events. Delivery is at most once per rule and may lose
+  events: on overflow of a target's queue, after its `retry-for`, on a 4xx answer, and on a
+  crash or restart, which loses what was queued (see
+  [Event notifications](operations.md#event-notifications)). In the message,
+  `userIdentity.principalId` is the access key that signed the request, and `s3dal` for a
+  lifecycle expiry or transition, whose `sourceIPAddress` is `s3dal` too; `responseElements` has no
+  `x-amz-id-2`; the `sequencer` orders the events of one s3dal process, not across instances.
+- Thumbnails are s3dal's own: a GET with `x-s3dal-thumbnail=<size>` answers with a scaled
+  image instead of the object, under the object's ETag (see
+  [Thumbnails](operations.md#thumbnails)); S3 has no such parameter. Thumbnails are kept under
+  `.s3dal/thumbs/` in the backend, where other tools see them as ordinary files.
 - ACLs: every bucket and object has one owner, `s3dal`, with full control, and nothing else
   can be granted. The canned ACLs `private`, `bucket-owner-read` and
   `bucket-owner-full-control` are accepted on objects, `private` on buckets; any ACL that grants
@@ -119,9 +182,16 @@ backend directly sees how s3dal stored them:
   ignores it and returns the whole object.
 - HEAD ignores `Range`, and answers `partNumber` with `200` rather than `206`.
 - Multipart uploads neither completed nor aborted within `--stale-upload-age` (24 hours by
-  default) are removed; AWS keeps them until a lifecycle rule removes them. GET or HEAD of one
+  default) are removed, unless a lifecycle `AbortIncompleteMultipartUpload` rule covers them,
+  which then decides alone, sooner or later; AWS keeps uploads no rule covers. GET or HEAD of one
   part (`partNumber`) of a multipart object returns no checksum.
 - A single PUT or copy is not limited to 5 GiB.
+- Storage classes: a class names a [cold tier](backends.md#cold-tiers) when one is configured
+  for it, and is otherwise accepted and ignored, the object reported `STANDARD`. There is no
+  RestoreObject and no `InvalidObjectState`: an object of any class reads at once. An empty
+  object is never cold and reports `STANDARD`, whatever class its PUT named. A GET of a cold
+  object whose key is overwritten while the GET starts reading can answer `503 SlowDown`, which
+  SDKs retry.
 - An unsigned request for an operation s3dal does not have, `HEAD /` (`curl -I`) among them,
   gets `501 NotImplemented` rather than `403`: s3s decides the operation before it checks the
   signature. To check that s3dal is up, ask its [health endpoint](operations.md#health-checks).

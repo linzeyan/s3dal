@@ -13,16 +13,28 @@ use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, TrailingHeaders
 
 use super::precondition::{self, Conditions};
 use super::store::{self, DeleteCondition, Dest, Precondition, write_err};
+use super::tier::{self, Removals};
 use super::upload::{self, BodyCheck, BodyHeaders, body_error, trailer_lookup};
-use super::{S3Dal, fs, multipart, naming, unsupported};
+use super::version::{self, Versioning};
+use super::{
+    S3Dal, bucket_state, cache, fs, lifecycle, multipart, naming, thumbnail, unsupported, usage,
+};
 use crate::checksum::{self, ALGORITHMS};
 use crate::error::{Ctx, map};
+use crate::events::{EventKind, ObjectEvent, Origin, Usage};
 use crate::meta::{self, Attrs, Computed, ObjectMeta};
 
 pub(super) async fn put_object(
     dal: &S3Dal,
     req: S3Request<PutObjectInput>,
 ) -> S3Result<S3Response<PutObjectOutput>> {
+    let origin = Origin::of(&req);
+    // s3s hands a form upload (PostObject) to PutObject.
+    let kind = if req.method == hyper::Method::POST {
+        EventKind::Post
+    } else {
+        EventKind::Put
+    };
     let trailers = req.trailing_headers;
     let mut input = req.input;
     input.content_md5 = upload::content_md5(input.content_md5.take(), &req.headers);
@@ -62,17 +74,27 @@ pub(super) async fn put_object(
         .content_length
         .and_then(|n| u64::try_from(n).ok())
         .or_else(|| body.remaining_length().exact().map(|n| n as u64));
+    // Before the body is read, so a refused write does not cost its upload.
+    usage::check_write(dal, &input.bucket, &input.key, declared).await?;
     let mut body = body.map(|chunk| chunk.map_err(body_error));
 
+    // A class a tier has sends the body there (cold-tier.md "Writes into a tier"). An empty
+    // body has nothing to move and stays hot, as does a body of unknown length, which may be
+    // one; a folder marker is a directory.
+    let cold = dal
+        .tier_for_class(input.storage_class.as_ref().map(StorageClass::as_str))
+        .filter(|_| declared.is_some_and(|n| n > 0) && !input.key.ends_with('/'));
     // Decision C1: a computed MD5 or checksum can be stored only if it is known before the
     // write starts, so small bodies are taken in memory first, and large ones fall back to a
     // synthesized ETag. With native ETags the backend computes the ETag, and buffering is what
     // stores a trailer checksum; it costs no extra memory there, because OpenDAL holds a body of
-    // that size anyway to send it in one request (`Dest::send_whole_up_to_limit`).
-    let buffered = input.content_md5.is_none()
+    // that size anyway to send it in one request (`Dest::send_whole_up_to_limit`). A body going
+    // to a tier needs neither: its stub is written after it, with everything hashed on the way.
+    let buffered = cold.is_none()
+        && input.content_md5.is_none()
         && declared.is_some_and(|n| n <= dal.settings().etag_buffer_limit);
-    let mut check = BodyCheck::new(&BodyHeaders::from_put(&input), buffered)?;
-    let dest = Dest::new(dal, &input.bucket, &input.key);
+    let mut check = BodyCheck::new(&BodyHeaders::from_put(&input), buffered || cold.is_some())?;
+    let dest = Dest::for_write(dal, &input.bucket, &input.key).await?;
 
     let trailers = trailers.as_ref();
     let (etag, checksum) = if input.key.ends_with('/') {
@@ -87,6 +109,19 @@ pub(super) async fn put_object(
             ));
         }
         put_folder_marker(&dest, &mut body, &mut check, trailers).await?
+    } else if let Some(tier) = cold {
+        let (verified, etag, _) = dest
+            .write_cold(
+                tier,
+                attrs,
+                &mut body,
+                &mut check,
+                trailer_lookup(trailers),
+                cond,
+                declared,
+            )
+            .await?;
+        (etag, verified.checksum)
     } else if buffered {
         let mut chunks = Vec::new();
         while let Some(chunk) = body.next().await {
@@ -131,8 +166,24 @@ pub(super) async fn put_object(
         (etag, verified.checksum)
     };
 
+    let size = check.received();
+    dal.emit(ObjectEvent {
+        size: Some(size),
+        etag: Some(etag.clone()),
+        version: dest.event_version(),
+        usage: dest.usage(size),
+        ..ObjectEvent::new(kind, &input.bucket, &input.key, origin)
+    });
+    // The object is written: a state read failing now must not fail it, only lose the header.
+    let created = Some(std::time::SystemTime::now());
+    let expiration = lifecycle::expiration_header(dal, &input.bucket, &input.key, size, created)
+        .await
+        .ok()
+        .flatten();
     Ok(S3Response::new(PutObjectOutput {
         e_tag: Some(ETag::Strong(etag)),
+        version_id: dest.response_version_id(),
+        expiration,
         checksum_crc32: checksum.checksum_crc32,
         checksum_crc32c: checksum.checksum_crc32c,
         checksum_crc64nvme: checksum.checksum_crc64nvme,
@@ -202,19 +253,33 @@ pub(super) async fn get_object(
     req: S3Request<GetObjectInput>,
 ) -> S3Result<S3Response<GetObjectOutput>> {
     unsupported::refuse_sse_on_read(&req.headers)?;
+    let thumbnail = thumbnail::requested(&req.uri)?;
     let input = req.input;
-    let (part, (path, obj, version, content)) = naming::with_bucket(dal, &input.bucket, async {
-        naming::validate_key(&input.key)?;
-        unsupported::refuse_sse_c(
-            input.sse_customer_algorithm.as_ref(),
-            input.sse_customer_key.as_ref(),
-            input.sse_customer_key_md5.as_ref(),
-        )?;
-        naming::require_null_version(input.version_id.as_deref())?;
-        let part = check_part_number(input.part_number, input.range.is_some())?;
-        Ok((part, open_object(dal, &input.bucket, &input.key).await?))
-    })
-    .await?;
+    let (part, target, (path, obj, version, content)) =
+        naming::with_bucket(dal, &input.bucket, async {
+            naming::validate_key(&input.key)?;
+            unsupported::refuse_sse_c(
+                input.sse_customer_algorithm.as_ref(),
+                input.sse_customer_key.as_ref(),
+                input.sse_customer_key_md5.as_ref(),
+            )?;
+            let part = check_part_number(input.part_number, input.range.is_some())?;
+            let target =
+                version::read_target(dal, &input.bucket, &input.key, input.version_id.as_deref())
+                    .await?;
+            let found = match open_object(dal, &target.path).await {
+                Err(err) if target.versioned && !target.named => {
+                    Err(version::missing(dal, &input.bucket, &input.key, err).await)
+                }
+                found => found,
+            }?;
+            Ok((part, target, found))
+        })
+        .await?;
+    // A stub that cannot be followed fails every GET of it, a 304 included.
+    let cold = tier::locate(dal, &input.bucket, &input.key, &path, &obj)?;
+    let version_id = version::response_id(&target, &obj);
+    let expiration = read_expiration(dal, &input.bucket, &input.key, &target, &obj).await?;
     precondition::check(
         &Conditions {
             if_match: input.if_match.as_ref(),
@@ -225,6 +290,21 @@ pub(super) async fn get_object(
         &obj.etag,
         obj.last_modified,
     )?;
+    // A thumbnail is whole: Range and partNumber address the object's bytes, not its
+    // thumbnail's, and HTTP lets a server answer a Range with the whole representation.
+    if let Some(size) = thumbnail {
+        let source = thumbnail::Source {
+            bucket: &input.bucket,
+            key: &input.key,
+            path: &path,
+            obj: &obj,
+            version: version.as_deref(),
+            content,
+            cold: cold.as_ref(),
+            version_id,
+        };
+        return thumbnail::respond(dal, source, size).await;
+    }
 
     let len = obj.content_length;
     let served = match (part, &input.range) {
@@ -233,11 +313,18 @@ pub(super) async fn get_object(
         (None, None) => Served::whole(len),
     };
     let range = served.range.clone();
+    let content = match content {
+        Some(content) => Some(content),
+        None => cache::content(dal, &path, version.as_deref(), cold.as_ref(), len).await?,
+    };
     let body = if range.is_empty() {
         StreamingBlob::from(Bytes::new())
     } else if let Some(content) = content {
         let at = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
         StreamingBlob::from(content.slice(at(range.start)..at(range.end)))
+    } else if let Some(cold) = &cold {
+        // A tier object never changes once written, so its read needs no pinning.
+        StreamingBlob::wrap(cold.stream(dal, range.clone()).await?)
     } else {
         // The conditions and headers describe the object as stat'ed, and a version written since
         // would be served under them: a ranged download, which SDK transfer managers make one
@@ -258,6 +345,7 @@ pub(super) async fn get_object(
     };
 
     let content_type = obj.content_type().to_owned();
+    let storage_class = reported_class(dal, &obj);
     let checksum = returned_checksum(
         obj.checksum,
         input.checksum_mode.as_ref(),
@@ -268,6 +356,9 @@ pub(super) async fn get_object(
     // headers with the requested values.
     Ok(S3Response::new(GetObjectOutput {
         body: Some(body),
+        storage_class,
+        version_id,
+        expiration,
         content_length: Some(length(range.end - range.start)?),
         content_range: served.content_range,
         parts_count: served.parts_count,
@@ -318,18 +409,27 @@ pub(super) async fn head_object(
     let content_encoding = overridden(input.response_content_encoding.take())?;
     let content_language = overridden(input.response_content_language.take())?;
     let expires = input.response_expires.take().map(http_date).transpose()?;
-    let (part, (_, obj, _)) = naming::with_bucket(dal, &input.bucket, async {
-        naming::validate_key(&input.key)?;
-        unsupported::refuse_sse_c(
-            input.sse_customer_algorithm.as_ref(),
-            input.sse_customer_key.as_ref(),
-            input.sse_customer_key_md5.as_ref(),
-        )?;
-        naming::require_null_version(input.version_id.as_deref())?;
-        let part = check_part_number(input.part_number, input.range.is_some())?;
-        Ok((part, stat_object(dal, &input.bucket, &input.key).await?))
-    })
-    .await?;
+    let (part, version_id, expiration, (_, obj, _)) =
+        naming::with_bucket(dal, &input.bucket, async {
+            naming::validate_key(&input.key)?;
+            unsupported::refuse_sse_c(
+                input.sse_customer_algorithm.as_ref(),
+                input.sse_customer_key.as_ref(),
+                input.sse_customer_key_md5.as_ref(),
+            )?;
+            let part = check_part_number(input.part_number, input.range.is_some())?;
+            let (target, found) =
+                stat_version(dal, &input.bucket, &input.key, input.version_id.as_deref()).await?;
+            let expiration =
+                read_expiration(dal, &input.bucket, &input.key, &target, &found.1).await?;
+            Ok((
+                part,
+                version::response_id(&target, &found.1),
+                expiration,
+                found,
+            ))
+        })
+        .await?;
     precondition::check(
         &Conditions {
             if_match: input.if_match.as_ref(),
@@ -347,6 +447,7 @@ pub(super) async fn head_object(
         None => Served::whole(len),
     };
     let stored_content_type = obj.content_type().to_owned();
+    let storage_class = reported_class(dal, &obj);
     let checksum = returned_checksum(
         obj.checksum,
         input.checksum_mode.as_ref(),
@@ -354,6 +455,9 @@ pub(super) async fn head_object(
     );
     let attrs = obj.attrs;
     Ok(S3Response::new(HeadObjectOutput {
+        storage_class,
+        version_id,
+        expiration,
         content_length: Some(length(served.range.end - served.range.start)?),
         content_range: served.content_range,
         parts_count: served.parts_count,
@@ -380,6 +484,28 @@ pub(super) async fn head_object(
         checksum_type: checksum.checksum_type,
         ..Default::default()
     }))
+}
+
+/// `x-amz-storage-class` of a GET or HEAD: a cold object's tier's class, and none for a hot
+/// one, as AWS leaves STANDARD out.
+fn reported_class(dal: &S3Dal, obj: &ObjectMeta) -> Option<StorageClass> {
+    dal.storage_class(obj)
+        .map(|c| StorageClass::from(c.to_owned()))
+}
+
+/// `x-amz-expiration` of an object a GET or HEAD read from `target`: only the current version
+/// carries one, the date its bucket's lifecycle rules expire it.
+async fn read_expiration(
+    dal: &S3Dal,
+    bucket: &str,
+    key: &str,
+    target: &version::Target,
+    obj: &ObjectMeta,
+) -> S3Result<Option<String>> {
+    if target.path != naming::object_path(bucket, key) {
+        return Ok(None);
+    }
+    lifecycle::expiration_header(dal, bucket, key, obj.content_length, obj.last_modified).await
 }
 
 /// A `response-*` value of a HEAD. One no header can carry would fail the response with a 500
@@ -530,16 +656,52 @@ pub(super) async fn delete_object(
     dal: &S3Dal,
     req: S3Request<DeleteObjectInput>,
 ) -> S3Result<S3Response<DeleteObjectOutput>> {
+    let origin = Origin::of(&req);
     let input = req.input;
     naming::require_bucket(dal, &input.bucket).await?;
-    naming::require_null_version(input.version_id.as_deref())?;
     let cond = DeleteCondition {
         if_match: input.if_match.as_ref(),
         last_modified: input.if_match_last_modified_time.as_ref(),
         size: input.if_match_size,
     };
-    store::delete_key(dal, &input.bucket, &input.key, cond).await?;
-    Ok(S3Response::new(DeleteObjectOutput::default()))
+    let state = version::state(dal, &input.bucket).await?;
+    let tracked = bucket_state::tracked(dal, &input.bucket).await?;
+    if state == Versioning::Unversioned {
+        naming::require_null_version(input.version_id.as_deref())?;
+        let removed = store::delete_key(dal, &input.bucket, &input.key, cond).await?;
+        if let Some(removed) = removed {
+            dal.emit(ObjectEvent {
+                usage: tracked.then(|| Usage::default().minus(removed)),
+                ..ObjectEvent::new(EventKind::Delete, &input.bucket, &input.key, origin)
+            });
+        }
+        return Ok(S3Response::new(DeleteObjectOutput::default()));
+    }
+    let removals = Removals::default();
+    let deleted = version::delete(
+        dal,
+        &input.bucket,
+        &input.key,
+        input.version_id.as_deref(),
+        cond,
+        state,
+        tracked,
+        &removals,
+    )
+    .await?;
+    removals.run(dal).await;
+    if let Some((kind, removed)) = deleted.change {
+        dal.emit(ObjectEvent {
+            version: deleted.version_id.clone(),
+            usage: tracked.then(|| Usage::default().minus(removed)),
+            ..ObjectEvent::new(kind, &input.bucket, &input.key, origin)
+        });
+    }
+    Ok(S3Response::new(DeleteObjectOutput {
+        delete_marker: deleted.delete_marker.then_some(true),
+        version_id: deleted.version_id,
+        ..Default::default()
+    }))
 }
 
 /// Every request that would tag an object is refused (`unsupported.rs`), so no object has tags,
@@ -552,9 +714,12 @@ pub(super) async fn get_object_tagging(
     let input = req.input;
     naming::require_bucket(dal, &input.bucket).await?;
     naming::validate_key(&input.key)?;
-    naming::require_null_version(input.version_id.as_deref())?;
-    stat_object(dal, &input.bucket, &input.key).await?;
-    Ok(S3Response::new(GetObjectTaggingOutput::default()))
+    let (target, (_, obj, _)) =
+        stat_version(dal, &input.bucket, &input.key, input.version_id.as_deref()).await?;
+    Ok(S3Response::new(GetObjectTaggingOutput {
+        version_id: version::response_id(&target, &obj),
+        ..Default::default()
+    }))
 }
 
 /// What HEAD reports, plus the part layout, in an XML body; only the requested attributes are
@@ -586,10 +751,11 @@ pub(super) async fn get_object_attributes(
         input.sse_customer_key.as_ref(),
         input.sse_customer_key_md5.as_ref(),
     )?;
-    naming::require_null_version(input.version_id.as_deref())?;
     let wanted = Wanted::parse(&input.object_attributes)?;
     let max_parts = multipart::page_size(input.max_parts, "max-parts")?;
-    let (_, obj, _) = stat_object(dal, &input.bucket, &input.key).await?;
+    let (target, (_, obj, _)) =
+        stat_version(dal, &input.bucket, &input.key, input.version_id.as_deref()).await?;
+    let version_id = version::response_id(&target, &obj);
     precondition::check(
         &Conditions {
             if_match: if_match.as_ref(),
@@ -616,13 +782,15 @@ pub(super) async fn get_object_attributes(
         None
     };
     Ok(S3Response::new(GetObjectAttributesOutput {
+        version_id,
         e_tag: wanted.etag.then(|| ETag::Strong(obj.etag.clone())),
         checksum: (wanted.checksum && checksum != Checksum::default()).then_some(checksum),
         object_parts,
         object_size,
-        storage_class: wanted
-            .storage_class
-            .then(|| StorageClass::from_static(StorageClass::STANDARD)),
+        storage_class: wanted.storage_class.then(|| {
+            reported_class(dal, &obj)
+                .unwrap_or_else(|| StorageClass::from_static(StorageClass::STANDARD))
+        }),
         last_modified: obj.last_modified.map(Timestamp::from),
         ..Default::default()
     }))
@@ -728,16 +896,30 @@ fn object_parts(
     })
 }
 
-/// Resolves an object for GET and HEAD, once the bucket and key are known to be valid.
-/// Directories (folder markers and prefixes) are not objects.
-/// The object's backend path and metadata, and the backend's own ETag, which names the version
-/// that was stat'ed.
-pub(super) async fn stat_object(
+/// Resolves the object, or the version `version_id` names (see [`version::read_target`]), for
+/// GET, HEAD and the requests that read what HEAD does, once the bucket and key are known to be
+/// valid. Without a version id, a key whose latest version is a delete marker answers as AWS
+/// does, with the marker's headers.
+pub(super) async fn stat_version(
     dal: &S3Dal,
     bucket: &str,
     key: &str,
-) -> S3Result<(String, ObjectMeta, Option<String>)> {
-    let path = naming::object_path(bucket, key);
+    version_id: Option<&str>,
+) -> S3Result<(version::Target, (String, ObjectMeta, Option<String>))> {
+    let target = version::read_target(dal, bucket, key, version_id).await?;
+    match stat_path(dal, target.path.clone()).await {
+        Ok(found) => Ok((target, found)),
+        Err(err) if target.versioned && !target.named => {
+            Err(version::missing(dal, bucket, key, err).await)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// The object at a backend path, a key's or an archived version's: its path and metadata, and
+/// the backend's own ETag, which names what was stat'ed. Directories (folder markers and
+/// prefixes) are not objects.
+async fn stat_path(dal: &S3Dal, path: String) -> S3Result<(String, ObjectMeta, Option<String>)> {
     let m = dal.op.stat(&path).await.map_err(read_err)?;
     if !m.is_file() {
         return Err(s3_error!(NoSuchKey));
@@ -746,16 +928,15 @@ pub(super) async fn stat_object(
     Ok((path, meta::resolve(&dal.profile, &m), version))
 }
 
-/// [`stat_object`] for GET, with the content of a small object on fs, read in the same trip
+/// [`stat_path`] for GET, with the content of a small object on fs, read in the same trip
 /// through the blocking pool (see [`fs::read_small`]).
 async fn open_object(
     dal: &S3Dal,
-    bucket: &str,
-    key: &str,
+    path: &str,
 ) -> S3Result<(String, ObjectMeta, Option<String>, Option<Bytes>)> {
     #[cfg(unix)]
     if fs::is_fs(&dal.op) {
-        let path = naming::object_path(bucket, key);
+        let path = path.to_owned();
         let full = std::path::PathBuf::from(dal.op.info().root()).join(&path);
         let (m, content) = fs::blocking(move || fs::read_small(&full))
             .await
@@ -766,9 +947,12 @@ async fn open_object(
         #[cfg(test)]
         tests::record_small_read(content.is_some());
         let version = m.etag().map(str::to_owned);
-        return Ok((path, meta::resolve(&dal.profile, &m), version, content));
+        let obj = meta::resolve(&dal.profile, &m);
+        // A stub's file is empty; served, it would answer the cold object with no bytes.
+        let content = content.filter(|_| obj.tier.is_none());
+        return Ok((path, obj, version, content));
     }
-    let (path, obj, version) = stat_object(dal, bucket, key).await?;
+    let (path, obj, version) = stat_path(dal, path.to_owned()).await?;
     Ok((path, obj, version, None))
 }
 
@@ -856,7 +1040,7 @@ mod tests {
             .unwrap();
         let large: Vec<u8> = (0..=fs::READ_WHOLE).map(|i| i as u8).collect();
         op.write("bkt/large", large.clone()).await.unwrap();
-        let (_, head, _) = stat_object(&dal, "bkt", "small").await.unwrap();
+        let (_, head, _) = stat_path(&dal, "bkt/small".to_owned()).await.unwrap();
         SMALL_READS.with(|reads| reads.take());
 
         let (out, body) = get(&dal, "small", None).await;

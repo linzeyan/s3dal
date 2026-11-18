@@ -10,8 +10,9 @@ use clap::parser::ValueSource;
 use clap::{ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::Deserialize;
 
-use crate::access::{Access, Limit};
+use crate::access::{Access, Expiry, Limit};
 use crate::logging::forward;
+use crate::notify;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -70,6 +71,28 @@ pub enum LogFormat {
     Json,
 }
 
+/// Who may read `/_s3dal/metrics`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum MetricsMode {
+    /// Not served: answered 404.
+    Off,
+    /// With `Authorization: Bearer` and `--metrics-token` only.
+    #[default]
+    Token,
+    /// Anyone who can reach the port.
+    Public,
+}
+
+impl MetricsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Token => "token",
+            Self::Public => "public",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct ServeArgs {
     /// TOML file with `serve` settings. Its keys are the long flag names below; `backend-opt`
@@ -109,6 +132,16 @@ pub struct ServeArgs {
     #[arg(skip)]
     pub fixed_access_key: Option<String>,
 
+    /// The webhooks bucket event notifications may be sent to, the config file's `[[notify]]`
+    /// tables.
+    #[arg(skip)]
+    pub notify: Vec<notify::Target>,
+
+    /// The cold tiers, the config file's `[[tier]]` tables: a write naming a tier's storage
+    /// class keeps its bytes there (see [`crate::tier`]).
+    #[arg(skip)]
+    pub tiers: Vec<TierConfig>,
+
     #[arg(long, env = "S3DAL_REGION", default_value = "us-east-1")]
     pub region: String,
 
@@ -126,6 +159,18 @@ pub struct ServeArgs {
     /// suffix; `0` disables the sweep.
     #[arg(long, env = "S3DAL_STALE_UPLOAD_AGE", default_value = "24h", value_parser = parse_duration)]
     pub stale_upload_age: Duration,
+
+    /// How often what each bucket holds is counted, for quotas and the bucket metrics: by one
+    /// instance of those sharing a backend, whose count the others take up. A number with an
+    /// `s` / `m` / `h` / `d` suffix; `0` disables the count.
+    #[arg(long, env = "S3DAL_USAGE_SCAN_INTERVAL", default_value = "5m", value_parser = parse_duration)]
+    pub usage_scan_interval: Duration,
+
+    /// Memory for a read cache of objects up to 1 MiB, on a remote backend: a GET of an object
+    /// cached since it last changed skips reading it from the backend. A byte count or a `KiB` /
+    /// `MiB` / `GiB` suffix; `0` has no cache. Not on fs, whose files the OS already caches.
+    #[arg(long, env = "S3DAL_CACHE_SIZE", default_value = "0", value_parser = parse_size)]
+    pub cache_size: u64,
 
     /// PEM certificate chain. With `--tls-key`, the server speaks HTTPS only.
     #[arg(long, env = "S3DAL_TLS_CERT")]
@@ -168,15 +213,21 @@ pub struct ServeArgs {
     #[arg(long, env = "S3DAL_LOG_FORWARD", hide_env_values = true, value_parser = parse_log_forward)]
     pub log_forward: Option<String>,
 
-    /// Buckets whose objects anyone may download without a key pair; repeatable, or
-    /// comma-separated. Listing, uploading and deleting still need one.
-    #[arg(long, env = "S3DAL_PUBLIC_BUCKETS", value_delimiter = ',')]
-    pub public_bucket: Vec<String>,
-
     /// Address and port of the web console; without it there is none. It speaks HTTPS when the
     /// S3 port does, with the same certificate.
     #[arg(long, env = "S3DAL_CONSOLE_ADDRESS")]
     pub console_address: Option<SocketAddr>,
+
+    /// Who may read the Prometheus metrics at `/_s3dal/metrics`: `token`, a scraper sending
+    /// `Authorization: Bearer` with `--metrics-token` (without a token, no one); `public`, anyone
+    /// who reaches the port; `off`, no one.
+    #[arg(long, env = "S3DAL_METRICS", value_enum, default_value = "token")]
+    pub metrics: MetricsMode,
+
+    /// The bearer token `--metrics token` asks for.
+    // Hidden from `--help` as the secret key is.
+    #[arg(long, env = "S3DAL_METRICS_TOKEN", hide_env_values = true, value_parser = parse_token)]
+    pub metrics_token: Option<String>,
 
     /// The long names of the settings given by a flag or a variable, which outrank the config
     /// file, so editing the file cannot change them.
@@ -190,6 +241,11 @@ impl ServeArgs {
             region: self.region.clone(),
             etag_buffer_limit: self.etag_buffer_limit,
             stale_upload_age: Some(self.stale_upload_age).filter(|age| !age.is_zero()),
+            usage_scan_interval: Some(self.usage_scan_interval).filter(|every| !every.is_zero()),
+            cache_size: self.cache_size,
+            metrics: self.metrics,
+            metrics_token: self.metrics_token.clone(),
+            notify: self.notify.clone(),
         }
     }
 
@@ -209,6 +265,11 @@ impl ServeArgs {
                 "stale-upload-age = \"{}s\"",
                 self.stale_upload_age.as_secs()
             ),
+            format!(
+                "usage-scan-interval = \"{}s\"",
+                self.usage_scan_interval.as_secs()
+            ),
+            format!("cache-size = \"{}\"", format_size(self.cache_size)),
         ];
         out.extend(path(&self.tls_cert).map(|p| format!("tls-cert = {p}")));
         out.extend(path(&self.tls_key).map(|p| format!("tls-key = {p}")));
@@ -229,13 +290,14 @@ impl ServeArgs {
                 .as_deref()
                 .map(|url| format!("log-forward = {:?}", forward::redact(url, "<redacted>"))),
         );
-        if !self.public_bucket.is_empty() {
-            out.push(format!("public-bucket = {:?}", self.public_bucket));
-        }
         out.extend(
             self.console_address
                 .map(|a| format!("console-address = \"{a}\"")),
         );
+        out.push(format!("metrics = \"{}\"", self.metrics.as_str()));
+        if self.metrics_token.is_some() {
+            out.push(format!("metrics-token = {REDACTED}"));
+        }
         out.push("\n[backend-opt]".into());
         for (name, value) in &self.backend_opts {
             if is_secretish(name) {
@@ -254,6 +316,42 @@ impl ServeArgs {
             }
             if pair.access != Access::ReadWrite {
                 out.push(format!("access = \"{}\"", pair.access.as_str()));
+            }
+            if let Some(expires) = pair.expires {
+                out.push(format!("expires = \"{expires}\""));
+            }
+        }
+        for target in &self.notify {
+            out.push(format!(
+                "\n[[notify]]\nid = {:?}\nurl = {:?}",
+                target.id,
+                // As the log and the console show it: webhook URLs often carry a token in the
+                // query, which only hiding the password would print.
+                notify::shown_url(&target.url)
+            ));
+            if target.auth_token.is_some() {
+                out.push(format!("auth-token = {REDACTED}"));
+            }
+            if target.hmac_secret.is_some() {
+                out.push(format!("hmac-secret = {REDACTED}"));
+            }
+            out.push(format!("queue-size = {}", target.queue_size));
+            out.push(format!(
+                "retry-for = \"{}\"",
+                format_duration(target.retry_for)
+            ));
+        }
+        for tier in &self.tiers {
+            out.push(format!(
+                "\n[[tier]]\nname = {:?}\nstorage-class = {:?}\nbackend = {:?}\n[tier.backend-opt]",
+                tier.name, tier.storage_class, tier.backend
+            ));
+            for (name, value) in &tier.backend_opts {
+                if is_secretish(name) {
+                    out.push(format!("{name} = {REDACTED}"));
+                } else {
+                    out.push(format!("{name} = {value:?}"));
+                }
             }
         }
         out.join("\n") + "\n"
@@ -281,17 +379,28 @@ impl ServeArgs {
         };
         self.credentials.extend(file.credentials);
         check_key_pairs(&self.credentials)?;
+        #[cfg(not(feature = "notify"))]
+        if !file.notify.is_empty() {
+            return Err(
+                "[[notify]]: this build of s3dal has no event notifications (the `notify` feature)"
+                    .into(),
+            );
+        }
+        self.notify = file.notify;
+        notify::check_targets(&self.notify)?;
+        self.tiers = file.tiers;
         if self.tls_cert.is_some() != self.tls_key.is_some() {
             return Err("--tls-cert and --tls-key must be given together".into());
         }
-        // Whole buckets only: a folder made public would need its own rule for listings and
-        // for keys that merely start like it, which is what `allow` already does for key pairs.
-        for name in &self.public_bucket {
-            if name.is_empty() || name.contains('/') {
-                return Err(format!(
-                    "public bucket {name:?}: expected a bucket name, without a folder"
-                ));
-            }
+        // Refused rather than ignored: the memory would be spent twice, once by the OS page
+        // cache, which already holds the files fs reads, and an operator who set it would believe
+        // the cache does something.
+        if self.cache_size > 0 && self.backend == "fs" {
+            return Err(
+                "--cache-size is for remote backends; on fs the OS page cache already keeps \
+                 recently read files in memory (remove it, or set it to 0)"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -309,6 +418,9 @@ pub struct KeyPair {
     pub allow: Option<Vec<String>>,
     #[serde(default)]
     pub access: Access,
+    /// The instant from which the pair signs nothing.
+    #[serde(default)]
+    pub expires: Option<Expiry>,
 }
 
 impl KeyPair {
@@ -319,6 +431,7 @@ impl KeyPair {
             secret_key: secret_key.into(),
             allow: None,
             access: Access::ReadWrite,
+            expires: None,
         }
     }
 
@@ -336,6 +449,7 @@ impl fmt::Debug for KeyPair {
             .field("secret_key", &"<redacted>")
             .field("allow", &self.allow)
             .field("access", &self.access)
+            .field("expires", &self.expires)
             .finish()
     }
 }
@@ -346,6 +460,22 @@ pub(crate) fn is_secretish(name: &str) -> bool {
     ["key", "secret", "token", "password", "credential", "sas"]
         .iter()
         .any(|s| lower.contains(s))
+}
+
+/// Pairs already expired are no error: a config file that keeps an old pair, or one that
+/// expired while the server ran, must still load, as the other pairs keep working. The warning
+/// is what tells the operator that a client's `InvalidAccessKeyId` is an expiry.
+pub fn warn_expired(pairs: &[KeyPair]) {
+    let now = std::time::SystemTime::now();
+    for pair in pairs {
+        if let Some(expires) = pair.expires.filter(|e| e.passed(now)) {
+            tracing::warn!(
+                access_key = pair.access_key,
+                %expires,
+                "key pair has expired; requests signed with it are refused"
+            );
+        }
+    }
 }
 
 /// There is no anonymous mode. Two secrets for one access key would leave which of them
@@ -473,6 +603,122 @@ fn serve_error(cmd: &clap::Command, sub: &str, kind: ErrorKind, msg: String) -> 
 struct FileOnly {
     backend_opts: Vec<(String, String)>,
     credentials: Vec<KeyPair>,
+    notify: Vec<notify::Target>,
+    tiers: Vec<TierConfig>,
+}
+
+/// One `[[tier]]` table: a second backend that holds the bytes of cold objects
+/// (cold-tier.md "Configuration"). File only, like `[[credentials]]`: a tier is several values
+/// that belong together, and its options may carry credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierConfig {
+    /// Written into every stub of the tier, so renaming a tier orphans its objects.
+    pub name: String,
+    /// One of the classes a lifecycle Transition can name.
+    pub storage_class: String,
+    pub backend: String,
+    pub backend_opts: Vec<(String, String)>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct TierFile {
+    name: String,
+    storage_class: String,
+    backend: String,
+    #[serde(default)]
+    backend_opt: toml::Table,
+}
+
+/// The classes a tier may have: those a lifecycle Transition can name (s3s
+/// `TransitionStorageClass`). STANDARD and REDUCED_REDUNDANCY are the primary's.
+pub const TIER_CLASSES: [&str; 6] = [
+    "STANDARD_IA",
+    "ONEZONE_IA",
+    "INTELLIGENT_TIERING",
+    "GLACIER_IR",
+    "GLACIER",
+    "DEEP_ARCHIVE",
+];
+
+/// Classes the aws CLI does not download (`s3 cp`, `sync`) without `--force-glacier-transfer`,
+/// since on AWS they cannot be read without a restore; here they read like any other.
+pub const UNREAD_BY_CLIS: [&str; 2] = ["GLACIER", "DEEP_ARCHIVE"];
+
+fn read_tiers(value: toml::Value) -> Result<Vec<TierConfig>, String> {
+    let files: Vec<TierFile> = value
+        .try_into()
+        .map_err(|e: toml::de::Error| format!("expected [[tier]] tables: {e}"))?;
+    let mut tiers = Vec::with_capacity(files.len());
+    for file in files {
+        let mut backend_opts = Vec::new();
+        for (name, value) in file.backend_opt {
+            let value = flag_value(value).map_err(|e| format!("[[tier]] {:?}: {e}", file.name))?;
+            backend_opts.push((name, value));
+        }
+        tiers.push(TierConfig {
+            name: file.name,
+            storage_class: file.storage_class,
+            backend: file.backend,
+            backend_opts,
+        });
+    }
+    check_tiers(&tiers)?;
+    Ok(tiers)
+}
+
+fn check_tiers(tiers: &[TierConfig]) -> Result<(), String> {
+    let mut names = HashSet::new();
+    let mut classes = HashSet::new();
+    for tier in tiers {
+        let at = |msg: String| format!("[[tier]] {:?}: {msg}", tier.name);
+        let name_ok = (1..=32).contains(&tier.name.len())
+            && tier
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !tier.name.starts_with('-');
+        if !name_ok {
+            return Err(at(
+                "a name is 1 to 32 characters of a-z, 0-9 and -, starting with a letter or digit"
+                    .into(),
+            ));
+        }
+        if !names.insert(tier.name.as_str()) {
+            return Err(at("configured more than once".into()));
+        }
+        let class = tier.storage_class.as_str();
+        if !TIER_CLASSES.contains(&class) {
+            return Err(at(format!(
+                "storage-class {class:?} cannot be a tier's: STANDARD and REDUCED_REDUNDANCY are \
+                 the primary backend's, and a tier takes one of {}",
+                TIER_CLASSES.join(", ")
+            )));
+        }
+        if !classes.insert(class) {
+            return Err(at(format!(
+                "storage-class {class:?} belongs to another tier already"
+            )));
+        }
+        let schemes = crate::backend::schemes();
+        if !schemes.contains(&tier.backend.as_str()) {
+            let feature = ["s3", "azblob", "gcs"]
+                .contains(&tier.backend.as_str())
+                .then(|| format!(" (the `services-{}` feature)", tier.backend));
+            return Err(at(match feature {
+                Some(feature) => format!(
+                    "this build of s3dal has no {:?} backend{feature}",
+                    tier.backend
+                ),
+                None => format!(
+                    "unknown backend {:?}; this build has {}",
+                    tier.backend,
+                    schemes.join(", ")
+                ),
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// Every other key becomes the default of the flag with the same long name. clap then parses
@@ -495,6 +741,14 @@ fn read_file(
                 file.credentials = value.try_into().map_err(|e: toml::de::Error| {
                     invalid(&key, format!("expected [[credentials]] tables: {e}"))
                 })?;
+            }
+            "notify" => {
+                file.notify = value.try_into().map_err(|e: toml::de::Error| {
+                    invalid(&key, format!("expected [[notify]] tables: {e}"))
+                })?;
+            }
+            "tier" => {
+                file.tiers = read_tiers(value).map_err(|msg| invalid(&key, msg))?;
             }
             "backend-opt" => {
                 let toml::Value::Table(opts) = value else {
@@ -571,12 +825,40 @@ fn flag_value(value: toml::Value) -> Result<String, String> {
 }
 
 /// Runtime behavior knobs, separate from the CLI so embedders and tests need no clap.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Settings {
     pub region: String,
     pub etag_buffer_limit: u64,
     /// The age the binary passes to [`crate::S3Dal::sweep_stale_uploads`]; `None` never sweeps.
     pub stale_upload_age: Option<Duration>,
+    /// How often the job `usage-scan` counts what each bucket holds; `None` never.
+    pub usage_scan_interval: Option<Duration>,
+    /// Bytes of object content the read cache may hold; 0, none. Read once, by
+    /// [`crate::S3Dal::new`].
+    pub cache_size: u64,
+    pub metrics: MetricsMode,
+    pub metrics_token: Option<String>,
+    /// Webhooks for bucket event notifications; see [`crate::notify`].
+    pub notify: Vec<notify::Target>,
+}
+
+// Written by hand so that printing the settings never prints the token.
+impl fmt::Debug for Settings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Settings")
+            .field("region", &self.region)
+            .field("etag_buffer_limit", &self.etag_buffer_limit)
+            .field("stale_upload_age", &self.stale_upload_age)
+            .field("usage_scan_interval", &self.usage_scan_interval)
+            .field("cache_size", &self.cache_size)
+            .field("metrics", &self.metrics)
+            .field(
+                "metrics_token",
+                &self.metrics_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("notify", &self.notify)
+            .finish()
+    }
 }
 
 impl Default for Settings {
@@ -585,11 +867,23 @@ impl Default for Settings {
             region: "us-east-1".to_owned(),
             // Matches the aws CLI multipart threshold, so CLI uploads always get an MD5 ETag.
             etag_buffer_limit: 8 * 1024 * 1024,
-            // MinIO's default. AWS keeps uploads until a lifecycle rule aborts them, but s3dal
-            // has no lifecycle rules, so without a default abandoned parts would fill the backend
-            // for good; a day outlasts any upload a client still means to finish, and keeps a
+            // MinIO's default. AWS keeps uploads until a lifecycle rule aborts them, but few
+            // buckets have one, so without a default abandoned parts would fill the backend for
+            // good (an abort rule replaces it for the uploads it covers); a day outlasts any upload a client still means to finish, and keeps a
             // completed record long enough to answer any retry of its Complete.
             stale_upload_age: Some(Duration::from_secs(24 * 60 * 60)),
+            // Within one instance its own writes keep the count exact between scans, so the scan
+            // only takes up what other instances on the backend wrote, and what changed behind
+            // s3dal's back. Five minutes bounds how far those can take a bucket past its quota,
+            // for a listing of the whole bucket each time: one request per thousand objects on S3,
+            // a few seconds per million files on fs.
+            usage_scan_interval: Some(Duration::from_secs(5 * 60)),
+            // Off: memory a server holds on to is the operator's to give, and on fs, the
+            // default backend, it would only duplicate the page cache.
+            cache_size: 0,
+            metrics: MetricsMode::Token,
+            metrics_token: None,
+            notify: Vec::new(),
         }
     }
 }
@@ -628,7 +922,9 @@ pub fn format_duration(d: Duration) -> String {
     format!("{s}s")
 }
 
-fn parse_size(s: &str) -> Result<u64, String> {
+/// A size as `--etag-buffer-limit` takes it: a byte count, or a number with a `KiB` / `MiB` /
+/// `GiB` suffix.
+pub fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (num, unit) = s.split_at(split);
@@ -660,7 +956,18 @@ fn parse_log_forward(s: &str) -> Result<String, String> {
     forward::Target::parse(s).map(|_| s.to_owned())
 }
 
-fn parse_duration(s: &str) -> Result<Duration, String> {
+/// What a scraper can send intact in a header, and enough of it to be a secret.
+fn parse_token(s: &str) -> Result<String, String> {
+    if s.chars().count() < 16 {
+        return Err("expected at least 16 characters".into());
+    }
+    if !s.chars().all(|c| c.is_ascii_graphic()) {
+        return Err("expected printable ASCII without spaces".into());
+    }
+    Ok(s.to_owned())
+}
+
+pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (num, unit) = s.split_at(split);
@@ -727,7 +1034,16 @@ mod tests {
         assert!(!limit.may_write());
         assert!(args.describe().contains("access = \"read-only\""));
 
-        for bad in ["allow = []", "access = \"write-only\"", "allow = [\"/x\"]"] {
+        for bad in [
+            "allow = []",
+            "access = \"append-only\"",
+            "allow = [\"/x\"]",
+            // No offset: which instant it names would depend on the server's time zone. TOML's
+            // own local date-time is no better.
+            "expires = \"2026-12-31T00:00:00\"",
+            "expires = 2026-12-31T00:00:00",
+            "expires = 2026-12-31",
+        ] {
             let file = config_file(&format!(
                 "backend = \"fs\"\n[[credentials]]\naccess-key = \"a\"\nsecret-key = \"b\"\n{bad}\n"
             ));
@@ -736,6 +1052,37 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_key_pair_expiry_comes_from_the_file_even_when_past() {
+        // An old pair left in the file must not keep the server from starting, nor the other
+        // pairs from working; it is refused at request time instead.
+        let file = config_file(
+            "backend = \"fs\"\n\
+             [[credentials]]\naccess-key = \"drop\"\nsecret-key = \"drop-secret\"\n\
+             access = \"write-only\"\nexpires = \"2001-01-01T09:00:00+09:00\"\n",
+        );
+        let args = serve(&["--config", file.path().to_str().unwrap()]).unwrap();
+        let drop = &args.credentials[0];
+        assert_eq!(drop.access, Access::WriteOnly);
+        assert!(drop.expires.unwrap().passed(std::time::SystemTime::now()));
+        let text = args.describe();
+        assert!(text.contains("access = \"write-only\""), "{text}");
+        assert!(
+            text.contains("expires = \"2001-01-01T00:00:00Z\""),
+            "{text}"
+        );
+
+        // TOML's own date-time, unquoted, is what an operator may well write; it names the
+        // same instant.
+        let file = config_file(
+            "backend = \"fs\"\n\
+             [[credentials]]\naccess-key = \"drop\"\nsecret-key = \"drop-secret\"\n\
+             expires = 2001-01-01T09:00:00+09:00\n",
+        );
+        let args = serve(&["--config", file.path().to_str().unwrap()]).unwrap();
+        assert_eq!(args.credentials[0].expires, drop.expires);
     }
 
     const FULL: &str = r#"
@@ -940,6 +1287,39 @@ mod tests {
     }
 
     #[test]
+    fn a_read_cache_is_refused_on_fs_and_shown_elsewhere() {
+        // On fs the OS page cache already holds the files read, so the memory would be spent
+        // twice; a server that took the setting silently would make the operator believe it
+        // helps. The refusal must come from check-config too, or a file that passes the check
+        // would not start.
+        let keys = ["--access-key", "a", "--secret-key", "b"];
+        let err = serve(&[&keys[..], &["--backend", "fs", "--cache-size", "64MiB"]].concat())
+            .unwrap_err();
+        assert!(err.to_string().contains("--cache-size"), "{err}");
+        assert!(err.to_string().contains("page cache"), "{err}");
+        let file = config_file("backend = \"fs\"\ncache-size = \"64MiB\"\n");
+        let cmd = Cli::command().mut_subcommand("check-config", |sub| {
+            sub.mut_args(|arg| arg.env(None::<&'static str>))
+        });
+        let argv = [
+            "s3dal",
+            "check-config",
+            "--config",
+            file.path().to_str().unwrap(),
+        ];
+        let err = Cli::load_from(cmd, [&argv[..], &keys[..]].concat()).unwrap_err();
+        assert!(err.to_string().contains("--cache-size"), "{err}");
+        // Off is fine on fs, and the default.
+        let args = serve(&[&keys[..], &["--backend", "fs", "--cache-size", "0"]].concat());
+        assert_eq!(args.unwrap().settings().cache_size, 0);
+
+        let args = serve(&[&keys[..], &["--backend", "s3", "--cache-size", "64MiB"]].concat());
+        let args = args.unwrap();
+        assert_eq!(args.settings().cache_size, 64 << 20);
+        assert!(args.describe().contains("cache-size = \"64MiB\"\n"));
+    }
+
+    #[test]
     fn sizes_use_binary_units() {
         assert_eq!(parse_size("8MiB"), Ok(8 * 1024 * 1024));
         assert_eq!(parse_size("512KiB"), Ok(512 * 1024));
@@ -993,18 +1373,28 @@ mod tests {
             "backend = \"s3\"\n\
              [backend-opt]\nbucket = \"up\"\nsecret_access_key = \"UPSTREAM-SECRET\"\n\
              session_token = \"UPSTREAM-TOKEN\"\n\
+             metrics-token = \"SCRAPER-TOKEN-0123456789\"\n\
              [[credentials]]\naccess-key = \"alice\"\nsecret-key = \"ALICE-SECRET\"\n",
         );
         let args = serve(&["--config", file.path().to_str().unwrap()]).unwrap();
         let text = args.describe();
-        for secret in ["UPSTREAM-SECRET", "UPSTREAM-TOKEN", "ALICE-SECRET"] {
+        let debug = format!("{:?}", args.settings());
+        for secret in [
+            "UPSTREAM-SECRET",
+            "UPSTREAM-TOKEN",
+            "ALICE-SECRET",
+            "SCRAPER-TOKEN",
+        ] {
             assert!(!text.contains(secret), "{secret} in:\n{text}");
+            assert!(!debug.contains(secret), "{secret} in:\n{debug}");
         }
         // What is not secret is shown, or the output would not help.
         for shown in [
             "bucket = \"up\"",
             "access-key = \"alice\"",
             "backend = \"s3\"",
+            "metrics = \"token\"",
+            "metrics-token = \"<redacted>\"",
         ] {
             assert!(text.contains(shown), "{shown} missing from:\n{text}");
         }
@@ -1063,27 +1453,73 @@ mod tests {
     }
 
     #[test]
-    fn public_buckets_and_the_log_collector_are_checked_when_read() {
-        // A folder named as a public bucket would open nothing, or more than meant, depending
-        // on how it was read; a collector URL with a typo would leave the log unsent. Both are
-        // refused at startup instead.
+    fn the_log_collector_is_checked_when_read() {
+        // A collector URL with a typo would leave the log unsent; it is refused at startup
+        // instead.
         let keys = ["--backend", "fs", "--access-key", "a", "--secret-key", "b"];
-        let args = serve(&[&keys[..], &["--public-bucket", "site,assets"]].concat()).unwrap();
-        assert_eq!(args.public_bucket, ["site", "assets"]);
-        assert!(serve(&[&keys[..], &["--public-bucket", "site/img"]].concat()).is_err());
         assert!(serve(&[&keys[..], &["--log-forward", "graylog:12201"]].concat()).is_err());
 
         let file = config_file(
-            "backend = \"fs\"\npublic-bucket = [\"site\"]\n\
-             log-forward = \"gelf+tcp://graylog:12201\"\n\
+            "backend = \"fs\"\nlog-forward = \"gelf+tcp://graylog:12201\"\n\
              [[credentials]]\naccess-key = \"a\"\nsecret-key = \"b\"\n",
         );
         let args = serve(&["--config", file.path().to_str().unwrap()]).unwrap();
-        assert_eq!(args.public_bucket, ["site"]);
         assert_eq!(
             args.log_forward.as_deref(),
             Some("gelf+tcp://graylog:12201")
         );
+    }
+
+    #[test]
+    fn public_buckets_in_the_settings_are_refused() {
+        // Public buckets moved into each bucket's state, which every instance sharing the
+        // backend reads. A config that still names them must not start a server that quietly
+        // keeps those buckets private: the operator would not know to set them again.
+        let keys = ["--backend", "fs", "--access-key", "a", "--secret-key", "b"];
+        let err = serve(&[&keys[..], &["--public-bucket", "site"]].concat())
+            .expect_err("the flag is gone");
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{err}");
+
+        let file = config_file(
+            "backend = \"fs\"\npublic-bucket = [\"site\"]\n\
+             [[credentials]]\naccess-key = \"a\"\nsecret-key = \"b\"\n",
+        );
+        let err = serve(&["--config", file.path().to_str().unwrap()]).expect_err("the key is gone");
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{err}");
+        assert!(
+            err.to_string().contains("unknown key `public-bucket`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn metrics_need_a_token_by_default_and_a_guessable_one_is_refused() {
+        // Metrics name the operations and buckets' traffic; a fresh install must not publish
+        // them, and a short token would be guessed by a scraper on the same network.
+        let keys = ["--backend", "fs", "--access-key", "a", "--secret-key", "b"];
+        let args = serve(&keys).unwrap();
+        assert_eq!(args.metrics, MetricsMode::Token);
+        assert_eq!(args.metrics_token, None);
+        for bad in [
+            "short",
+            "has a space in it, long",
+            "tab\tseparated-long-token",
+        ] {
+            assert!(
+                serve(&[&keys[..], &["--metrics-token", bad]].concat()).is_err(),
+                "{bad}"
+            );
+        }
+        let file = config_file(
+            "backend = \"fs\"\nmetrics = \"public\"\nmetrics-token = \"0123456789abcdef\"\n\
+             [[credentials]]\naccess-key = \"a\"\nsecret-key = \"b\"\n",
+        );
+        let settings = serve(&["--config", file.path().to_str().unwrap()])
+            .unwrap()
+            .settings();
+        assert_eq!(settings.metrics, MetricsMode::Public);
+        assert_eq!(settings.metrics_token.as_deref(), Some("0123456789abcdef"));
+        assert!(serve(&[&keys[..], &["--metrics", "open"]].concat()).is_err());
     }
 
     #[test]
@@ -1094,6 +1530,139 @@ mod tests {
         let text = args.describe();
         assert!(!text.contains("COLLECTOR-SECRET"), "{text}");
         assert!(text.contains("elastic:<redacted>@es:9200"), "{text}");
+    }
+
+    #[test]
+    fn notification_targets_come_from_the_file_with_their_secrets_hidden() {
+        // The webhook's token and signing secret are credentials to another system: check-config
+        // output is pasted into issues, so it must say they are set without showing them.
+        let file = config_file(
+            "backend = \"fs\"\n\
+             [[credentials]]\naccess-key = \"a\"\nsecret-key = \"b\"\n\
+             [[notify]]\nid = \"hooks\"\nurl = \"https://user:URL-PASSWORD@hooks.example.com/in?token=QUERY-TOKEN\"\n\
+             auth-token = \"HOOK-TOKEN\"\nhmac-secret = \"HOOK-SECRET\"\n\
+             queue-size = 100\nretry-for = \"10m\"\n\
+             [[notify]]\nid = \"plain\"\nurl = \"http://plain:8080/\"\n",
+        );
+        let args = serve(&["--config", file.path().to_str().unwrap()]).unwrap();
+        let [hooks, plain] = &args.notify[..] else {
+            panic!("{:?}", args.notify)
+        };
+        assert_eq!(hooks.id, "hooks");
+        assert_eq!(hooks.auth_token.as_deref(), Some("HOOK-TOKEN"));
+        assert_eq!(hooks.hmac_secret.as_deref(), Some("HOOK-SECRET"));
+        assert_eq!(hooks.queue_size, 100);
+        assert_eq!(hooks.retry_for, Duration::from_secs(600));
+        assert_eq!(plain.queue_size, notify::DEFAULT_QUEUE);
+        assert_eq!(plain.retry_for, notify::DEFAULT_RETRY_FOR);
+        assert_eq!(args.settings().notify, args.notify);
+        let text = args.describe();
+        let debug = format!("{:?}", args.settings());
+        for secret in ["HOOK-TOKEN", "HOOK-SECRET", "URL-PASSWORD", "QUERY-TOKEN"] {
+            assert!(!text.contains(secret), "{secret} in:\n{text}");
+            assert!(!debug.contains(secret), "{secret} in:\n{debug}");
+        }
+        for shown in [
+            "id = \"hooks\"",
+            "url = \"https://hooks.example.com/in\"",
+            "auth-token = \"<redacted>\"",
+            "hmac-secret = \"<redacted>\"",
+            "retry-for = \"10m\"",
+            "url = \"http://plain:8080/\"",
+        ] {
+            assert!(text.contains(shown), "{shown} missing from:\n{text}");
+        }
+    }
+
+    #[test]
+    fn bad_notification_targets_refuse_to_start() {
+        // A target that cannot be reached by construction, or named twice, would lose every
+        // event sent to it without a word; it is refused where the operator reads the error.
+        for bad in [
+            "id = \"a:b\"\nurl = \"http://h/\"",
+            "id = \"a\"\nurl = \"ftp://h/\"",
+            "id = \"a\"\nurl = \"http://h/\"\nretry-for = \"10\"",
+            "id = \"a\"\nurl = \"http://h/\"\nqueue-size = 0",
+            "id = \"a\"\nurl = \"http://h/\"\nsecret = \"x\"",
+            "id = \"a\"\nurl = \"http://h/\"\n[[notify]]\nid = \"a\"\nurl = \"http://i/\"",
+        ] {
+            let file = config_file(&format!(
+                "backend = \"fs\"\n[[credentials]]\naccess-key = \"a\"\nsecret-key = \"b\"\n\
+                 [[notify]]\n{bad}\n"
+            ));
+            let err = serve(&["--config", file.path().to_str().unwrap()]).unwrap_err();
+            assert!(err.to_string().contains("notify"), "{bad}: {err}");
+        }
+    }
+
+    const TIERED: &str =
+        "backend = \"fs\"\n[[credentials]]\naccess-key = \"a\"\nsecret-key = \"b\"\n";
+
+    #[test]
+    fn tiers_come_from_the_file_with_their_secrets_hidden() {
+        // A tier's options carry the credentials of another backend, and check-config output is
+        // pasted into issues; its name and class are what an operator checks.
+        let file = config_file(&format!(
+            "{TIERED}[[tier]]\nname = \"hdd\"\nstorage-class = \"STANDARD_IA\"\nbackend = \"fs\"\n\
+             [tier.backend-opt]\nroot = \"/mnt/hdd\"\n\
+             [[tier]]\nname = \"archive\"\nstorage-class = \"GLACIER_IR\"\nbackend = \"fs\"\n\
+             [tier.backend-opt]\nroot = \"/mnt/a,b\"\nsecret_access_key = \"TIER-SECRET\"\n"
+        ));
+        let args = serve(&["--config", file.path().to_str().unwrap()]).unwrap();
+        let [hdd, archive] = &args.tiers[..] else {
+            panic!("{:?}", args.tiers)
+        };
+        assert_eq!(
+            (hdd.name.as_str(), hdd.storage_class.as_str()),
+            ("hdd", "STANDARD_IA")
+        );
+        // A table, so a value may hold a comma, as the primary's options may.
+        assert!(
+            archive
+                .backend_opts
+                .contains(&("root".to_owned(), "/mnt/a,b".to_owned()))
+        );
+        let text = args.describe();
+        assert!(!text.contains("TIER-SECRET"), "{text}");
+        for shown in [
+            "[[tier]]\nname = \"archive\"\nstorage-class = \"GLACIER_IR\"",
+            "secret_access_key = \"<redacted>\"",
+            "root = \"/mnt/hdd\"",
+        ] {
+            assert!(text.contains(shown), "{shown} missing from:\n{text}");
+        }
+    }
+
+    #[test]
+    fn bad_tiers_refuse_to_start_naming_the_file_and_the_table() {
+        // Every stub records its tier's name, and a class decides where writes go: a tier read
+        // wrongly would put objects where the operator never meant them, or lose track of them.
+        let tier = |name: &str, class: &str, backend: &str| {
+            format!(
+                "[[tier]]\nname = \"{name}\"\nstorage-class = \"{class}\"\nbackend = \"{backend}\"\n"
+            )
+        };
+        let ok = tier("hdd", "STANDARD_IA", "fs");
+        for bad in [
+            tier("", "STANDARD_IA", "fs"),
+            tier("-hdd", "STANDARD_IA", "fs"),
+            tier("HDD", "STANDARD_IA", "fs"),
+            tier(&"a".repeat(33), "STANDARD_IA", "fs"),
+            tier("cold", "STANDARD", "fs"),
+            tier("cold", "REDUCED_REDUNDANCY", "fs"),
+            tier("cold", "OUTPOSTS", "fs"),
+            tier("cold", "GLACIER_IR", "ftp"),
+            format!("{ok}{}", tier("hdd", "GLACIER_IR", "fs")),
+            format!("{ok}{}", tier("other", "STANDARD_IA", "fs")),
+            format!("{ok}speed = \"fast\"\n"),
+        ] {
+            let file = config_file(&format!("{TIERED}{bad}"));
+            let path = file.path().to_str().unwrap();
+            let err = serve(&["--config", path]).unwrap_err().to_string();
+            assert!(err.contains(path) && err.contains("tier"), "{bad}: {err}");
+        }
+        let file = config_file(&format!("{TIERED}{ok}"));
+        assert!(serve(&["--config", file.path().to_str().unwrap()]).is_ok());
     }
 
     #[test]

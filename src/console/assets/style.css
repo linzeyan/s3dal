@@ -18,7 +18,14 @@
   --danger-soft: rgb(198 40 40 / 0.08);
   --warn-soft: #fff7e6;
   --warn-border: #f2d49b;
+  --warn-text: #a16207;
   --ok: #15803d;
+  /* Chart series, in a fixed order checked for color-blind separation; Other is gray. */
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-other: #9a9aa6;
   --shadow: 0 1px 2px rgb(16 16 24 / 0.04), 0 8px 24px rgb(16 16 24 / 0.08);
   --radius: 10px;
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", "PingFang TC", "Hiragino Sans",
@@ -45,7 +52,13 @@
     --danger-soft: rgb(240 98 98 / 0.12);
     --warn-soft: #2a2213;
     --warn-border: #5b4520;
+    --warn-text: #e3b05a;
     --ok: #4ade80;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-other: #6b6b76;
     --shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 12px 32px rgb(0 0 0 / 0.45);
     color-scheme: dark;
   }
@@ -339,6 +352,38 @@ textarea.input {
   color: var(--accent);
 }
 
+.pill.warn {
+  background: var(--warn-soft);
+  color: var(--warn-text);
+}
+
+.pill.danger {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+/* A state that its pill also changes, for an admin. */
+button.pill {
+  border: 0;
+  cursor: pointer;
+  transition: box-shadow 120ms;
+}
+
+button.pill:hover {
+  box-shadow: inset 0 0 0 1px currentColor;
+}
+
+.pill-button .icon {
+  width: 12px;
+  height: 12px;
+  transform: rotate(90deg);
+}
+
+/* "expires in 3 days" reads as one phrase; wrapping moves it whole. */
+.expiry {
+  white-space: nowrap;
+}
+
 /* Sign in */
 
 .login {
@@ -549,6 +594,14 @@ textarea.input {
   gap: 20px;
 }
 
+/* A fieldset only so that it can be disabled as a whole; it draws nothing of its own. */
+fieldset.stack {
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
 /* Panels and tables */
 
 .panel {
@@ -706,8 +759,8 @@ textarea.input {
   font-weight: 500;
 }
 
-a.name-cell:hover span,
-.link-button.name-cell:hover span {
+a.name-cell:hover .truncate,
+.link-button.name-cell:hover .truncate {
   color: var(--accent);
   text-decoration: underline;
   text-underline-offset: 3px;
@@ -871,6 +924,175 @@ a.name-cell:hover span,
   padding: 8px 0;
 }
 
+.warn-text {
+  color: var(--warn-text);
+}
+
+/* Dashboard. Each series class sets --c, which its line, dots, area and legend swatch take. */
+
+.s1 { --c: var(--series-1); }
+.s2 { --c: var(--series-2); }
+.s3 { --c: var(--series-3); }
+.s4 { --c: var(--series-4); }
+.s-other { --c: var(--series-other); }
+
+.kpis .stat-value {
+  font-size: 22px;
+}
+
+.charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr));
+  gap: 12px;
+}
+
+.chart-heading {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  /* On the baseline, a box that starts with a swatch rides above the text beside it. */
+  vertical-align: middle;
+}
+
+.swatch {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  background: var(--c);
+}
+
+.chart {
+  position: relative;
+  padding: 10px 14px 12px;
+}
+
+.chart svg {
+  display: block;
+  width: 100%;
+  overflow: visible;
+  border-radius: 6px;
+  outline: none;
+}
+
+.chart svg:focus-visible {
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.chart-grid,
+.chart-axis,
+.chart-cursor {
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+
+.chart-grid {
+  stroke: var(--border);
+}
+
+.chart-axis,
+.chart-cursor {
+  stroke: var(--border-strong);
+}
+
+.chart-tick {
+  fill: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-line {
+  fill: none;
+  stroke: var(--c);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.chart-area {
+  fill: var(--c);
+  fill-opacity: 0.1;
+}
+
+.chart-dot {
+  fill: var(--c);
+  stroke: var(--surface);
+  stroke-width: 2;
+}
+
+.chart-tooltip {
+  position: absolute;
+  top: 10px;
+  z-index: 2;
+  display: grid;
+  gap: 3px;
+  min-width: 150px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  font-size: 12.5px;
+  pointer-events: none;
+}
+
+.tooltip-time {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.tooltip-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+
+.tooltip-row strong {
+  min-width: 68px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-table {
+  max-height: 300px;
+  overflow: auto;
+}
+
+.table .num-col {
+  text-align: right;
+}
+
+/* S3's operation names run long (CompleteMultipartUpload); the fixed layout would split the
+   width evenly and let them run into the next column. */
+.ops-table th:first-child {
+  width: 44%;
+}
+
+.ops-table td:first-child {
+  overflow-wrap: anywhere;
+}
+
+/* The last picture stays while the next is fetched, dimmed so it does not pass for current. */
+.is-refreshing .chart svg {
+  opacity: 0.6;
+  transition: opacity 120ms;
+}
+
 /* Settings */
 
 .setting {
@@ -952,6 +1174,84 @@ a.name-cell:hover span,
 
 .preview:empty {
   display: none;
+}
+
+.drawer-banner {
+  margin: 16px 20px 0;
+}
+
+.drawer-banner .button {
+  margin-top: 10px;
+}
+
+.drawer-banner .button .icon {
+  margin-top: 0;
+  color: inherit;
+}
+
+.versions {
+  padding: 16px 20px 24px;
+  border-top: 1px solid var(--border);
+}
+
+.versions-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+  font-size: 13px;
+}
+
+.version-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.version-item {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.version-item:last-child {
+  border-bottom: 0;
+}
+
+.version-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+}
+
+.version-item.marker .version-when {
+  color: var(--muted);
+}
+
+.version-meta {
+  overflow-wrap: anywhere;
+}
+
+.version-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.version-actions .icon-button {
+  margin-left: auto;
+}
+
+.button.small {
+  height: 28px;
+  padding: 0 10px;
+  gap: 5px;
+  border-radius: 7px;
+  font-size: 12.5px;
 }
 
 .preview {
@@ -1153,6 +1453,203 @@ input[role="switch"]:disabled {
   width: 130px;
 }
 
+.col-versioning {
+  width: 130px;
+}
+
+.col-versioning .pill {
+  margin-left: 0;
+}
+
+.crumb-state {
+  display: inline-flex;
+}
+
+.crumb-state:empty {
+  display: none;
+}
+
+.toolbar-switch {
+  margin-left: auto;
+}
+
+.toolbar-end {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-left: auto;
+}
+
+/* List or grid: two icon buttons in one outline, the one on filled with the accent. */
+.view-toggle {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.view-toggle .icon-button {
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+}
+
+.view-toggle .icon-button[aria-pressed="true"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* The grid: square pictures over their names, as many columns as fit. */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px;
+  margin: 0;
+  padding: 16px;
+  list-style: none;
+}
+
+.tile {
+  position: relative;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  transition: border-color 120ms, background-color 120ms;
+}
+
+.tile:hover {
+  border-color: var(--border-strong);
+}
+
+.tile.selected,
+.tile.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.tile-main {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  min-width: 0;
+  padding: 8px 8px 10px;
+  color: inherit;
+  text-decoration: none;
+}
+
+.tile-art {
+  position: relative;
+  display: grid;
+  place-items: center;
+  aspect-ratio: 1;
+  margin-bottom: 6px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+/* Fitted whole into the square, portrait or landscape: a percentage height would not resolve
+   against a box sized by its aspect ratio. */
+.tile-art img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.tile-icon {
+  width: 36px;
+  height: 36px;
+  color: var(--muted);
+}
+
+.tile-icon.folder-icon {
+  color: var(--accent);
+}
+
+.tile-name {
+  font-weight: 500;
+}
+
+.tile.deleted .tile-name {
+  color: var(--muted);
+}
+
+.tile-main:hover .tile-name {
+  color: var(--accent);
+}
+
+/* Shown on the tile under the pointer, once checked, and when reached by keyboard. */
+.tile-check {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+  opacity: 0;
+}
+
+.tile:hover .tile-check,
+.tile-check:checked,
+.tile-check:focus-visible {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .tile-check {
+    opacity: 1;
+  }
+}
+
+.preview-note {
+  margin: 0;
+  padding: 12px;
+}
+
+/* Versions listed under their key: indented past the key's icon, lower and quieter, so the
+   key rows still read as the list. */
+.table tr.version-row td {
+  height: 34px;
+  font-size: 12.5px;
+}
+
+.table tr.has-versions td {
+  border-bottom-color: transparent;
+}
+
+.version-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  min-width: 0;
+  padding-left: 28px;
+  color: var(--muted);
+}
+
+.version-cell .pill,
+.version-head .pill,
+.name-cell .pill {
+  flex: none;
+  margin-left: 0;
+}
+
+.version-cell:hover .mono {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.name-cell.deleted {
+  color: var(--muted);
+}
+
 /* A setting edited with more than one control: a menu, and the field it opens. */
 .control-stack {
   display: grid;
@@ -1214,6 +1711,188 @@ input[role="switch"]:disabled {
 
 .progress.cancelled {
   background: var(--surface-2);
+}
+
+/* A quota meter: the fill carries the state, accent then warning then danger; the track is the
+   same color's light step, so the state reads across the whole bar. A word beside it says the
+   state too, for those who cannot tell the colors apart. */
+.meter {
+  --fill: 0%;
+  --meter: var(--accent);
+  --meter-track: var(--accent-soft);
+  height: 8px;
+  min-width: 80px;
+  border-radius: 999px;
+  background: linear-gradient(var(--meter), var(--meter)) no-repeat left / var(--fill) 100%,
+    var(--meter-track);
+}
+
+.meter.level-warn {
+  --meter: var(--warn-text);
+  --meter-track: var(--warn-soft);
+}
+
+.meter.level-over {
+  --meter: var(--danger);
+  --meter-track: var(--danger-soft);
+}
+
+/* Hot bytes in the full color, then the cold ones in a paler step of it: one bar still reads as
+   the whole bucket against its limit. */
+.meter.split {
+  background: linear-gradient(var(--meter), var(--meter)) no-repeat left / var(--hot) 100%,
+    linear-gradient(var(--meter-cold), var(--meter-cold)) no-repeat left / var(--fill) 100%,
+    var(--meter-track);
+  --meter-cold: color-mix(in srgb, var(--meter) 45%, var(--meter-track));
+}
+
+.class-pill {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.class-prop {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.class-select {
+  width: auto;
+}
+
+.tiers-table .pill {
+  margin-left: 0;
+}
+
+.quota-strip,
+.lifecycle-strip,
+.events-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+
+.rule-pill {
+  margin-left: 0;
+  max-width: 100%;
+  font-weight: 400;
+  text-align: left;
+}
+
+.rule-pill strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.rule-pill.off {
+  opacity: 0.6;
+}
+
+.target-pill {
+  margin-left: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.target-pill strong {
+  font-weight: 600;
+}
+
+/* One kind per row, its events wrapping beside "All": the dialog is too narrow for columns. */
+.event-kinds {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.event-kind {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 16px;
+  min-width: 0;
+  margin: 0;
+  padding: 4px 12px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.event-kind legend {
+  padding: 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.event-kind .check-field {
+  margin-top: 6px;
+}
+
+.field-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  align-items: end;
+}
+
+.rule-switch {
+  padding-bottom: 8px;
+}
+
+.quota-strip .meter {
+  flex: 0 1 240px;
+}
+
+.quota-figure {
+  font-variant-numeric: tabular-nums;
+}
+
+.quota-strip .pill {
+  margin-left: 0;
+}
+
+.unit-select {
+  flex: none;
+  width: 84px;
+}
+
+.usage-list {
+  margin: 0;
+  padding: 4px 20px 16px;
+  list-style: none;
+  display: grid;
+}
+
+/* Name, bar and figure in aligned columns; the bar drops under the name where the list is
+   narrow. */
+.usage-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(120px, 2fr) minmax(200px, 1.4fr);
+  align-items: center;
+  gap: 4px 16px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.usage-row:last-child {
+  border-bottom: 0;
+}
+
+.usage-row .meters {
+  display: grid;
+  gap: 6px;
+}
+
+.usage-row .quota-figure {
+  font-size: 12.5px;
+}
+
+@media (max-width: 720px) {
+  .usage-row {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* Dialogs and toasts */

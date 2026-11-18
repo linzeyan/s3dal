@@ -16,6 +16,14 @@ use crate::s3::{acl, naming};
 /// AWS's default and cap for max-parts and max-uploads.
 const MAX_PAGE: usize = 1000;
 
+/// The class an upload's object will have: its tier's, recorded at Create, else STANDARD.
+fn reported_class(recorded: Option<String>) -> StorageClass {
+    recorded.map_or_else(
+        || StorageClass::from_static(StorageClass::STANDARD),
+        StorageClass::from,
+    )
+}
+
 /// Manifest and `upload.json` reads in flight; a page names up to 1000 of them.
 const READ_CONCURRENCY: usize = 16;
 
@@ -67,7 +75,7 @@ pub(in crate::s3) async fn list_parts(
         max_parts: Some(max_parts as i32),
         is_truncated: Some(is_truncated),
         parts: Some(parts),
-        storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
+        storage_class: Some(reported_class(upload.storage_class)),
         owner: Some(acl::owner()),
         initiator: Some(acl::initiator()),
         checksum_algorithm: upload.checksum_algorithm.map(ChecksumAlgorithm::from),
@@ -149,7 +157,7 @@ pub(in crate::s3) async fn list_multipart_uploads(
                 initiated: Some(Timestamp::from(u.initiated)),
                 owner: Some(acl::owner()),
                 initiator: Some(acl::initiator()),
-                storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
+                storage_class: Some(reported_class(u.storage_class.clone())),
                 checksum_algorithm: u.checksum_algorithm.clone().map(ChecksumAlgorithm::from),
                 checksum_type: u.checksum_type.clone().map(ChecksumType::from),
             }),
@@ -193,6 +201,7 @@ struct Listed {
     id: String,
     checksum_algorithm: Option<String>,
     checksum_type: Option<String>,
+    storage_class: Option<String>,
 }
 
 /// Every upload of the bucket in listing order: by key, then by initiation time. The id breaks
@@ -217,6 +226,7 @@ async fn load_uploads(dal: &S3Dal, bucket: &str) -> S3Result<Vec<Listed>> {
                 id: id.hyphenated().to_string(),
                 checksum_algorithm: u.checksum_algorithm,
                 checksum_type: u.checksum_type,
+                storage_class: u.storage_class,
             }))
         })
         .buffered(READ_CONCURRENCY)
@@ -328,6 +338,7 @@ mod tests {
             id: id.to_owned(),
             checksum_algorithm: None,
             checksum_type: None,
+            storage_class: None,
         }
     }
 

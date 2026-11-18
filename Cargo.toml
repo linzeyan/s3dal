@@ -1,6 +1,6 @@
 [package]
 name = "s3dal"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 # s3s 0.17 requires 1.96.
 rust-version = "1.96"
@@ -24,7 +24,7 @@ include = [
 ]
 
 [features]
-default = ["services-s3", "services-azblob", "services-gcs", "client", "log-forward"]
+default = ["services-s3", "services-azblob", "services-gcs", "client", "log-forward", "notify", "thumbnail"]
 # A remote service brings OpenDAL's HTTP transport with it; fs alone needs none, so each one
 # that s3dal is tested against is a feature that a build can leave out.
 services-s3 = ["opendal/services-s3", "opendal/http-transport-reqwest"]
@@ -47,6 +47,12 @@ client = [
 # over TLS. Over UDP and TCP it needs nothing more. Every crate it needs is already compiled for
 # OpenDAL's s3 service.
 log-forward = ["dep:percent-encoding", "dep:reqwest", "dep:rustls-platform-verifier"]
+# Bucket event notifications to webhooks (`[[notify]]` targets). Every crate it needs is already
+# compiled for OpenDAL's s3 service and for s3s.
+notify = ["dep:hmac", "dep:reqwest", "dep:sha2"]
+# Image thumbnails on GetObject (`?x-s3dal-thumbnail=256`), cached in the backend. The only
+# feature that brings image codecs; without it the query parameter is refused.
+thumbnail = ["dep:image"]
 
 [dependencies]
 anyhow = "1"
@@ -62,13 +68,27 @@ clap = { version = "4.6", features = ["derive", "env", "string", "wrap_help"] }
 futures = "0.3"
 # Already compiled for uuid. `keygen` draws key pairs from the OS generator.
 getrandom = "0.4"
+# Already compiled for s3s, which verifies signatures with it. Signs webhook notifications
+# (`X-S3dal-Signature`).
+hmac = { version = "0.13", optional = true }
 # Already compiled for reqwest. The client builds the request head that reqsign signs.
 http = { version = "1", optional = true }
 # Already compiled for s3s; wraps its service to fix up request headers before s3s parses them.
 hyper = "1"
 hyper-util = { version = "0.1.20", features = ["server-auto", "http1", "http2", "tokio"] }
+# Thumbnails. Pure Rust decoders for the four formats browsers show everywhere, and nothing else:
+# HEIC, AVIF and RAW would bring C libraries, and the default features bring rayon and a dozen
+# formats no one previews.
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp"], optional = true }
+# The read cache's least-recently-used order (`--cache-size`). Already in Cargo.lock for the
+# tests' aws-sdk-s3; without default features it brings no other crate, std's HashMap instead of
+# hashbrown.
+lru = { version = "0.18.5", default-features = false }
 md-5 = "0.11"
 opendal = { version = "0.59.4", default-features = false, features = ["services-fs", "services-memory", "executors-tokio", "layers-retry"] }
+# Times backend operations for `/_s3dal/metrics`; the interceptor in metrics.rs keeps the
+# numbers in atomics. OpenDAL's prometheus-client layer would take locks on every operation.
+opendal-layer-observe-metrics-common = "0.59.4"
 # Already compiled for reqwest. The client escapes keys and query values as SigV4 canonicalizes
 # them, so the URL sent and the URL signed agree.
 percent-encoding = { version = "2.3", optional = true }
@@ -91,9 +111,14 @@ s3s-rfc2047 = "0.17.0"
 # Already compiled for opendal-core. Multipart uploads keep their state in small JSON files.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+# Already compiled for s3s; see hmac.
+sha2 = { version = "0.11", optional = true }
 # Already compiled for tokio, with `all`. Sets TCP keepalive timing on accepted sockets, which
 # tokio does not expose, without unsafe setsockopt calls and the per-OS option names.
 socket2 = { version = "0.6", features = ["all"] }
+# Already compiled for s3s, with these features. A key pair's `expires` is RFC 3339, which s3s's
+# Timestamp parses but prints in the offset it was written with, followed by a Z.
+time = { version = "0.3.53", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 # Already compiled for OpenDAL's s3 service (reqwest's TLS), with the same aws-lc-rs provider.
 # Serves HTTPS, and re-exports rustls and its PEM parser.
@@ -113,9 +138,8 @@ uuid = { version = "1", features = ["v4"] }
 # Already compiled for OpenDAL's fs service, which keeps user metadata in xattrs with it.
 # Listings read them the same way, in batches, instead of one OpenDAL stat per key.
 xattr = "1.6.1"
-
-# Already compiled for tokio. Bounds glibc's malloc arenas at startup (see main.rs).
-[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+# Already compiled for tokio. Bounds glibc's malloc arenas at startup (see main.rs), and reads
+# the process's CPU time, memory and file descriptor limit for `/_s3dal/metrics`.
 libc = "0.2"
 
 [dev-dependencies]

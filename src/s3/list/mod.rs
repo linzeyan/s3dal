@@ -8,6 +8,7 @@
 
 mod page;
 mod source;
+mod versions;
 
 pub(super) use source::Proofs;
 
@@ -19,6 +20,7 @@ use opendal::Metadata;
 use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result, s3_error};
 
+use super::version::{self, Versioning};
 use super::{S3Dal, acl, fs, naming};
 use crate::backend::Profile;
 use crate::error::{Ctx, map};
@@ -148,8 +150,9 @@ pub(super) async fn list_objects(
 /// object here is.
 const NULL_VERSION: &str = "null";
 
-/// s3dal keeps no versions, so every object is listed as its one version, `null`, the latest,
-/// and there are no delete markers. Clients ask anyway: ceph s3-tests empty every bucket with
+/// In a bucket that never had versioning every object is listed as its one version, `null`,
+/// the latest, and there are no delete markers; a bucket that has or had versioning is listed by
+/// [`versions`]. Clients ask anyway: ceph s3-tests empty every bucket with
 /// it, `rclone --s3-versions` and `aws s3api list-object-versions` list with it, and backup
 /// tools probe it.
 pub(super) async fn list_object_versions(
@@ -158,6 +161,9 @@ pub(super) async fn list_object_versions(
 ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
     let input = req.input;
     naming::require_bucket(dal, &input.bucket).await?;
+    if version::state(dal, &input.bucket).await? != Versioning::Unversioned {
+        return versions::list_versioned(dal, input).await;
+    }
     let key_marker = input.key_marker.clone().filter(|m| !m.is_empty());
     match input.version_id_marker.as_deref().filter(|m| !m.is_empty()) {
         None => {}
@@ -218,9 +224,9 @@ pub(super) async fn list_object_versions(
             size: object.size,
             last_modified: object.last_modified,
             owner: Some(acl::owner()),
-            storage_class: Some(ObjectVersionStorageClass::from_static(
-                ObjectVersionStorageClass::STANDARD,
-            )),
+            storage_class: object
+                .storage_class
+                .map(|c| ObjectVersionStorageClass::from(c.as_str().to_owned())),
             ..Default::default()
         })
         .collect();
@@ -382,7 +388,7 @@ async fn object(
     key: String,
     listed: Metadata,
 ) -> S3Result<Option<Object>> {
-    let stat = if listing_is_complete(&dal.profile, &listed) {
+    let stat = if listing_is_complete(&dal.profile, &listed, dal.has_tiers()) {
         Ok(listed)
     } else {
         dal.op.stat(&naming::object_path(bucket, &key)).await
@@ -444,23 +450,30 @@ fn stated_object(
         },
     };
     let meta = meta::resolve(&dal.profile, &stat);
+    let storage_class = dal
+        .storage_class(&meta)
+        .unwrap_or(ObjectStorageClass::STANDARD)
+        .to_owned();
     Ok(Some(Object {
         key: Some(key),
         e_tag: Some(ETag::Strong(meta.etag)),
         size: Some(i64::try_from(meta.content_length).unwrap_or(i64::MAX)),
         last_modified: meta.last_modified.map(Timestamp::from),
-        storage_class: Some(ObjectStorageClass::from_static(
-            ObjectStorageClass::STANDARD,
-        )),
+        storage_class: Some(ObjectStorageClass::from(storage_class)),
         ..Default::default()
     }))
 }
 
 /// Object stores list native ETags, but s3dal's own ETag lives in user metadata, which no
 /// listing carries. Without the stat, a listing would show a synthesized ETag where HEAD
-/// shows the stored MD5, and clients that compare the two would see a changed object.
-fn listing_is_complete(profile: &Profile, listed: &Metadata) -> bool {
-    profile.native_etag && listed.etag().is_some() && listed.last_modified().is_some()
+/// shows the stored MD5, and clients that compare the two would see a changed object. With
+/// tiers configured (`tiered`), an empty entry may be a stub, whose size, ETag and class are
+/// only in its metadata.
+fn listing_is_complete(profile: &Profile, listed: &Metadata, tiered: bool) -> bool {
+    profile.native_etag
+        && listed.etag().is_some()
+        && listed.last_modified().is_some()
+        && !(tiered && listed.content_length() == 0)
 }
 
 /// Opaque to clients, but it must carry any UTF-8 key, `/` and `+` included, through a query
@@ -604,17 +617,31 @@ mod tests {
             native_etag: true,
             ..gateway
         };
-        let entry = |etag: Option<&str>| {
-            let mut m = MetadataBuilder::file(1);
+        let sized = |len: u64, etag: Option<&str>| {
+            let mut m = MetadataBuilder::file(len);
             m.last_modified(OpendalTimestamp::from_second(1_700_000_000).unwrap());
             if let Some(etag) = etag {
                 m.etag(etag);
             }
             m.build()
         };
-        assert!(listing_is_complete(&native, &entry(Some("\"e\""))));
-        assert!(!listing_is_complete(&native, &entry(None)));
+        let entry = |etag: Option<&str>| sized(1, etag);
+        assert!(listing_is_complete(&native, &entry(Some("\"e\"")), false));
+        assert!(!listing_is_complete(&native, &entry(None), false));
         // A backend ETag is not the ETag s3dal reports on a gateway profile.
-        assert!(!listing_is_complete(&gateway, &entry(Some("\"e\""))));
+        assert!(!listing_is_complete(&gateway, &entry(Some("\"e\"")), false));
+        // With tiers an empty entry may be a stub, whose size, ETag and class only its
+        // metadata holds; without them it is an empty object, listed as it is.
+        assert!(!listing_is_complete(
+            &native,
+            &sized(0, Some("\"e\"")),
+            true
+        ));
+        assert!(listing_is_complete(
+            &native,
+            &sized(0, Some("\"e\"")),
+            false
+        ));
+        assert!(listing_is_complete(&native, &entry(Some("\"e\"")), true));
     }
 }

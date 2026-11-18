@@ -22,7 +22,7 @@ use s3s::dto::*;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use uuid::{Uuid, Version};
 
-use super::{S3Dal, naming, unsupported};
+use super::{S3Dal, naming, unsupported, usage};
 use crate::backend::RESERVED_ROOT;
 use crate::checksum::{self, ALGORITHMS};
 use crate::error::{Ctx, map};
@@ -31,7 +31,7 @@ use crate::meta::{self, Attrs};
 pub(super) use complete::complete_multipart_upload;
 pub(super) use list::{list_multipart_uploads, list_parts, page_size};
 pub(super) use part::{upload_part, upload_part_copy};
-pub(super) use sweep::sweep;
+pub(super) use sweep::{abort_by_lifecycle, sweep};
 
 pub(super) async fn create_multipart_upload(
     dal: &S3Dal,
@@ -60,6 +60,7 @@ pub(super) async fn create_multipart_upload(
     let checksum_type = checksum_type(algorithm.as_ref(), input.checksum_type.take())?;
     let user_metadata = input.metadata.take().unwrap_or_default();
     meta::check_user_metadata(&user_metadata)?;
+    usage::check_room(dal, &input.bucket).await?;
 
     let id = Uuid::new_v4();
     let upload = record::Upload {
@@ -75,10 +76,15 @@ pub(super) async fn create_multipart_upload(
         },
         checksum_algorithm: algorithm.as_ref().map(|a| a.as_str().to_owned()),
         checksum_type: checksum_type.as_ref().map(|t| t.as_str().to_owned()),
+        // A class no tier has stays advisory: the object is stored hot, reported STANDARD.
+        storage_class: dal
+            .tier_for_class(input.storage_class.as_ref().map(StorageClass::as_str))
+            .map(|t| t.storage_class.clone()),
         initiated: SystemTime::now(),
         completed: None,
     };
     record::store_upload(dal, &input.bucket, id, &upload).await?;
+    dal.metrics().multipart_opened();
 
     Ok(S3Response::new(CreateMultipartUploadOutput {
         bucket: Some(input.bucket),
@@ -143,6 +149,7 @@ pub(super) async fn abort_multipart_upload(
     let id = parse_upload_id(&input.upload_id)?;
     record::load_upload(dal, &input.bucket, id, &input.key).await?;
     remove_dir(dal, &upload_dir(&input.bucket, id)).await?;
+    dal.metrics().multipart_closed();
     Ok(S3Response::new(AbortMultipartUploadOutput::default()))
 }
 

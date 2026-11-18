@@ -50,14 +50,14 @@ impl NameValidation for AnyBucketName {
 async fn start_with_permissive_routing() -> (Backend, Client) {
     let backend = Backend::from_env().await;
     let dal = S3Dal::new(backend.op.clone(), backend.profile, Settings::default());
-    let mut builder = S3ServiceBuilder::new(dal);
+    let mut builder = S3ServiceBuilder::new(dal.clone());
     builder.set_auth(SimpleAuth::from_single(ACCESS_KEY, SECRET_KEY));
     builder.set_validation(AnyBucketName);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(server::serve(
         listener,
-        builder.build(),
+        server::Service::new(builder.build(), dal),
         None,
         std::future::pending(),
     ));

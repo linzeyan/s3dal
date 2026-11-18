@@ -38,6 +38,7 @@ const ICONS = {
   copy: ["M9 9h10a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V10a1 1 0 0 1 1-1z", "M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"],
   close: ["M6 6l12 12", "M18 6L6 18"],
   server: ["M4 5h16v6H4z", "M4 13h16v6H4z", "M8 8h.01", "M8 16h.01"],
+  chart: ["M4 4v16h16", "M7.5 14.5l3.5-4 3 2.5 4.5-6"],
   settings: ["M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z", "M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"],
   key: ["M15.5 7.5a3 3 0 1 1-6 0 3 3 0 0 1 6 0z", "M12.5 10.5L5 18v2h3v-2h2v-2h2l1.2-1.2"],
   lock: ["M6 11h12v9H6z", "M8.5 11V8a3.5 3.5 0 0 1 7 0v3"],
@@ -46,7 +47,11 @@ const ICONS = {
   edit: ["M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17z", "M13.5 6.5l3 3"],
   minus: ["M6 12h12"],
   chevron: ["M9 6l6 6-6 6"],
+  history: ["M3.5 12a8.5 8.5 0 1 0 2.5-6", "M3.5 4v4.5H8", "M12 8v4l3 2"],
+  restore: ["M9 14L4 9l5-5", "M4 9h10.5a5.5 5.5 0 0 1 0 11H11"],
   alert: ["M12 9v4", "M12 17h.01", "M10.3 3.9L2.4 17.5A2 2 0 0 0 4.1 20.5h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"],
+  list: ["M9 6h11", "M9 12h11", "M9 18h11", "M4.5 6h.01", "M4.5 12h.01", "M4.5 18h.01"],
+  grid: ["M4 4h6.5v6.5H4z", "M13.5 4H20v6.5h-6.5z", "M4 13.5h6.5V20H4z", "M13.5 13.5H20V20h-6.5z"],
 };
 
 export function icon(name, cls = "icon") {
@@ -75,6 +80,37 @@ export function formatBytes(n) {
   const digits = i === 0 || n >= 100 ? 0 : 1;
   return `${n.toFixed(digits)} ${UNITS[i]}`;
 }
+
+// How full a bucket is against its quota: the fuller of its bytes and its objects, and a state
+// that the meter's color and a word both carry. Null for a bucket without a quota.
+export function quotaState(usage, quota) {
+  if (!quota) return null;
+  const ratios = [usage.bytes / Math.max(quota.max_bytes, 1)];
+  if (quota.max_objects != null) ratios.push(usage.objects / Math.max(quota.max_objects, 1));
+  const ratio = Math.max(...ratios);
+  const over = usage.bytes > quota.max_bytes || (quota.max_objects != null && usage.objects > quota.max_objects);
+  const full = !over && (usage.bytes >= quota.max_bytes || (quota.max_objects != null && usage.objects >= quota.max_objects));
+  const level = over || full ? "over" : ratio >= 0.9 ? "warn" : "ok";
+  const word = over ? "Over quota" : full ? "Full" : ratio >= 0.9 ? "Nearly full" : "";
+  return { ratio, level, word };
+}
+
+// A thin bar of `used` against `max`; the fill's color follows the state, the track is a lighter
+// step of the same color. Its width is a custom property, which the page's style policy allows
+// where an inline style attribute is not. `cold`, the part of `used` in cold tiers, is drawn
+// last in the fill, paler.
+export function meter(used, max, level, label, cold = 0) {
+  const width = (n) => `${Math.min(100, (max > 0 ? n / max : n > 0 ? 1 : 0) * 100).toFixed(2)}%`;
+  const el = h("div", {
+    class: `meter level-${level}${cold > 0 ? " split" : ""}`, role: "meter", "aria-label": label,
+    "aria-valuemin": "0", "aria-valuemax": String(max), "aria-valuenow": String(Math.min(used, max)),
+  });
+  el.style.setProperty("--fill", width(used));
+  el.style.setProperty("--hot", width(used - cold));
+  return el;
+}
+
+export const percent = (ratio) => `${ratio > 0 && ratio < 0.01 ? "<1" : Math.round(ratio * 100)}%`;
 
 const dateFormat = new Intl.DateTimeFormat(undefined, {
   year: "numeric",

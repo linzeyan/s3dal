@@ -80,6 +80,16 @@ impl Backend {
         }
     }
 
+    /// The backend `server` runs on, for a second instance sharing it, as several s3dal
+    /// processes may share one backend.
+    pub fn sharing(server: &TestServer) -> Self {
+        Self {
+            op: server.op.clone(),
+            profile: server.profile,
+            fs_root: None,
+        }
+    }
+
     /// fs on a fresh temporary root, whatever the suite's backend is, for tests about fs
     /// itself: files planted or inspected behind s3dal's back, directory mtimes.
     pub async fn fs() -> Self {
@@ -143,12 +153,41 @@ impl TestServer {
         keys: &[KeyPair],
         tls: Option<TlsAcceptor>,
     ) -> Self {
+        Self::start_with_tiers(backend, settings, keys, tls, Vec::new()).await
+    }
+
+    /// A server on `backend` with cold tiers, each a name, the storage class that sends objects
+    /// there, and its operator, probed and claimed as startup does. The caller keeps whatever
+    /// backs the tiers' operators alive.
+    pub async fn start_tiered(
+        backend: Backend,
+        settings: Settings,
+        tiers: &[(&str, &str, Operator)],
+    ) -> Self {
+        let mut opened = Vec::new();
+        for (name, class, op) in tiers {
+            let tier = s3dal::Tier::open(name, class, op.clone(), &backend.op, &backend.profile)
+                .await
+                .unwrap();
+            opened.push(tier);
+        }
+        let keys = [KeyPair::new(ACCESS_KEY, SECRET_KEY)];
+        Self::start_with_tiers(backend, settings, &keys, None, opened).await
+    }
+
+    async fn start_with_tiers(
+        backend: Backend,
+        settings: Settings,
+        keys: &[KeyPair],
+        tls: Option<TlsAcceptor>,
+        tiers: Vec<s3dal::Tier>,
+    ) -> Self {
         let Backend {
             op,
             profile,
             fs_root,
         } = backend;
-        let dal = S3Dal::new(op.clone(), profile, settings);
+        let dal = S3Dal::new(op.clone(), profile, settings).with_tiers(tiers);
         let auth = server::LiveAuth::new(keys, &[]).unwrap();
         let service = server::build_service(dal.clone(), &auth, None);
 
@@ -413,6 +452,136 @@ pub fn aws_chunked(data: &[u8], trailer: &str) -> (Vec<u8>, Vec<(&'static str, S
         ("x-amz-trailer", name),
     ];
     (body, headers)
+}
+
+/// How the [`Hook`] answers one request.
+#[derive(Debug, Clone, Copy)]
+pub enum Answer {
+    Status(u16),
+    /// Takes the request and never answers, as a target that hangs does.
+    Stall,
+}
+
+/// One request a [`Hook`] took.
+#[derive(Debug)]
+pub struct Delivery {
+    /// The request line and headers.
+    pub head: String,
+    pub body: Vec<u8>,
+}
+
+impl Delivery {
+    /// The value of header `name`, any case.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.head.lines().find_map(|line| {
+            let (n, v) = line.split_once(':')?;
+            n.eq_ignore_ascii_case(name).then(|| v.trim())
+        })
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).expect("the body is JSON")
+    }
+
+    /// The one record of an S3 event message.
+    pub fn record(&self) -> serde_json::Value {
+        let message = self.json();
+        let records = message["Records"].as_array().expect("Records");
+        assert_eq!(records.len(), 1, "{message}");
+        records[0].clone()
+    }
+}
+
+/// A webhook on 127.0.0.1, for event notification tests: it answers the n-th request (from 0)
+/// as `answer(n)` says, one request per connection, and hands each request to the test.
+pub struct Hook {
+    pub url: String,
+    got: tokio::sync::mpsc::UnboundedReceiver<Delivery>,
+}
+
+impl Hook {
+    pub async fn start(answer: impl Fn(usize) -> Answer + Send + Sync + 'static) -> Self {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let (tx, got) = tokio::sync::mpsc::unbounded_channel();
+        let answer = Arc::new(answer);
+        let count = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let (tx, answer, count) = (tx.clone(), answer.clone(), count.clone());
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let split = loop {
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i;
+                        }
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..split]).into_owned();
+                    let mut delivery = Delivery {
+                        head,
+                        body: buf[split + 4..].to_vec(),
+                    };
+                    let len: usize = delivery
+                        .header("content-length")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    while delivery.body.len() < len {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => delivery.body.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let n = count.fetch_add(1, Ordering::SeqCst);
+                    let _ = tx.send(delivery);
+                    match answer(n) {
+                        Answer::Status(code) => {
+                            let response = format!(
+                                "HTTP/1.1 {code} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            );
+                            let _ = socket.write_all(response.as_bytes()).await;
+                        }
+                        Answer::Stall => {
+                            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                        }
+                    }
+                });
+            }
+        });
+        Self { url, got }
+    }
+
+    /// A webhook that takes every request.
+    pub async fn ok() -> Self {
+        Self::start(|_| Answer::Status(200)).await
+    }
+
+    /// The next request, waiting up to 10 seconds for it.
+    pub async fn next(&mut self) -> Delivery {
+        tokio::time::timeout(std::time::Duration::from_secs(10), self.got.recv())
+            .await
+            .expect("no notification within 10 seconds")
+            .expect("the hook is gone")
+    }
+
+    /// Fails if a request comes within `wait`.
+    pub async fn none_within(&mut self, wait: std::time::Duration) {
+        if let Ok(Some(d)) = tokio::time::timeout(wait, self.got.recv()).await {
+            panic!(
+                "unexpected notification: {}",
+                String::from_utf8_lossy(&d.body)
+            );
+        }
+    }
 }
 
 /// A client with the SDK's default behavior, including CRC32 request checksums, because that

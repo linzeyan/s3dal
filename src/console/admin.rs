@@ -15,28 +15,35 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::ConsoleRequest;
-use crate::access::Access;
+use crate::access::{Access, Expiry};
 use crate::backend;
 use crate::config::{ServeArgs, format_duration, format_size, is_secretish};
 use crate::live::Live;
 use crate::logging::forward;
+use crate::s3::{BucketUsage, Quota};
 
 const PREFIX: &str = "/_s3dal/admin/";
 
+/// Under [`PREFIX`]: `buckets/<bucket>`, a bucket's own settings.
+const BUCKETS: &str = "buckets/";
+
 /// The settings a reload applies at once.
-const LIVE: [&str; 6] = [
+const LIVE: [&str; 8] = [
     "region",
     "domain",
     "etag-buffer-limit",
     "stale-upload-age",
+    "usage-scan-interval",
     "log-level",
-    "public-bucket",
+    "metrics",
+    "metrics-token",
 ];
 
 /// The settings that take a restart: an edit is written to the file, and the server and
 /// settings pages say what waits for the restart, which they offer to do.
-const RESTART: [&str; 10] = [
+const RESTART: [&str; 11] = [
     "backend",
+    "cache-size",
     "address",
     "console-address",
     "tls-cert",
@@ -75,17 +82,30 @@ impl AdminRoute {
 #[async_trait::async_trait]
 impl S3Route for AdminRoute {
     fn is_match(&self, _: &Method, uri: &Uri, _: &HeaderMap, extensions: &mut Extensions) -> bool {
-        extensions.get::<ConsoleRequest>().is_some() && uri.path().starts_with(PREFIX)
+        let ours = extensions.get::<ConsoleRequest>().is_some() && uri.path().starts_with(PREFIX);
+        if ours {
+            crate::metrics::note_operation("ConsoleAdmin");
+        }
+        ours
     }
 
-    /// Any valid signature may ask who it is, which is how the console signs in; the rest is
-    /// for key pairs without limits, since the settings reach past any one bucket.
+    /// Any valid signature may ask who it is, which is how the console signs in, and read the
+    /// settings of a bucket it reaches, so the console can show whether the bucket is public;
+    /// the rest is for key pairs without limits, since the settings reach past any one bucket.
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
         if req.credentials.is_none() {
             return Err(s3_error!(AccessDenied, "Signature is required"));
         }
-        let whoami = req.uri.path().strip_prefix(PREFIX) == Some("whoami");
-        if !whoami && self.live.auth().limit(req.credentials.as_ref()).is_some() {
+        let Some(limit) = self.live.auth().limit(req.credentials.as_ref()) else {
+            return Ok(());
+        };
+        let name = req.uri.path().strip_prefix(PREFIX);
+        let open = name == Some("whoami")
+            || (req.method == Method::GET
+                && name
+                    .and_then(|n| n.strip_prefix(BUCKETS))
+                    .is_some_and(|b| limit.reaches_bucket(b)));
+        if !open {
             return Err(s3_error!(
                 AccessDenied,
                 "this key pair has limits; the server's settings need one without"
@@ -97,8 +117,15 @@ impl S3Route for AdminRoute {
     async fn call(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
         let name = req.uri.path().strip_prefix(PREFIX).unwrap_or_default();
         let doc = match (&req.method, name) {
+            (method, name) if name.starts_with(BUCKETS) => {
+                let admin = self.live.auth().limit(req.credentials.as_ref()).is_none();
+                self.bucket(method, &mut req.input, &name[BUCKETS.len()..], admin)
+                    .await?
+            }
             (&Method::GET, "whoami") => self.whoami(&req),
             (&Method::GET, "info") => self.info(),
+            (&Method::GET, "stats") => self.live.dal().metrics().stats(),
+            (&Method::GET, "usage") => self.usage().await?,
             (&Method::GET, "config") => config_view(&self.live),
             (&Method::PUT, "config") => {
                 let body =
@@ -128,14 +155,6 @@ impl AdminRoute {
     /// What the signing pair reaches, so the console shows only what it can do.
     fn whoami(&self, req: &S3Request<Body>) -> Value {
         let limit = self.live.auth().limit(req.credentials.as_ref());
-        // Only those the pair reaches, so a pair limited to one bucket learns no other's name.
-        let public: Vec<String> = self
-            .live
-            .current()
-            .public_bucket
-            .into_iter()
-            .filter(|b| limit.as_ref().is_none_or(|l| l.reaches_bucket(b)))
-            .collect();
         json!({
             "access_key": req.credentials.as_ref().map(|c| c.access_key.as_str()),
             "admin": limit.is_none(),
@@ -143,8 +162,91 @@ impl AdminRoute {
             "allow": limit.as_ref().and_then(|l| l.scopes()).map(|s| {
                 s.iter().map(|s| json!({ "bucket": s.bucket, "prefix": s.prefix })).collect::<Vec<_>>()
             }),
-            "public": public,
         })
+    }
+
+    /// A bucket's settings that S3 has no request for, kept in the bucket's state (F1), so
+    /// every instance sharing the backend serves them: `{"public": bool, "quota": {"max_bytes",
+    /// "max_objects"} or null}`, and what the bucket holds, `usage`. A PUT changes the fields it
+    /// lists; `"quota": null` removes the quota. For a pair without limits, `notify` lists the
+    /// server's notification targets, which the bucket's notification rules name, with how
+    /// their deliveries went; a pair with limits gets `null`, as the targets are the server's.
+    /// `tiers` lists the cold tiers, `{"name", "storage_class"}`, for every reader: they are the
+    /// storage classes a write into the bucket can name.
+    async fn bucket(
+        &self,
+        method: &Method,
+        input: &mut Body,
+        bucket: &str,
+        admin: bool,
+    ) -> S3Result<Value> {
+        let dal = self.live.dal();
+        if method == Method::PUT {
+            let body = input
+                .store_all_limited(MAX_EDIT)
+                .await
+                .map_err(|_| s3_error!(EntityTooLarge, "a settings edit is at most 64 KiB"))?;
+            let edit: BucketEdit =
+                serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidArgument, "{e}"))?;
+            if let Some(public) = edit.public {
+                dal.set_bucket_public(bucket, public).await?;
+                tracing::info!(bucket, public, "bucket access changed");
+            }
+            if let Some(edit) = edit.quota {
+                // Fields a newer server wrote into the quota are kept through the edit.
+                let unknown = dal
+                    .bucket_quota(bucket)
+                    .await?
+                    .map(|q| q.unknown)
+                    .unwrap_or_default();
+                let quota = edit.map(|q| Quota {
+                    max_bytes: q.max_bytes,
+                    max_objects: q.max_objects,
+                    unknown,
+                });
+                dal.set_bucket_quota(bucket, quota.clone()).await?;
+                tracing::info!(
+                    bucket,
+                    max_bytes = quota.as_ref().map(|q| q.max_bytes),
+                    max_objects = quota.as_ref().and_then(|q| q.max_objects),
+                    "bucket quota changed"
+                );
+            }
+        } else if method != Method::GET {
+            return Err(s3_error!(MethodNotAllowed, "no such settings request"));
+        }
+        Ok(json!({
+            "public": dal.bucket_public(bucket).await?,
+            "quota": quota_json(dal.bucket_quota(bucket).await?.as_ref()),
+            "usage": usage_json(dal.bucket_usage(bucket).await?),
+            "notify": admin.then(|| notify_json(dal)),
+            "tiers": dal
+                .tiers()
+                .iter()
+                .map(|t| json!({ "name": t.name(), "storage_class": t.storage_class() }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// What every bucket holds and its quota, for the dashboard.
+    async fn usage(&self) -> S3Result<Value> {
+        let dal = self.live.dal();
+        let buckets: Vec<Value> = dal
+            .buckets_usage()
+            .await?
+            .into_iter()
+            .map(|(name, usage, quota)| {
+                json!({
+                    "name": name,
+                    "usage": usage_json(usage),
+                    "quota": quota_json(quota.as_ref()),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "buckets": buckets,
+            "scan_interval_secs": dal.settings().usage_scan_interval.map(|d| d.as_secs()),
+        }))
     }
 
     fn info(&self) -> Value {
@@ -162,6 +264,13 @@ impl AdminRoute {
             // a file it is stderr, which in a container is `docker logs`.
             "log_file": started.log_file.as_ref().map(|p| p.display().to_string()),
             "log_forward": started.log_forward.as_deref().map(|u| forward::redact(u, "")),
+            "log_forward_state": started.log_forward.as_ref().map(|_| {
+                let state = forward::state();
+                json!({ "failing": state.failing, "dropped": state.dropped })
+            }),
+            "probe": self.live.dal().metrics().probe_json(),
+            "metrics": self.live.dal().settings().metrics.as_str(),
+            "tiers": tiers_json(self.live.dal()),
         })
     }
 
@@ -308,7 +417,26 @@ async fn preflight(args: &ServeArgs, started: &ServeArgs) -> S3Result<()> {
                 .map_err(|e| refuse(format!("cannot listen on {addr}: {e}")))?;
         }
     }
-    check_backend(&args.backend, &args.backend_opts).await
+    let (op, profile) = check_backend(&args.backend, &args.backend_opts).await?;
+    if args.tiers.is_empty() {
+        return Ok(());
+    }
+    // As startup does: a tier that cannot be reached, or one another primary claimed (a new
+    // backend root with the old tiers), would keep the server from starting. Claiming a tier
+    // that has no owner yet is what the restart would do first anyway.
+    match tokio::time::timeout(
+        PROBE_TIMEOUT,
+        crate::tier::connect(&op, &profile, &args.tiers),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(refuse(format!("{e:#}"))),
+        Err(_) => Err(refuse(format!(
+            "the tiers did not answer within {}s",
+            PROBE_TIMEOUT.as_secs()
+        ))),
+    }
 }
 
 /// The file's key pairs as the edit lists them. A pair listed without a secret keeps the one it
@@ -322,6 +450,11 @@ fn key_pairs(
         .credentials
         .iter()
         .map(|p| (p.access_key.as_str(), p.secret_key.as_str()))
+        .collect();
+    let expiries: HashMap<&str, Option<Expiry>> = current
+        .credentials
+        .iter()
+        .map(|p| (p.access_key.as_str(), p.expires))
         .collect();
     let fixed = current.fixed_access_key.as_deref();
     let mut tables = toml_edit::ArrayOfTables::new();
@@ -356,8 +489,13 @@ fn key_pairs(
         table["access-key"] = toml_edit::value(key);
         table["secret-key"] = toml_edit::value(secret);
         // Limiting the pair the page signs with would take the settings from this session in
-        // the middle of editing them, as removing it would.
-        if Some(key) == signer && (pair.allow.is_some() || pair.access != Access::ReadWrite) {
+        // the middle of editing them, as removing it would; so would setting or moving its
+        // expiry. An expiry it already has, set in the file, is sent back as it is and kept.
+        if Some(key) == signer
+            && (pair.allow.is_some()
+                || pair.access != Access::ReadWrite
+                || expiries.get(key).copied().flatten() != pair.expires)
+        {
             return Err(s3_error!(
                 InvalidArgument,
                 "the console is signed in with {key:?}; sign in with another key to limit it"
@@ -373,6 +511,9 @@ fn key_pairs(
         }
         if pair.access != Access::ReadWrite {
             table["access"] = toml_edit::value(pair.access.as_str());
+        }
+        if let Some(expires) = pair.expires {
+            table["expires"] = toml_edit::value(expires.to_string());
         }
         tables.push(table);
     }
@@ -425,11 +566,14 @@ fn backend_opts(current: &ServeArgs, opts: &[OptEdit]) -> S3Result<Vec<(String, 
     Ok(out)
 }
 
-async fn check_backend(scheme: &str, opts: &[(String, String)]) -> S3Result<()> {
+async fn check_backend(
+    scheme: &str,
+    opts: &[(String, String)],
+) -> S3Result<(opendal::Operator, backend::Profile)> {
     let op = backend::build_operator(scheme, opts)
         .map_err(|e| s3_error!(InvalidArgument, "backend {scheme:?}: {e:#}"))?;
     match tokio::time::timeout(PROBE_TIMEOUT, backend::probe(&op)).await {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(profile)) => Ok((op, profile)),
         Ok(Err(e)) => Err(s3_error!(
             InvalidArgument,
             "backend {scheme:?} does not work: {e:#}"
@@ -485,9 +629,21 @@ fn config_view(live: &Live) -> Value {
             "stale-upload-age",
             json!(format_duration(args.stale_upload_age)),
         ),
+        setting(
+            "usage-scan-interval",
+            json!(format_duration(args.usage_scan_interval)),
+        ),
         setting("log-level", json!(args.log_level)),
-        setting("public-bucket", json!(args.public_bucket)),
+        setting("metrics", json!(args.metrics.as_str())),
+        // Never sent, as a secret key is not: the page says whether one is set, and an empty
+        // field keeps it.
+        {
+            let mut s = setting("metrics-token", Value::Null);
+            s["secret"] = json!(args.metrics_token.is_some());
+            s
+        },
         setting("backend", json!(args.backend)),
+        setting("cache-size", json!(format_size(args.cache_size))),
         setting(
             "log-format",
             json!(match args.log_format {
@@ -524,6 +680,7 @@ fn config_view(live: &Live) -> Value {
                 "locked": locked,
                 "allow": p.allow,
                 "access": p.access.as_str(),
+                "expires": p.expires.map(|e| e.to_string()),
             })
         })
         .collect();
@@ -562,6 +719,94 @@ struct Edit {
     credentials: Option<Vec<KeyEdit>>,
 }
 
+/// Refuses what it does not know, so a client that sends a setting this server lacks learns it
+/// was not applied.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BucketEdit {
+    public: Option<bool>,
+    /// Absent leaves the quota as it is; `null` removes it.
+    #[serde(default, deserialize_with = "present")]
+    quota: Option<Option<QuotaEdit>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuotaEdit {
+    max_bytes: u64,
+    max_objects: Option<u64>,
+}
+
+/// A field that is present, `null` included, as `Some`; with `#[serde(default)]` an absent one
+/// is `None`.
+fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
+}
+
+/// The notification targets, without their secrets: whether one is set, and the URL without
+/// user, password or query.
+fn notify_json(dal: &crate::S3Dal) -> Value {
+    let settings = dal.settings();
+    let targets: Vec<Value> = settings
+        .notify
+        .iter()
+        .map(|t| {
+            let mut v = dal.metrics().notify_target(&t.id).json();
+            v["id"] = json!(t.id);
+            v["arn"] = json!(t.arn(&settings.region));
+            v["url"] = json!(crate::notify::shown_url(&t.url));
+            v["auth_token"] = json!(t.auth_token.is_some());
+            v["hmac"] = json!(t.hmac_secret.is_some());
+            v
+        })
+        .collect();
+    json!(targets)
+}
+
+fn quota_json(quota: Option<&Quota>) -> Value {
+    quota.map_or(
+        Value::Null,
+        |q| json!({ "max_bytes": q.max_bytes, "max_objects": q.max_objects }),
+    )
+}
+
+fn usage_json(usage: BucketUsage) -> Value {
+    let scanned = usage
+        .scanned
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    json!({
+        "objects": usage.objects,
+        "bytes": usage.bytes,
+        "cold_bytes": usage.cold_bytes,
+        "scanned": scanned,
+    })
+}
+
+/// The cold tiers for the server page: what each is, and what its last sweep here found (`null`
+/// until one ran: the daily sweep runs on the instance holding its lease).
+fn tiers_json(dal: &crate::S3Dal) -> Value {
+    dal.tiers()
+        .iter()
+        .map(|t| {
+            let swept = dal.metrics().tier(t.name()).last_sweep();
+            json!({
+                "name": t.name(),
+                "storage_class": t.storage_class(),
+                "backend": t.scheme(),
+                "profile": t.profile(),
+                "swept": swept.map(|(objects, bytes, dangling)| {
+                    json!({ "objects": objects, "bytes": bytes, "dangling": dangling })
+                }),
+            })
+        })
+        .collect()
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OptEdit {
@@ -579,6 +824,11 @@ struct KeyEdit {
     /// rather than lifting them.
     access: Access,
     allow: Option<Vec<String>>,
+    /// Required too, `null` for none: a client that lists the pairs without their expiries
+    /// would otherwise make them last forever. A deserializer of its own is what makes serde
+    /// require an `Option` field.
+    #[serde(deserialize_with = "Option::deserialize")]
+    expires: Option<Expiry>,
 }
 
 #[cfg(test)]
@@ -638,5 +888,31 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let opts = [("root".to_owned(), root.path().display().to_string())];
         check_backend("fs", &opts).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_restart_that_a_tier_would_stop_is_refused() {
+        // A new backend root with the old tier: the tier belongs to the first primary, so the
+        // start would fail and leave nothing serving, this console included, to set it right.
+        let (first, second, tier) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let root = |d: &tempfile::TempDir| d.path().display().to_string();
+        let mut args = current(&[("root", &root(&first))]);
+        args.tiers = vec![crate::config::TierConfig {
+            name: "hdd".into(),
+            storage_class: "STANDARD_IA".into(),
+            backend: "fs".into(),
+            backend_opts: vec![("root".into(), root(&tier))],
+        }];
+        preflight(&args, &args).await.unwrap();
+        args.backend_opts = vec![("root".into(), root(&second))];
+        let err = preflight(&args, &args).await.unwrap_err();
+        assert!(
+            format!("{err:?}").contains("belongs to another s3dal"),
+            "{err:?}"
+        );
     }
 }

@@ -214,13 +214,17 @@ async fn serve(args: ServeArgs) -> anyhow::Result<Stop> {
     };
     // Backend options are not logged: they may carry upstream credentials.
     let op = backend::build_operator(&args.backend, &args.backend_opts)?;
+    let probing = std::time::Instant::now();
     let profile = backend::probe(&op).await?;
+    let probe_took = probing.elapsed();
     tracing::info!(backend = %args.backend, ?profile, "backend profile");
+    let tiers = s3dal::tier::connect(&op, &profile, &args.tiers).await?;
 
-    let dal = S3Dal::new(op, profile, args.settings());
-    tokio::spawn(sweep_stale(dal.clone()));
+    let dal = S3Dal::new(op, profile, args.settings()).with_tiers(tiers);
+    dal.metrics().record_probe(probe_took);
+    tokio::spawn(s3dal::jobs::Runner::new(dal.clone()).run());
     let auth = LiveAuth::new(&args.credentials, &args.domain)?;
-    auth.set_public(&args.public_bucket);
+    s3dal::config::warn_expired(&args.credentials);
     let (address, console_address) = (args.address, args.console_address);
     let live = Arc::new(Live::new(
         std::env::args_os().collect(),
@@ -300,31 +304,4 @@ fn shutdown_signal() -> anyhow::Result<impl Future<Output = ()>> {
         // So the log tells a stop that was asked for from a crash.
         tracing::info!("stopping: no new connections; requests in flight get 10 seconds");
     })
-}
-
-/// Sweeps stale multipart uploads, and on fs the temporary files of cut-off writes, at startup,
-/// which catches up on what went stale while s3dal was down or was left by a crash, and then
-/// hourly, or more often for an age under an hour, so nothing outlives its age by much. The age
-/// is read again each time, since a config reload may change it, or turn the sweep on or off.
-async fn sweep_stale(dal: S3Dal) {
-    const HOUR: Duration = Duration::from_secs(60 * 60);
-    loop {
-        let Some(age) = dal.settings().stale_upload_age else {
-            // Looks again in a minute, so a reload that turns the sweep on is not missed for long.
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            continue;
-        };
-        let next = tokio::time::Instant::now() + age.min(HOUR);
-        match dal.sweep_stale_uploads(age).await {
-            Ok(0) => {}
-            Ok(removed) => tracing::info!(removed, "removed stale multipart uploads"),
-            Err(err) => tracing::warn!(error = %err, "cannot sweep stale multipart uploads"),
-        }
-        match dal.sweep_stale_temp_files(age).await {
-            Ok(0) => {}
-            Ok(removed) => tracing::info!(removed, "removed stale temporary files"),
-            Err(err) => tracing::warn!(error = %err, "cannot sweep stale temporary files"),
-        }
-        tokio::time::sleep_until(next).await;
-    }
 }

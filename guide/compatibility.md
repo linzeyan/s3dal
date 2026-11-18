@@ -3,10 +3,14 @@
 ## Implemented operations
 
 - Buckets: CreateBucket, HeadBucket, ListBuckets, DeleteBucket, GetBucketLocation,
-  GetBucketVersioning (always unversioned), GetBucketAcl and PutBucketAcl (owner only). The
-  GETs of configurations s3dal does not have (policy, policy status, CORS, lifecycle, tagging,
+  GetBucketVersioning and PutBucketVersioning, GetBucketAcl and PutBucketAcl (owner only),
+  PutBucketLifecycleConfiguration, GetBucketLifecycleConfiguration and DeleteBucketLifecycle
+  (expiration rules only; see [Differences](differences.md#other-differences)),
+  PutBucketNotificationConfiguration and GetBucketNotificationConfiguration (to webhooks the
+  operator configures; see [Event notifications](../README.md#event-notifications)). The
+  GETs of configurations s3dal does not have (policy, policy status, CORS, tagging,
   encryption, object lock, website, replication, ownership controls, public access block,
-  logging, notifications, transfer acceleration, request payment) answer as S3 does for a
+  logging, transfer acceleration, request payment) answer as S3 does for a
   bucket that has none, so tools that read them all, such as Terraform, see them unset.
 - Objects: PutObject, GetObject (with Range and `partNumber`), HeadObject, DeleteObject,
   DeleteObjects, CopyObject, GetObjectAttributes, GetObjectTagging (always the empty tag
@@ -52,7 +56,7 @@ API s3dal covers. The full results, per test and per category, are in
 | gcs on fake-gcs-server | 283 / 1042 | 27.1% |
 
 What the rate counts: every test in the suite, including the 158 the suite itself skips and
-the tests of features s3dal does not have (ACLs, IAM, STS, versioning, SSE, object lock,
+the tests of features s3dal does not have (ACLs, IAM, STS, SSE, object lock,
 lifecycle, logging, ...), which make up most of the failures. It is a measure of API coverage,
 not of how correct the implemented operations are; the per-category table in the report shows
 the latter better (range reads 100%, objects 65.7%, listing 89.1% on fs and 91.5% on the

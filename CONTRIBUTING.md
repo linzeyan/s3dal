@@ -25,7 +25,8 @@ cargo install --path .               # into ~/.cargo/bin
 
 The features `services-s3`, `services-azblob` and `services-gcs`, all on by default, add the
 `s3`, `azblob` and `gcs` backends and the HTTP client they need; `client`, also on by default,
-adds the `ls`, `cp`, ... subcommands, on that same HTTP client.
+adds the `ls`, `cp`, ... subcommands, on that same HTTP client; `thumbnail`, on by default,
+adds image thumbnails and the `image` crate's JPEG, PNG, GIF and WebP codecs.
 `cargo build --release --no-default-features` builds an fs-only server, and
 `--no-default-features --features services-s3` one with fs and s3 only.
 

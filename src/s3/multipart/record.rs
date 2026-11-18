@@ -30,6 +30,10 @@ pub(super) struct Upload {
     pub checksum_algorithm: Option<String>,
     /// `COMPOSITE` or `FULL_OBJECT`, set exactly when the algorithm is.
     pub checksum_type: Option<String>,
+    /// The class of the tier Complete writes the object to, when Create named one a tier has.
+    /// Left out otherwise, so a server without tiers writes the record it always wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_class: Option<String>,
     pub initiated: SystemTime,
     /// Set in the same file once the object is committed, so the upload turns from active to
     /// completed in one atomic write and no request can see it as both.
@@ -50,6 +54,10 @@ pub(super) struct Completed {
     pub checksum: Option<String>,
     pub size: u64,
     pub at: SystemTime,
+    /// The `x-amz-version-id` the response named; none for a bucket without versioning, and for
+    /// uploads completed before versioning existed.
+    #[serde(default)]
+    pub version_id: Option<String>,
 }
 
 /// Serde's mirror of [`Attrs`]. The derive builds `Attrs` with a struct literal, so a field

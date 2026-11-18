@@ -23,11 +23,14 @@ use super::slots;
 use super::{parse_upload_id, upload_dir};
 use crate::S3Dal;
 use crate::checksum::{self, ALGORITHMS};
+use crate::events::{EventKind, ObjectEvent, Origin};
 use crate::meta::{self, Computed, PartLayout};
-use crate::s3::store::{self, Dest, Precondition, write_err};
+use crate::s3::store::{self, ColdObject, Dest, Precondition, write_err};
 use crate::s3::unsupported::refuse_sse_c;
-use crate::s3::{fs, naming};
+use crate::s3::version::Versioning;
+use crate::s3::{fs, naming, tier, usage};
 use crate::server::{RequestId, Scheme};
+use crate::tier::Tier;
 
 /// Every part except the last must be at least this large.
 pub(super) const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
@@ -41,6 +44,7 @@ pub(in crate::s3) async fn complete_multipart_upload(
     req: S3Request<CompleteMultipartUploadInput>,
 ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
     let location = object_url(&req);
+    let origin = Origin::of(&req);
     let mut input = req.input;
     naming::require_bucket(dal, &input.bucket).await?;
     naming::validate_key(&input.key)?;
@@ -97,9 +101,14 @@ pub(in crate::s3) async fn complete_multipart_upload(
     let sizes: Vec<u64> = parts.iter().map(|p| p.size).collect();
     let total: u64 = sizes.iter().sum();
     check_object_size(input.mpu_object_size, total)?;
-    Dest::new(dal, &input.bucket, &input.key)
-        .check(cond)
-        .await?;
+    usage::check_write(dal, &input.bucket, &input.key, Some(total)).await?;
+    let dest = Dest::for_write(dal, &input.bucket, &input.key).await?;
+    dest.check(cond).await?;
+    // The response's headers go out before the object is assembled, so the version id is the one
+    // chosen here, as C1 wants it anyway.
+    let version_id = dest.response_version_id();
+    let (versioning, new_version, tracked) =
+        (dest.versioning, dest.version_id.clone(), dest.tracked);
 
     // Decision C1: both are stored with the object, so both are known before the write starts.
     let etag = multipart_etag(parts.iter().map(|p| p.md5.as_str())).ok_or_else(|| {
@@ -121,6 +130,11 @@ pub(in crate::s3) async fn complete_multipart_upload(
         total,
         if_match: input.if_match,
         if_none_match: input.if_none_match,
+        versioning,
+        new_version,
+        version_id: version_id.clone(),
+        tracked,
+        origin,
     };
     // The assembly runs while the 200's body is sent, after the request's span has closed and
     // its error documents were stamped (src/server.rs), so it carries both itself.
@@ -139,6 +153,7 @@ pub(in crate::s3) async fn complete_multipart_upload(
     let joined = async move { assembling.await.map_err(S3Error::internal_error)? };
     Ok(S3Response::new(CompleteMultipartUploadOutput {
         future: Some(Box::pin(joined)),
+        version_id,
         ..Default::default()
     }))
 }
@@ -178,6 +193,7 @@ fn retried(
         done.etag.clone(),
         upload,
         done.checksum.as_deref(),
+        done.version_id.clone(),
     ))
 }
 
@@ -201,9 +217,11 @@ fn output(
     etag: String,
     upload: &Upload,
     checksum: Option<&str>,
+    version_id: Option<String>,
 ) -> CompleteMultipartUploadOutput {
     let checksum = stored_checksum(upload, checksum);
     CompleteMultipartUploadOutput {
+        version_id,
         bucket: Some(bucket),
         key: Some(key),
         location,
@@ -531,6 +549,14 @@ struct Assembly {
     total: u64,
     if_match: Option<ETagCondition>,
     if_none_match: Option<ETagCondition>,
+    versioning: Versioning,
+    /// The new version's id, `None` for the `null` version.
+    new_version: Option<String>,
+    /// What the response names, recorded so a retried Complete names it too.
+    version_id: Option<String>,
+    /// See `Dest::tracked`.
+    tracked: bool,
+    origin: Origin,
 }
 
 impl Assembly {
@@ -552,6 +578,11 @@ impl Assembly {
             total,
             if_match,
             if_none_match,
+            versioning,
+            new_version,
+            version_id,
+            tracked,
+            origin,
         } = self;
         // One Complete of an upload at a time in this process. A retry that arrives while the
         // first one is still assembling waits here and then answers from the record the first
@@ -572,48 +603,79 @@ impl Assembly {
             );
         }
 
-        let dest = Dest::new(&dal, &bucket, &key);
-        let computed = Computed {
+        let dest = Dest::versioned(&dal, &bucket, &key, versioning, new_version, tracked);
+        let computed = || Computed {
             md5_hex: Some(etag.clone()),
             checksum: stored_checksum(&upload, checksum.as_deref()),
             parts: Some(layout),
         };
-        let opts = meta::write_options(&dal.profile, upload.attrs.clone(), computed);
         let cond = Precondition {
             if_match: if_match.as_ref(),
             if_none_match: if_none_match.as_ref(),
         };
-        let closed = match compose_options(&dal, &opts) {
-            Some(compose) => compose_parts(&dest, &dir, &parts, compose, cond).await?,
-            #[cfg(unix)]
-            None if fs::is_fs(&dal.op) => assemble_on_fs(&dest, &dir, &parts, &opts, cond).await?,
-            None => {
-                let opts = WriteOptions {
-                    chunk: store::chunk_for(&dal.op, total),
-                    ..opts
-                };
-                let mut w = dest.open(opts, cond).await?;
-                if let Err(err) = copy_parts(&dir, &parts, &mut w).await {
-                    dest.abandon(&mut w).await;
-                    return Err(err);
+        // An empty object has nothing to move and stays hot, as for PutObject.
+        let cold = dal
+            .tier_for_class(upload.storage_class.as_deref())
+            .filter(|_| total > 0);
+        let written = if let Some(tier) = cold {
+            // Held to the state found now, as a hot write's condition is from its open.
+            let expected = dest.expected(cond).await?;
+            let opts = meta::write_options(&tier.profile, upload.attrs.clone(), computed());
+            let closed = stream_into_tier(&dest, tier, opts, &dir, &parts, total).await?;
+            let attrs = upload.attrs.clone();
+            dest.commit_cold(closed, attrs, computed(), total, &etag, expected, cond)
+                .await?;
+            // The stub stores the multipart ETag on every backend.
+            etag.clone()
+        } else {
+            let mut opts = meta::write_options(&dal.profile, upload.attrs.clone(), computed());
+            dest.stamp(&mut opts);
+            let closed = match compose_options(&dal, &opts) {
+                Some(compose) => compose_parts(&dest, &dir, &parts, compose, cond).await?,
+                #[cfg(unix)]
+                None if fs::is_fs(&dal.op) => {
+                    assemble_on_fs(&dest, &dir, &parts, &opts, cond).await?
                 }
-                dest.commit(w, cond).await?
+                None => {
+                    let opts = WriteOptions {
+                        chunk: store::chunk_for(&dal.op, total),
+                        ..opts
+                    };
+                    let mut w = dest.open(opts, cond).await?;
+                    if let Err(err) = copy_parts(&dir, &parts, &mut w).await {
+                        dest.abandon(&mut w).await;
+                        return Err(err);
+                    }
+                    dest.commit(w, cond).await?
+                }
+            };
+            // Compose and the fs renames commit without `Dest::commit`, which removes these
+            // itself.
+            dest.remove_replaced().await;
+
+            // As for PutObject: a backend with native ETags reports its own, and the response
+            // must name the ETag a following HEAD sees.
+            if dal.profile.native_etag {
+                dest.written_etag(closed, total).await?
+            } else {
+                etag.clone()
             }
         };
-
-        // As for PutObject: a backend with native ETags reports its own, and the response must
-        // name the ETag a following HEAD sees.
-        let written = if dal.profile.native_etag {
-            dest.written_etag(closed, total).await?
-        } else {
-            etag.clone()
-        };
+        // At the commit, before the record: a retry answered from the record changes nothing.
+        dal.emit(ObjectEvent {
+            size: Some(total),
+            etag: Some(written.clone()),
+            version: dest.event_version(),
+            usage: dest.usage(total),
+            ..ObjectEvent::new(EventKind::Complete, &bucket, &key, origin)
+        });
         upload.completed = Some(Completed {
             parts: etag,
             etag: written.clone(),
             checksum: checksum.clone(),
             size: total,
             at: SystemTime::now(),
+            version_id: version_id.clone(),
         });
         finish(&dal, &bucket, id, &dir, &upload).await;
         Ok(output(
@@ -623,6 +685,7 @@ impl Assembly {
             written,
             &upload,
             checksum.as_deref(),
+            version_id,
         ))
     }
 }
@@ -637,6 +700,7 @@ async fn finish(dal: &S3Dal, bucket: &str, id: Uuid, dir: &str, completed: &reco
         tracing::warn!(dir, error = %err, "cannot record the completed upload");
         return;
     }
+    dal.metrics().multipart_closed();
     let removed = async {
         let entries = dal.op.list(dir).await?;
         let parts = entries
@@ -668,6 +732,44 @@ async fn copy_parts(dir: &str, parts: &[PartManifest], w: &mut Writer) -> S3Resu
             .map_err(|err| copy_part_err(&path, err))?;
     }
     Ok(())
+}
+
+/// Streams the parts from the primary into a new object in `tier`, described by `opts`, for a
+/// Complete into a tier (cold-tier.md "Writes into a tier"): compose, the fs rename and
+/// `copy_from` all work within one Operator only. The caller commits the stub naming it.
+async fn stream_into_tier<'t>(
+    dest: &Dest<'_>,
+    tier: &'t Tier,
+    opts: WriteOptions,
+    dir: &str,
+    parts: &[PartManifest],
+    total: u64,
+) -> S3Result<ColdObject<'t>> {
+    let mut w = dest.open_cold(tier, opts, Some(total)).await?;
+    let streamed = async {
+        // An empty range is never read: OpenDAL reads one as "to the end" of the data file,
+        // which on fs holds the other parts too.
+        for part in parts.iter().filter(|p| p.size > 0) {
+            let path = format!("{dir}{}", part.data);
+            let failed = |err| copy_part_err(&path, err);
+            let reader = dest.dal.op.reader(&path).await.map_err(failed)?;
+            let mut chunks = reader
+                .into_bytes_stream(part.offset..part.offset + part.size)
+                .await
+                .map_err(failed)?;
+            while let Some(chunk) = chunks.next().await {
+                w.write(chunk.map_err(|err| failed(tier::opendal_error(err)))?)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(err) = streamed {
+        w.abort().await;
+        return Err(err);
+    }
+    w.close().await
 }
 
 /// Assembles the parts on fs and commits the object as [`Dest::commit`] commits a write: the
@@ -733,7 +835,7 @@ async fn assemble_on_fs(
     };
     let committed = {
         let _guard = dal.locks.lock(&dest.path).await;
-        match dest.check(cond).await {
+        match checked_and_archived(dest, cond).await {
             Ok(()) => {
                 let tmp = tmp.clone();
                 fs::blocking(move || fs::rename_into_place(&tmp, &target))
@@ -785,7 +887,7 @@ async fn take_in_place(
     let target = std::path::PathBuf::from(dal.op.info().root()).join(&dest.path);
     let committed = {
         let _guard = dal.locks.lock(&dest.path).await;
-        match dest.check(cond).await {
+        match checked_and_archived(dest, cond).await {
             Ok(()) => fs::blocking(move || fs::rename_into_place(&object, &target))
                 .await
                 .map_err(write_err),
@@ -851,15 +953,25 @@ async fn compose_parts(
         Some(expected) => expected.apply_to_compose(&mut opts),
         None => dest.check(cond).await?,
     }
+    dest.archive().await?;
     dest.dal
         .op
         .compose_options(sources, &dest.path, opts)
         .await
         .map_err(|err| match err.kind() {
             opendal::ErrorKind::NotFound => record::no_such_upload(),
-            // A failed condition is 412; anything unexpected is logged by `write_err`.
-            _ => write_err(err),
+            // A failed condition is 412, or a conflict where only versioning set one (see
+            // `store::commit_err`); anything unexpected is logged by `write_err`.
+            _ => store::commit_err(err, cond),
         })
+}
+
+/// What `Dest::commit` does under the key's lock before a writer closes, for the commits that
+/// rename a file into place instead.
+#[cfg(unix)]
+async fn checked_and_archived(dest: &Dest<'_>, cond: Precondition<'_>) -> S3Result<()> {
+    dest.check(cond).await?;
+    dest.archive().await
 }
 
 /// Part data disappears only when the upload is aborted or completed by another request.

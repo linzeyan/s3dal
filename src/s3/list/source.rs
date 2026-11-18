@@ -88,7 +88,7 @@ pub(super) async fn collect(dal: &S3Dal, bucket: &str, query: &Query) -> S3Resul
 /// also keeps `..` out of backend paths, where it would lead out of the bucket, and the control
 /// character away from an S3 upstream, which echoes the prefix into XML that cannot be parsed
 /// (RustFS 1.0.2 does, even when asked for `encoding-type=url`).
-fn prefix_dir(prefix: &str) -> Option<&str> {
+pub(super) fn prefix_dir(prefix: &str) -> Option<&str> {
     let dir = &prefix[..prefix.rfind('/').map_or(0, |i| i + 1)];
     let possible =
         naming::xml_safe(prefix) && (dir.is_empty() || naming::validate_key(dir).is_ok());
@@ -269,7 +269,7 @@ async fn walk(
 }
 
 /// One directory's files and subdirectories, as paths relative to the bucket, in key order.
-async fn sorted_children(
+pub(super) async fn sorted_children(
     op: &Operator,
     bucket_dir: &str,
     dir: &str,

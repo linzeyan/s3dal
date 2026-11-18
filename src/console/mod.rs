@@ -44,6 +44,11 @@ const ASSETS: &[(&str, &str, &str)] = &[
         include_str!("assets/app.js"),
     ),
     (
+        "/dashboard.js",
+        "text/javascript; charset=utf-8",
+        include_str!("assets/dashboard.js"),
+    ),
+    (
         "/s3.js",
         "text/javascript; charset=utf-8",
         include_str!("assets/s3.js"),

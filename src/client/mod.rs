@@ -92,6 +92,37 @@ pub enum ClientCommand {
         #[command(flatten)]
         conn: Connection,
     },
+    /// Show whether anyone may download a bucket's objects without a key pair, or switch that.
+    /// An s3dal server only, through its console's settings API: give the console's address
+    /// (`console-address`) as --endpoint.
+    Public {
+        #[arg(value_parser = S3Url::parse)]
+        bucket: S3Url,
+        /// `on` or `off`; without it, the current state is printed.
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+        #[command(flatten)]
+        conn: Connection,
+    },
+    /// Show a bucket's quota and what it holds, or set or remove the quota. Writes that would
+    /// take the bucket past it are refused. An s3dal server only, as for `public`: give the
+    /// console's address as --endpoint.
+    Quota {
+        #[arg(value_parser = S3Url::parse)]
+        bucket: S3Url,
+        /// Bytes the bucket may hold, every version counted: a byte count or a number with a
+        /// `KiB` / `MiB` / `GiB` suffix.
+        #[arg(long, value_parser = crate::config::parse_size, conflicts_with = "clear")]
+        max_bytes: Option<u64>,
+        /// Objects the bucket may hold, every version counted; set with --max-bytes.
+        #[arg(long, requires = "max_bytes")]
+        max_objects: Option<u64>,
+        /// Remove the quota.
+        #[arg(long)]
+        clear: bool,
+        #[command(flatten)]
+        conn: Connection,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -321,7 +352,89 @@ async fn exec(cmd: ClientCommand) -> anyhow::Result<()> {
             let url = s3.presign(method, bucket, key, expires).await?;
             say(format_args!("{url}"))
         }
+        ClientCommand::Public {
+            bucket,
+            state,
+            conn,
+        } => {
+            let s3 = conn.connect()?;
+            let name = bucket.bucket_only()?;
+            let path = format!("buckets/{name}");
+            let answer = match state.as_deref() {
+                None => s3.admin(Method::GET, &path, None).await,
+                Some(state) => {
+                    let edit = serde_json::json!({ "public": state == "on" }).to_string();
+                    s3.admin(Method::PUT, &path, Some(edit)).await
+                }
+            }
+            .with_context(|| {
+                format!(
+                    "cannot reach the settings of bucket {name}; they are on an s3dal console's \
+                     address, given as --endpoint"
+                )
+            })?;
+            let settings: serde_json::Value =
+                serde_json::from_str(&answer).context("cannot parse the answer")?;
+            let public = settings["public"]
+                .as_bool()
+                .with_context(|| format!("unexpected answer: {answer}"))?;
+            let shown = if public { "public" } else { "private" };
+            say(format_args!("{name}: {shown}"))
+        }
+        ClientCommand::Quota {
+            bucket,
+            max_bytes,
+            max_objects,
+            clear,
+            conn,
+        } => {
+            let s3 = conn.connect()?;
+            let name = bucket.bucket_only()?;
+            let path = format!("buckets/{name}");
+            let edit = match max_bytes {
+                Some(max_bytes) => Some(serde_json::json!({
+                    "quota": { "max_bytes": max_bytes, "max_objects": max_objects }
+                })),
+                None => clear.then(|| serde_json::json!({ "quota": null })),
+            };
+            let answer = match edit {
+                None => s3.admin(Method::GET, &path, None).await,
+                Some(edit) => s3.admin(Method::PUT, &path, Some(edit.to_string())).await,
+            }
+            .with_context(|| {
+                format!(
+                    "cannot reach the settings of bucket {name}; they are on an s3dal console's \
+                     address, given as --endpoint"
+                )
+            })?;
+            let settings: serde_json::Value =
+                serde_json::from_str(&answer).context("cannot parse the answer")?;
+            say(format_args!("{}", describe_quota(name, &settings)?))
+        }
     }
+}
+
+/// `b: 1048576 bytes of 10GiB, 3 of 100 objects`, or `b: 1048576 bytes, 3 objects, no quota`.
+fn describe_quota(name: &str, settings: &serde_json::Value) -> anyhow::Result<String> {
+    let unexpected = || format!("unexpected answer: {settings}");
+    let usage = &settings["usage"];
+    let bytes = usage["bytes"].as_u64().with_context(unexpected)?;
+    let objects = usage["objects"].as_u64().with_context(unexpected)?;
+    let quota = &settings["quota"];
+    if quota.is_null() {
+        return Ok(format!(
+            "{name}: {bytes} bytes, {objects} objects, no quota"
+        ));
+    }
+    let max_bytes = quota["max_bytes"].as_u64().with_context(unexpected)?;
+    let objects = match quota["max_objects"].as_u64() {
+        Some(max) => format!("{objects} of {max} objects"),
+        None => format!("{objects} objects"),
+    };
+    Ok(format!(
+        "{name}: {bytes} bytes of {}, {objects}",
+        crate::config::format_size(max_bytes)
+    ))
 }
 
 /// One line on stdout, with a write error returned rather than panicked on as `println!` does.

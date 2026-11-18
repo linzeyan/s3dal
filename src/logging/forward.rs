@@ -12,7 +12,7 @@
 
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -315,6 +315,23 @@ pub fn keep_password(new: &str, current: Option<&str>) -> String {
     }
 }
 
+/// Lines dropped since the process started, and whether the collector is failing now, for the
+/// metrics and the console's server page. Process-wide, as the log is: there is one forwarder.
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+static FAILING: AtomicBool = AtomicBool::new(false);
+
+pub struct State {
+    pub dropped: u64,
+    pub failing: bool,
+}
+
+pub fn state() -> State {
+    State {
+        dropped: DROPPED.load(Ordering::Relaxed),
+        failing: FAILING.load(Ordering::Relaxed),
+    }
+}
+
 /// The writer the log's JSON layer writes to: hands each line to the sending thread.
 pub struct Forwarder {
     queue: SyncSender<Line>,
@@ -414,6 +431,7 @@ impl Write for ForwardWriter<'_> {
         if self.0.queue.try_send(line).is_err() {
             self.0.progress.queued.fetch_sub(1, Ordering::SeqCst);
             self.0.dropped.fetch_add(1, Ordering::Relaxed);
+            DROPPED.fetch_add(1, Ordering::Relaxed);
         }
         Ok(buf.len())
     }
@@ -454,6 +472,7 @@ fn run(
                     if failing {
                         eprintln!("s3dal: sending the log to {shown} again");
                         failing = false;
+                        FAILING.store(false, Ordering::Relaxed);
                     }
                     i += 1;
                 }
@@ -461,6 +480,7 @@ fn run(
                     if !failing {
                         eprintln!("s3dal: cannot send the log to {shown}: {e}; retrying");
                         failing = true;
+                        FAILING.store(true, Ordering::Relaxed);
                     }
                     std::thread::sleep(pause);
                     pause = (pause * 2).min(MAX_PAUSE);

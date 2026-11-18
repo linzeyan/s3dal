@@ -10,7 +10,7 @@ use s3s::dto::*;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 use super::naming::{bucket_dir, require_bucket, validate_bucket_name};
-use super::{S3Dal, acl, multipart, unsupported};
+use super::{S3Dal, acl, multipart, unsupported, version};
 use crate::access::Limit;
 use crate::error::{Ctx, map};
 
@@ -63,6 +63,9 @@ pub(super) async fn create_bucket(
         }
         return Err(s3_error!(BucketAlreadyOwnedByYou));
     }
+    // What a bucket of this name left when a DeleteBucket crashed between removing it and
+    // removing its versions: a new bucket starts unversioned and holds no old versions.
+    version::forget(dal, &bucket).await?;
     dal.op
         .create_dir(&dir)
         .await
@@ -80,6 +83,10 @@ pub(super) async fn delete_bucket(
     let Some(mut dirs) = dirs_of_empty_bucket(dal, &dir).await? else {
         return Err(s3_error!(BucketNotEmpty));
     };
+    // As on AWS, a bucket whose versions or delete markers are left is not empty.
+    if version::has_versions(dal, &bucket).await? {
+        return Err(s3_error!(BucketNotEmpty));
+    }
     // A bucket created later under this name must not inherit these uploads. They go before the
     // bucket, so a failure here leaves a bucket that a retry can still delete.
     multipart::delete_bucket_uploads(dal, &bucket).await?;
@@ -95,6 +102,11 @@ pub(super) async fn delete_bucket(
             }
             return Err(map(err, Ctx::Bucket));
         }
+    }
+    // After the bucket, so a removal that fails above leaves it versioned (and public) as it
+    // was. Left behind, the state is removed by the next CreateBucket of the name.
+    if let Err(err) = version::forget(dal, &bucket).await {
+        tracing::warn!(bucket, error = %err, "cannot remove the state of a deleted bucket");
     }
     Ok(S3Response::new(DeleteBucketOutput {}))
 }
@@ -249,16 +261,6 @@ pub(super) async fn get_bucket_location(
         location_constraint: (region != LEGACY_REGION)
             .then(|| BucketLocationConstraint::from(region.clone())),
     }))
-}
-
-/// s3dal has no versioning, so every bucket is one that never had it enabled: AWS answers that
-/// with no Status at all. Clients such as rclone ask before deleting and log an error on 501.
-pub(super) async fn get_bucket_versioning(
-    dal: &S3Dal,
-    req: S3Request<GetBucketVersioningInput>,
-) -> S3Result<S3Response<GetBucketVersioningOutput>> {
-    require_bucket(dal, &req.input.bucket).await?;
-    Ok(S3Response::new(GetBucketVersioningOutput::default()))
 }
 
 /// A GET of a bucket configuration s3dal never stores (policy, CORS, lifecycle, ...) answers as

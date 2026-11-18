@@ -197,6 +197,54 @@ async fn a_signed_form_uploads_the_file_with_the_attributes_it_names() {
 }
 
 #[tokio::test]
+async fn a_write_only_pair_takes_form_uploads_into_its_folder_only() {
+    // A browser drop box: the app signs forms with a pair that can only put objects in, so a
+    // leaked form or key uploads and nothing more. The form's key is checked against the
+    // pair's folder, as a PUT's would be.
+    let server = server().await;
+    let mut dropper = s3dal::config::KeyPair::new(ACCESS_KEY, SECRET_KEY);
+    dropper.allow = Some(vec![format!("{BUCKET}/uploads/")]);
+    dropper.access = s3dal::access::Access::WriteOnly;
+    server.auth.replace(&[dropper], &[]).unwrap();
+
+    let mut form = signed(vec![
+        json!({"bucket": BUCKET}),
+        json!(["starts-with", "$key", ""]),
+    ]);
+    form.extend(fields(&[("key", "uploads/${filename}")]));
+    let posted = post(&server, &form, "photo.png", b"dropped").await;
+    assert_eq!(posted.status, 204, "{}", posted.body);
+    assert_eq!(
+        server.read(&format!("{BUCKET}/uploads/photo.png")).await,
+        b"dropped"
+    );
+
+    let mut outside = signed(vec![
+        json!({"bucket": BUCKET}),
+        json!(["starts-with", "$key", ""]),
+    ]);
+    outside.extend(fields(&[("key", "elsewhere.png")]));
+    let posted = post(&server, &outside, "photo.png", b"x").await;
+    assert_eq!(posted.status, 403, "{}", posted.body);
+    assert!(!server.exists(&format!("{BUCKET}/elsewhere.png")).await);
+
+    // The same pair gets nothing back.
+    let err = server
+        .client
+        .get_object()
+        .bucket(BUCKET)
+        .key("uploads/photo.png")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.raw_response().map(|r| r.status().as_u16()),
+        Some(403),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
 async fn success_action_status_and_redirect_shape_the_answer() {
     // A plain HTML form navigates to whatever the upload answers: the redirect brings the browser
     // back to the app with the key and ETag, and 201 hands scripts the key that was stored.
@@ -599,4 +647,111 @@ async fn an_empty_file_is_stored_as_an_empty_put_would_be() {
         .unwrap();
     assert_eq!(head.content_length(), Some(0));
     assert_eq!(head.e_tag(), Some(format!("\"{}\"", md5_hex(b"")).as_str()));
+}
+
+#[tokio::test]
+async fn a_form_upload_is_announced_as_a_post() {
+    // S3 names a browser upload `ObjectCreated:Post`, not `Put`, and notification rules filter
+    // on that; one event, signed by the form's key pair, and none for a form refused.
+    let server = server().await;
+    let mut events = server.dal.subscribe();
+    let mut form = signed(vec![json!(["starts-with", "$key", ""])]);
+    form.extend(fields(&[("key", "posted")]));
+    let posted = post(&server, &form, "f", b"form data").await;
+    assert_eq!(posted.status, 204, "{}", posted.body);
+    let event = events.try_recv().expect("no event");
+    assert_eq!(event.kind, s3dal::events::EventKind::Post);
+    assert_eq!((event.key.as_str(), event.size), ("posted", Some(9)));
+    assert_eq!(event.etag, Some(md5_hex(b"form data")));
+    assert_eq!(event.access_key.as_deref(), Some(ACCESS_KEY));
+    assert_eq!(
+        event.request_id.as_deref(),
+        header(&posted.head, "x-amz-request-id")
+    );
+    assert!(events.try_recv().is_none());
+
+    let mut outside = signed(vec![json!(["starts-with", "$key", "uploads/"])]);
+    outside.extend(fields(&[("key", "elsewhere")]));
+    let refused = post(&server, &outside, "f", b"x").await;
+    assert_eq!(refused.status, 400, "{}", refused.body);
+    assert!(events.try_recv().is_none());
+}
+
+#[tokio::test]
+async fn a_form_upload_is_notified_as_object_created_post() {
+    // A consumer that subscribed to browser uploads only (`s3:ObjectCreated:Post`) must get
+    // them, with the form's key pair as the principal, and not the PUTs beside them.
+    let mut hook = common::Hook::ok().await;
+    let settings = s3dal::Settings {
+        notify: vec![s3dal::notify::Target::new("t", &hook.url)],
+        ..s3dal::Settings::default()
+    };
+    let server = TestServer::start_with(settings).await;
+    server.create_bucket_dir(BUCKET).await;
+    let rule = aws_sdk_s3::types::QueueConfiguration::builder()
+        .queue_arn("arn:s3dal:sqs:us-east-1:t:webhook")
+        .events(aws_sdk_s3::types::Event::from("s3:ObjectCreated:Post"))
+        .build()
+        .unwrap();
+    server
+        .client
+        .put_bucket_notification_configuration()
+        .bucket(BUCKET)
+        .notification_configuration(
+            aws_sdk_s3::types::NotificationConfiguration::builder()
+                .queue_configurations(rule)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    server
+        .client
+        .put_object()
+        .bucket(BUCKET)
+        .key("put")
+        .body(b"x".to_vec().into())
+        .send()
+        .await
+        .unwrap();
+    let mut form = signed(vec![json!(["starts-with", "$key", ""])]);
+    form.extend(fields(&[("key", "posted")]));
+    let posted = post(&server, &form, "f", b"form data").await;
+    assert_eq!(posted.status, 204, "{}", posted.body);
+    let record = hook.next().await.record();
+    assert_eq!(record["eventName"], "ObjectCreated:Post");
+    assert_eq!(record["s3"]["object"]["key"], "posted");
+    assert_eq!(record["s3"]["object"]["size"], 9);
+    assert_eq!(record["userIdentity"]["principalId"], ACCESS_KEY);
+    hook.none_within(Duration::from_millis(300)).await;
+}
+
+#[tokio::test]
+async fn a_form_upload_may_fill_the_quota_exactly_but_not_one_byte_past_it() {
+    // A browser upload is a write like a PUT: a form signed by an app must not be a way around
+    // the bucket's quota, and the file is refused before it is stored.
+    let server = server().await;
+    let quota = s3dal::Quota {
+        max_bytes: 10,
+        max_objects: None,
+        unknown: Default::default(),
+    };
+    server
+        .dal
+        .set_bucket_quota(BUCKET, Some(quota))
+        .await
+        .unwrap();
+    let mut form = signed(vec![json!(["starts-with", "$key", ""])]);
+    form.extend(fields(&[("key", "${filename}")]));
+    let posted = post(&server, &form, "fits", b"0123456789").await;
+    assert_eq!(posted.status, 204, "{}", posted.body);
+    let refused = post(&server, &form, "over", b"x").await;
+    assert_eq!(refused.status, 403, "{}", refused.body);
+    assert!(
+        refused.body.contains("<Code>QuotaExceeded</Code>"),
+        "{}",
+        refused.body
+    );
+    assert_eq!(server.names(BUCKET).await, ["fits"]);
+    server.assert_no_temp_files().await;
 }

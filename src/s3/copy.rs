@@ -17,16 +17,25 @@ use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 use super::precondition::{self, Conditions};
 use super::store::{self, Dest, Precondition};
+use super::tier::{self, Cold};
 use super::upload::{BodyCheck, BodyHeaders};
-use super::{S3Dal, naming, unsupported};
+use super::{S3Dal, naming, unsupported, usage, version};
 use crate::checksum::{self, ALGORITHMS};
 use crate::error::{Ctx, map};
+use crate::events::{EventKind, ObjectEvent, Origin};
 use crate::meta::{self, Attrs, Computed, ObjectMeta};
 
 /// The object `x-amz-copy-source` names, as it was when its conditions were evaluated.
 pub(super) struct Source {
     path: String,
     pub meta: ObjectMeta,
+    /// `x-amz-copy-source-version-id`: the version copied, in a bucket that has or had
+    /// versioning.
+    pub version_id: Option<String>,
+    /// Where a cold source's bytes are.
+    cold: Option<Cold>,
+    /// The ETag a hot source's read is pinned to, where the backend can pin it.
+    pin: Option<String>,
 }
 
 impl Source {
@@ -50,15 +59,28 @@ impl Source {
             ));
         };
         naming::require_bucket(dal, bucket).await?;
-        naming::require_null_version(version_id.as_deref())?;
         naming::validate_key(key)?;
-        let path = naming::object_path(bucket, key);
+        let target = version::read_target(dal, bucket, key, version_id.as_deref())
+            .await
+            .map_err(|err| {
+                // AWS refuses a delete marker named as a source with 400, not a read's 405.
+                if *err.code() == S3ErrorCode::MethodNotAllowed {
+                    s3_error!(
+                        InvalidRequest,
+                        "The source of a copy request may not specifically refer to a delete marker by version id."
+                    )
+                } else {
+                    err
+                }
+            })?;
+        let path = target.path.clone();
         let m = dal.op.stat(&path).await.map_err(read_err)?;
         // Folder markers and prefixes are directories, not objects.
         if !m.is_file() {
             return Err(s3_error!(NoSuchKey));
         }
         let meta = meta::resolve(&dal.profile, &m);
+        let version_id = version::response_id(&target, &meta);
         precondition::check(cond, &meta.etag, meta.last_modified).map_err(|err| {
             if *err.code() == S3ErrorCode::NotModified {
                 s3_error!(
@@ -69,7 +91,39 @@ impl Source {
                 err
             }
         })?;
-        Ok(Self { path, meta })
+        let cold = tier::locate(dal, bucket, key, &path, &meta)?;
+        Ok(Self {
+            path,
+            meta,
+            version_id,
+            cold,
+            pin: None,
+        })
+    }
+
+    /// The object stat'ed as `m` at `path`, the key's or an archived version's entry, read whole
+    /// by a lifecycle move. A hot one's read is pinned to that stat where the backend can, so an
+    /// object written in between fails the read instead of being moved under the stat's stub.
+    pub(super) fn stated(
+        dal: &S3Dal,
+        bucket: &str,
+        key: &str,
+        path: &str,
+        m: &opendal::Metadata,
+    ) -> S3Result<Self> {
+        let meta = meta::resolve(&dal.profile, m);
+        let cold = tier::locate(dal, bucket, key, path, &meta)?;
+        let pin = m
+            .etag()
+            .filter(|_| cold.is_none() && dal.op.info().capability().read_with_if_match)
+            .map(str::to_owned);
+        Ok(Self {
+            path: path.to_owned(),
+            meta,
+            version_id: None,
+            cold,
+            pin,
+        })
     }
 
     /// What the bytes [`Self::read`] returns for `range` must match, in the form an upload's
@@ -119,7 +173,17 @@ impl Source {
         if range.is_empty() {
             return Ok(stream::empty().boxed());
         }
-        let reader = dal.op.reader(&self.path).await.map_err(read_err)?;
+        if let Some(cold) = &self.cold {
+            let chunks = cold.stream(dal, range).await?;
+            return Ok(chunks
+                .map_err(|err| read_err(tier::opendal_error(err)))
+                .boxed());
+        }
+        let reader = match &self.pin {
+            Some(etag) => dal.op.reader_with(&self.path).if_match(etag).await,
+            None => dal.op.reader(&self.path).await,
+        }
+        .map_err(read_err)?;
         let chunks = reader.into_stream(range).await.map_err(read_err)?;
         Ok(chunks.map_ok(|b| b.to_bytes()).map_err(read_err).boxed())
     }
@@ -129,6 +193,7 @@ pub(super) async fn copy_object(
     dal: &S3Dal,
     req: S3Request<CopyObjectInput>,
 ) -> S3Result<S3Response<CopyObjectOutput>> {
+    let origin = Origin::of(&req);
     let mut input = req.input;
     unsupported::refuse_new_object_features!(input)?;
     unsupported::refuse_sse_c(
@@ -176,16 +241,12 @@ pub(super) async fn copy_object(
     } else {
         None
     };
+    // Copying an older version onto its key restores it as the latest, which needs no change.
     let onto_itself = matches!(
         &input.copy_source,
-        CopySource::Bucket { bucket, key, .. } if **bucket == *input.bucket && **key == *input.key
+        CopySource::Bucket { bucket, key, version_id }
+            if **bucket == *input.bucket && **key == *input.key && version_id.is_none()
     );
-    if onto_itself && !replace {
-        return Err(s3_error!(
-            InvalidRequest,
-            "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes."
-        ));
-    }
 
     let source_cond = Conditions {
         if_match: input.copy_source_if_match.as_ref(),
@@ -195,23 +256,65 @@ pub(super) async fn copy_object(
     };
     let source = Source::resolve(dal, &input.copy_source, &source_cond).await?;
     let src = &source.meta;
+    let len = src.content_length;
+    // The copy's class is the request's, STANDARD when it names none, as on AWS; an empty object
+    // has nothing to move and stays hot (cold-tier.md "Writes into a tier").
+    let tier = dal
+        .tier_for_class(input.storage_class.as_ref().map(StorageClass::as_str))
+        .filter(|_| len > 0);
+    // A self-copy is how S3 changes an object's class, a cold one's back to STANDARD included
+    // (cold-tier.md "Moving back"). The class compared is the one the copy would report, so a
+    // class no tier has, stored hot as STANDARD, changes nothing.
+    let changes_class = tier.map(|t| t.storage_class.as_str()) != dal.storage_class(src);
+    if onto_itself && !replace && !changes_class {
+        return Err(s3_error!(
+            InvalidRequest,
+            "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes."
+        ));
+    }
     let attrs = replaced.unwrap_or_else(|| src.attrs.clone());
     let profile = &dal.profile;
-    let len = src.content_length;
+    usage::check_write(dal, &input.bucket, &input.key, Some(len)).await?;
 
     // An MD5 ETag is known before the write (C1), so it is stored with the copy and the stream
     // is verified against it. Stored checksums are carried and verified the same way; the part
-    // layout is not, because a copy is a single part.
+    // layout is not, because a copy is a single part. A copy into a tier hashes the MD5 on the
+    // way instead: its stub is written after the bytes.
     let headers = source.expected(0..len, input.checksum_algorithm.take())?;
-    let buffered = !profile.native_etag
+    let buffered = tier.is_none()
+        && !profile.native_etag
         && headers.content_md5.is_none()
         && len <= dal.settings().etag_buffer_limit;
-    let mut check = BodyCheck::new(&headers, buffered)?;
-    let dest = Dest::new(dal, &input.bucket, &input.key);
+    let mut check = BodyCheck::new(&headers, buffered || tier.is_some())?;
+    let dest = Dest::for_write(dal, &input.bucket, &input.key).await?;
     dest.check(cond).await?;
     let mut body = source.read(dal, 0..len).await?;
     let no_trailer = |_: &str| None;
 
+    if let Some(tier) = tier {
+        let (verified, etag, modified) = dest
+            .write_cold(
+                tier,
+                attrs,
+                &mut body,
+                &mut check,
+                no_trailer,
+                cond,
+                Some(len),
+            )
+            .await
+            .map_err(source_changed)?;
+        return Ok(copied(
+            dal,
+            &input,
+            origin,
+            &source,
+            &dest,
+            etag,
+            verified.checksum,
+            Some(modified),
+        ));
+    }
     let (etag, checksum, closed) = if buffered {
         let mut chunks = Vec::new();
         while let Some(chunk) = body.next().await {
@@ -261,8 +364,39 @@ pub(super) async fn copy_object(
         Some(etag) => etag,
         None => dest.written_etag(closed, len).await?,
     };
+    Ok(copied(
+        dal,
+        &input,
+        origin,
+        &source,
+        &dest,
+        etag,
+        checksum,
+        last_modified,
+    ))
+}
 
-    Ok(S3Response::new(CopyObjectOutput {
+/// The answer to a copy that committed, after its event.
+#[allow(clippy::too_many_arguments)]
+fn copied(
+    dal: &S3Dal,
+    input: &CopyObjectInput,
+    origin: Origin,
+    source: &Source,
+    dest: &Dest<'_>,
+    etag: String,
+    checksum: Checksum,
+    last_modified: Option<SystemTime>,
+) -> S3Response<CopyObjectOutput> {
+    let len = source.meta.content_length;
+    dal.emit(ObjectEvent {
+        size: Some(len),
+        etag: Some(etag.clone()),
+        version: dest.event_version(),
+        usage: dest.usage(len),
+        ..ObjectEvent::new(EventKind::Copy, &input.bucket, &input.key, origin)
+    });
+    S3Response::new(CopyObjectOutput {
         copy_object_result: Some(CopyObjectResult {
             e_tag: Some(ETag::Strong(etag)),
             last_modified: last_modified.map(Timestamp::from),
@@ -278,8 +412,10 @@ pub(super) async fn copy_object(
             checksum_xxhash128: checksum.checksum_xxhash128,
             ..Default::default()
         }),
+        copy_source_version_id: source.version_id.clone(),
+        version_id: dest.response_version_id(),
         ..Default::default()
-    }))
+    })
 }
 
 /// Reads a `COPY` / `REPLACE` directive; `COPY` is the default.

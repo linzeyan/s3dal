@@ -16,18 +16,26 @@ use uuid::Uuid;
 use super::{parse_upload_id, record, remove_dir, upload_dir, uploads_dir};
 use crate::S3Dal;
 use crate::backend::RESERVED_ROOT;
+use crate::s3::bucket_state;
+use crate::s3::lifecycle::{self, Lifecycle};
 use crate::s3::naming::{bucket_dir, validate_bucket_name};
 
 /// Removes every stale upload directory and returns how many it removed. One that cannot be
-/// read or removed is logged and left for the next sweep.
+/// read or removed is logged and left for the next sweep. The active uploads it keeps become
+/// the metrics' count, which the requests of this process only move up and down from there:
+/// the sweep is what sees those of other processes on the same backend, and those from before
+/// the start.
 pub(in crate::s3) async fn sweep(dal: &S3Dal, age: Duration) -> anyhow::Result<usize> {
     let root = format!("{RESERVED_ROOT}uploads/");
     let buckets = match dal.op.list(&root).await {
         Ok(entries) => entries,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            dal.metrics().set_multipart_open(0);
+            return Ok(0);
+        }
         Err(err) => return Err(err).context("cannot list multipart uploads"),
     };
-    let mut removed = 0;
+    let (mut removed, mut active) = (0, 0);
     for entry in buckets {
         // s3dal names this directory only after a bucket it has checked, so anything else here
         // is not its own and stays.
@@ -37,35 +45,66 @@ pub(in crate::s3) async fn sweep(dal: &S3Dal, age: Duration) -> anyhow::Result<u
         if entry.path() == root || validate_bucket_name(bucket).is_err() {
             continue;
         }
-        match sweep_bucket(dal, bucket, age).await {
-            Ok(n) => removed += n,
+        match sweep_bucket(dal, bucket, Some(age), SystemTime::now()).await {
+            Ok((r, a)) => (removed, active) = (removed + r, active + a),
             Err(err) => tracing::warn!(bucket, error = %err, "cannot sweep multipart uploads"),
         }
     }
+    dal.metrics().set_multipart_open(active);
     Ok(removed)
 }
 
-async fn sweep_bucket(dal: &S3Dal, bucket: &str, age: Duration) -> anyhow::Result<usize> {
+/// Aborts the bucket's incomplete uploads that its lifecycle rules (`AbortIncompleteMultipartUpload`)
+/// name, as of `now`, and nothing else; for the lifecycle job, so the rules apply also where the
+/// stale-upload sweep is off. Returns how many it aborted.
+pub(in crate::s3) async fn abort_by_lifecycle(
+    dal: &S3Dal,
+    bucket: &str,
+    now: SystemTime,
+) -> anyhow::Result<usize> {
+    sweep_bucket(dal, bucket, None, now)
+        .await
+        .map(|(removed, _)| removed)
+}
+
+/// How many uploads it removed, and how many active ones it kept. An active upload that one of
+/// the bucket's abort rules covers goes by the rule; every other upload once it was last used
+/// `age` ago, and with no `age` never.
+async fn sweep_bucket(
+    dal: &S3Dal,
+    bucket: &str,
+    age: Option<Duration>,
+    now: SystemTime,
+) -> anyhow::Result<(usize, usize)> {
     let exists = match dal.op.stat(&bucket_dir(bucket)).await {
         Ok(m) => m.is_dir(),
         Err(err) if err.kind() == ErrorKind::NotFound => false,
         Err(err) => return Err(err).context("cannot look up the bucket"),
     };
-    let now = SystemTime::now();
     // The uploads of a bucket that is gone are stale at once, but only those that predate this
-    // check: a newer one belongs to a bucket created again under the same name since.
-    let cutoff = if exists {
-        now.checked_sub(age).unwrap_or(UNIX_EPOCH)
+    // check: a newer one belongs to a bucket created again under the same name since. Its rules,
+    // if any were left behind, no longer apply.
+    let (cutoff, lifecycle) = if exists {
+        let state = bucket_state::get(dal, bucket)
+            .await
+            .map_err(|err| anyhow::anyhow!("cannot read the bucket's state: {err}"))?;
+        let cutoff = age.map(|age| now.checked_sub(age).unwrap_or(UNIX_EPOCH));
+        (cutoff, state.lifecycle.clone())
     } else {
-        now
+        (Some(now), None)
+    };
+    let rules = Rules {
+        cutoff,
+        lifecycle: lifecycle.as_ref(),
+        now,
     };
     let dir = uploads_dir(bucket);
     let entries = match dal.op.list(&dir).await {
         Ok(entries) => entries,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok((0, 0)),
         Err(err) => return Err(err).context("cannot list the bucket's uploads"),
     };
-    let mut removed = 0;
+    let (mut removed, mut active) = (0, 0);
     for entry in entries {
         let Some(id) = entry
             .name()
@@ -74,9 +113,10 @@ async fn sweep_bucket(dal: &S3Dal, bucket: &str, age: Duration) -> anyhow::Resul
         else {
             continue;
         };
-        match sweep_upload(dal, bucket, id, cutoff).await {
-            Ok(true) => removed += 1,
-            Ok(false) => {}
+        match sweep_upload(dal, bucket, id, &rules).await {
+            Ok(Swept::Removed) => removed += 1,
+            Ok(Swept::Active) => active += 1,
+            Ok(Swept::Kept) => {}
             Err(err) => tracing::warn!(bucket, %id, error = %err, "cannot sweep multipart upload"),
         }
     }
@@ -85,36 +125,67 @@ async fn sweep_bucket(dal: &S3Dal, bucket: &str, age: Duration) -> anyhow::Resul
         // empty, and the non-recursive delete then fails and leaves it.
         let _ = dal.op.delete(&dir).await;
     }
-    Ok(removed)
+    Ok((removed, active))
 }
 
-/// Removes the upload if it was last used before `cutoff`: initiated, for an active upload,
+/// When an upload of one bucket is stale.
+struct Rules<'a> {
+    /// Last used before this; `None`: only the lifecycle rules remove anything.
+    cutoff: Option<SystemTime>,
+    lifecycle: Option<&'a Lifecycle>,
+    now: SystemTime,
+}
+
+enum Swept {
+    Removed,
+    /// Kept, and neither completed nor aborted.
+    Active,
+    Kept,
+}
+
+/// Removes the upload if it was last used before the cutoff: initiated, for an active upload,
 /// whatever happened since, as AWS lifecycle rules count (`DaysAfterInitiation`); completed, for
 /// a completed one; and for a directory without `upload.json`, when anything in it was last
-/// written.
+/// written. An active upload one of the bucket's abort rules covers goes by that rule instead.
 async fn sweep_upload(
     dal: &S3Dal,
     bucket: &str,
     id: Uuid,
-    cutoff: SystemTime,
-) -> anyhow::Result<bool> {
+    rules: &Rules<'_>,
+) -> anyhow::Result<Swept> {
     let dir = upload_dir(bucket, id);
     // A Complete of this upload in this process finishes first; its record then counts as
     // fresh. Elsewhere the sweep can race one, which then either fails or commits a whole
     // object, because it aborts its write when part data is missing.
     let _lock = dal.upload_locks.lock(&dir).await;
-    let last_used = match record::load_upload_at(dal, &dir).await {
-        Ok(Some(upload)) => Some(upload.completed.map_or(upload.initiated, |done| done.at)),
-        Ok(None) => last_written(dal, &dir).await?,
+    let (last_used, active, deadline) = match record::load_upload_at(dal, &dir).await {
+        Ok(Some(upload)) => {
+            let active = upload.completed.is_none();
+            let deadline = active
+                .then(|| lifecycle::abort_due(rules.lifecycle, &upload.key, upload.initiated))
+                .flatten();
+            let last_used = upload
+                .completed
+                .as_ref()
+                .map_or(upload.initiated, |done| done.at);
+            (Some(last_used), active, deadline)
+        }
+        Ok(None) => (last_written(dal, &dir).await?, false, None),
         Err(err) => anyhow::bail!("cannot read upload.json: {err}"),
     };
-    if !last_used.is_some_and(|t| t < cutoff) {
-        return Ok(false);
+    let stale = match deadline {
+        Some(due) => rules.now >= due,
+        None => rules
+            .cutoff
+            .is_some_and(|cutoff| last_used.is_some_and(|t| t < cutoff)),
+    };
+    if !stale {
+        return Ok(if active { Swept::Active } else { Swept::Kept });
     }
     remove_dir(dal, &dir)
         .await
         .map_err(|err| anyhow::anyhow!("cannot remove: {err}"))?;
-    Ok(true)
+    Ok(Swept::Removed)
 }
 
 /// When anything in `dir` was last written; `None` when nothing tells, which keeps the

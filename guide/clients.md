@@ -37,6 +37,13 @@ access_key_id = my-access-key
 secret_access_key = my-secret-key
 ```
 
+With a write-only key pair (a drop box), rclone must not look at what it uploads or at the
+destination, none of which such a pair may do: add `--s3-no-head` (no HEAD after an upload),
+`--s3-no-check-bucket` (no bucket check or creation) and `--no-check-dest` (no listing of the
+destination first), for example `rclone copy --s3-no-head --s3-no-check-bucket --no-check-dest
+./outbox s3dal:inbox/`. `aws s3 cp` of a local file needs nothing extra; `aws s3 sync` lists
+the destination and fails.
+
 SDKs: set the endpoint, the region, and path style. With the Rust SDK:
 
 ```rust

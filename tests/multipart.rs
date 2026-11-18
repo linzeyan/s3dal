@@ -1147,8 +1147,8 @@ async fn delete_bucket_removes_its_uploads() {
 
 #[tokio::test]
 async fn the_stale_upload_sweep_removes_exactly_what_went_stale() {
-    // s3dal has no lifecycle rules, so without the sweep an abandoned upload would hold its
-    // parts forever. It must take every kind of stale entry, judged by times every backend has,
+    // Without an abort rule, which few buckets have, an abandoned upload would hold its parts
+    // forever but for the sweep. It must take every kind of stale entry, judged by times every backend has,
     // and nothing a client may still use: an upload in progress, or the record a retried
     // Complete needs. What exists before the wait below is stale and what comes after it is
     // not: each sweep's age reaches back to the end of the wait and a margin further, however

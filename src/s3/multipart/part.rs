@@ -181,6 +181,7 @@ pub(in crate::s3) async fn upload_part_copy(
         if_unmodified_since: input.copy_source_if_unmodified_since.as_ref(),
     };
     let source = Source::resolve(dal, &input.copy_source, &source_cond).await?;
+    let copy_source_version_id = source.version_id.clone();
     let len = source.meta.content_length;
     let range = match &input.copy_source_range {
         Some(header) => copy_source_range(header, len)?,
@@ -214,6 +215,7 @@ pub(in crate::s3) async fn upload_part_copy(
             checksum_xxhash3: checksum.checksum_xxhash3,
             checksum_xxhash128: checksum.checksum_xxhash128,
         }),
+        copy_source_version_id,
         ..Default::default()
     }))
 }

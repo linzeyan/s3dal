@@ -31,8 +31,20 @@ pub const META_CONTENT_ENCODING: &str = "s3dal-content-encoding";
 pub const META_CONTENT_LANGUAGE: &str = "s3dal-content-language";
 pub const META_EXPIRES: &str = "s3dal-expires";
 pub const META_PARTS: &str = "s3dal-parts";
+/// Set on an object written while its bucket had versioning enabled; one without it is the
+/// `null` version (versioning.md "Reserved keys").
+pub const META_VERSION_ID: &str = "s3dal-version-id";
+/// The version's Last-Modified, in nanoseconds since the epoch, on an archived copy of it on an
+/// object store, whose own mtime is when it was copied (versioning.md "V2").
+pub const META_LAST_MODIFIED: &str = "s3dal-last-modified";
 /// Followed by the lowercase algorithm name, for example `s3dal-checksum-crc32`.
 pub const META_CHECKSUM_PREFIX: &str = "s3dal-checksum-";
+/// On a cold object's stub: the tier its bytes are in (cold-tier.md "The stub").
+pub const META_TIER: &str = "s3dal-tier";
+/// On a stub: the id of its tier object, 32 lowercase hex digits.
+pub const META_TIER_ID: &str = "s3dal-tier-id";
+/// On a stub: the object's size, which the empty stub itself does not have.
+pub const META_SIZE: &str = "s3dal-size";
 
 /// What AWS S3 reports when an object was stored without a Content-Type.
 pub const DEFAULT_CONTENT_TYPE: &str = "binary/octet-stream";
@@ -96,6 +108,32 @@ pub struct ObjectMeta {
     /// Only the checksums that were stored with the object.
     pub checksum: Checksum,
     pub parts: Option<PartLayout>,
+    /// `None` for the `null` version.
+    pub version_id: Option<String>,
+    /// Set on a cold object: the stub at its path names where its bytes are.
+    pub tier: Option<TierRef>,
+}
+
+/// Where a cold object's bytes are, as its stub names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierRef {
+    /// The tier's configured name.
+    pub name: String,
+    /// The tier object's id. `None` for a damaged stub, whose id or size is missing or
+    /// malformed: its bytes cannot be found, or would be served under a wrong length, so every
+    /// read of it fails rather than answering an empty 200.
+    pub id: Option<String>,
+}
+
+/// What a stub stores beyond a hot object's metadata (cold-tier.md "The stub"). ETag and
+/// Last-Modified are stored always, native profiles included: the stub's own are those of an
+/// empty object written at another time.
+pub struct Stub<'a> {
+    pub tier: &'a str,
+    pub id: &'a str,
+    pub size: u64,
+    pub etag: &'a str,
+    pub last_modified: SystemTime,
 }
 
 impl ObjectMeta {
@@ -180,9 +218,16 @@ pub fn resolve(profile: &Profile, m: &opendal::Metadata) -> ObjectMeta {
     let pick = |native: bool, native_value: Option<&str>, key: &str| {
         if native { native_value } else { reserved(key) }.map(str::to_owned)
     };
-    let last_modified = m.last_modified().map(SystemTime::from);
+    // A stored Last-Modified marks an archived copy of a version on an object store, whose own
+    // mtime and ETag are the copy's, not the version's; there the stored values win, also over
+    // native ETags (versioning.md "V2"). Anywhere else a stored ETag on a native profile is
+    // stale (another tool may copy reserved keys along) and the backend's own is the truth.
+    let archived_at = reserved(META_LAST_MODIFIED)
+        .and_then(|nanos| nanos.parse::<u64>().ok())
+        .map(|nanos| UNIX_EPOCH + std::time::Duration::from_nanos(nanos));
+    let last_modified = archived_at.or_else(|| m.last_modified().map(SystemTime::from));
 
-    let etag = if profile.native_etag {
+    let etag = if profile.native_etag && archived_at.is_none() {
         m.etag().map(unquote)
     } else {
         reserved(META_ETAG).map(str::to_owned)
@@ -226,14 +271,130 @@ pub fn resolve(profile: &Profile, m: &opendal::Metadata) -> ObjectMeta {
         *field(&mut checksum) = reserved(&checksum_key(name)).map(str::to_owned);
     }
 
+    // A stub is empty and names its tier. A client cannot set `s3dal-tier`, so an empty object
+    // written through S3 is never one; a stub another tool filled with content is hot again.
+    let mut content_length = m.content_length();
+    let tier = reserved(META_TIER)
+        .filter(|_| content_length == 0)
+        .map(|name| {
+            let size = reserved(META_SIZE).and_then(|s| s.parse::<u64>().ok());
+            let id = reserved(META_TIER_ID).filter(|id| is_tier_id(id));
+            if let (Some(size), Some(_)) = (size, id) {
+                content_length = size;
+            }
+            TierRef {
+                name: name.to_owned(),
+                id: id.filter(|_| size.is_some()).map(str::to_owned),
+            }
+        });
+
     ObjectMeta {
         etag,
-        content_length: m.content_length(),
+        content_length,
         last_modified,
         attrs,
         checksum,
         parts: reserved(META_PARTS).and_then(PartLayout::decode),
+        version_id: reserved(META_VERSION_ID).map(str::to_owned),
+        tier,
     }
+}
+
+/// The size an object has as S3 reports it: a stub's stored size, else the backend's length.
+/// Usage and quota count this, wherever the bytes are.
+pub fn size(profile: &Profile, m: &opendal::Metadata) -> u64 {
+    resolve(profile, m).content_length
+}
+
+/// 32 lowercase hex digits, as tier object ids are made.
+pub fn is_tier_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Stores `stub` with what `opts` writes, so the empty object written is the cold object's stub.
+pub fn set_stub(profile: &Profile, opts: &mut WriteOptions, stub: &Stub<'_>) {
+    set_reserved(profile, opts, META_TIER, stub.tier.to_owned());
+    set_reserved(profile, opts, META_TIER_ID, stub.id.to_owned());
+    set_reserved(profile, opts, META_SIZE, stub.size.to_string());
+    set_reserved(profile, opts, META_ETAG, stub.etag.to_owned());
+    if let Ok(nanos) = stub.last_modified.duration_since(UNIX_EPOCH) {
+        set_reserved(
+            profile,
+            opts,
+            META_LAST_MODIFIED,
+            nanos.as_nanos().to_string(),
+        );
+    }
+}
+
+/// Stores `version_id` with the object `opts` writes. The id is chosen before the write opens,
+/// as every gateway-owned value is (C1). Setting it again with the same id changes nothing.
+pub fn set_version_id(profile: &Profile, opts: &mut WriteOptions, version_id: &str) {
+    set_reserved(profile, opts, META_VERSION_ID, version_id.to_owned());
+}
+
+fn set_reserved(profile: &Profile, opts: &mut WriteOptions, key: &str, value: String) {
+    let name = if profile.encoded_metadata_names {
+        encode_name(key)
+    } else {
+        key.to_owned()
+    };
+    opts.user_metadata
+        .get_or_insert_with(HashMap::new)
+        .insert(name, value);
+}
+
+/// Options for a copy of the version `obj` that keeps everything S3 reports about it. An
+/// `archived` copy, in the versions tree, also stores the ETag and Last-Modified, which the copy
+/// itself does not keep (see [`resolve`]); a copy promoted back to the key is a current object
+/// again, with the backend's mtime and, where ETags are native, the backend's ETag. A stub's
+/// copy, archived or promoted, is a stub again with all of its fields: its own ETag and time are
+/// an empty object's, never the version's.
+pub fn version_copy_options(profile: &Profile, obj: &ObjectMeta, archived: bool) -> WriteOptions {
+    let computed = Computed {
+        md5_hex: Some(obj.etag.clone()),
+        checksum: obj.checksum.clone(),
+        parts: obj.parts,
+    };
+    let mut opts = write_options(profile, obj.attrs.clone(), computed);
+    if let Some(id) = &obj.version_id {
+        set_version_id(profile, &mut opts, id);
+    }
+    if let Some(TierRef { name, id: Some(id) }) = &obj.tier
+        && let Some(last_modified) = obj.last_modified
+    {
+        set_stub(
+            profile,
+            &mut opts,
+            &Stub {
+                tier: name,
+                id,
+                size: obj.content_length,
+                etag: &obj.etag,
+                last_modified,
+            },
+        );
+        return opts;
+    }
+    if let Some(damaged) = &obj.tier {
+        // Copied without its tier it would read as an empty object; damaged it fails reads.
+        set_reserved(profile, &mut opts, META_TIER, damaged.name.clone());
+    }
+    if archived {
+        set_reserved(profile, &mut opts, META_ETAG, obj.etag.clone());
+        if let Some(nanos) = obj
+            .last_modified
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        {
+            set_reserved(
+                profile,
+                &mut opts,
+                META_LAST_MODIFIED,
+                nanos.as_nanos().to_string(),
+            );
+        }
+    }
+    opts
 }
 
 /// Options for writing an object with `attrs`. See [`Computed`] for what may be passed.
@@ -578,6 +739,125 @@ mod tests {
         assert_eq!(meta.etag, "xyz");
         assert_eq!(meta.content_type(), "image/png");
         assert_eq!(meta.attrs.cache_control, None);
+    }
+
+    #[test]
+    fn an_archived_copy_keeps_the_versions_etag_and_time_on_a_native_profile() {
+        // The copy's own ETag (an upstream's multipart one, say) and mtime are the copy's; the
+        // version must keep what clients saw. A promoted copy is a current object again, and
+        // there the backend's own values hold, as ListObjects reads them without a stat.
+        let version = ObjectMeta {
+            etag: "abc-2".to_owned(),
+            content_length: 5,
+            last_modified: Some(UNIX_EPOCH + std::time::Duration::from_nanos(1_234_567_891)),
+            attrs: Attrs::default(),
+            checksum: Checksum::default(),
+            parts: None,
+            version_id: Some("v".to_owned()),
+            tier: None,
+        };
+        let as_copied = |archived| {
+            let opts = version_copy_options(&NATIVE, &version, archived);
+            let mut b = MetadataBuilder::file(5);
+            b.etag("\"copy\"");
+            b.last_modified(Timestamp::from_second(1_800_000_000).unwrap());
+            b.user_metadata(opts.user_metadata.unwrap());
+            resolve(&NATIVE, &b.build())
+        };
+        let archived = as_copied(true);
+        assert_eq!(archived.etag, "abc-2");
+        assert_eq!(archived.last_modified, version.last_modified);
+        assert_eq!(archived.version_id.as_deref(), Some("v"));
+        let promoted = as_copied(false);
+        assert_eq!(promoted.etag, "copy");
+        assert_ne!(promoted.last_modified, version.last_modified);
+        assert_eq!(promoted.version_id.as_deref(), Some("v"));
+    }
+
+    fn stub_metadata(profile: &Profile, len: u64, size: &str, id: &str) -> Metadata {
+        let mut opts = write_options(profile, Attrs::default(), Computed::default());
+        set_stub(
+            profile,
+            &mut opts,
+            &Stub {
+                tier: "hdd",
+                id: "0123456789abcdef0123456789abcdef",
+                size: 0,
+                etag: "abc",
+                last_modified: UNIX_EPOCH + Duration::from_secs(7),
+            },
+        );
+        let mut user = opts.user_metadata.unwrap();
+        let name = |key: &str| {
+            if profile.encoded_metadata_names {
+                encode_name(key)
+            } else {
+                key.to_owned()
+            }
+        };
+        user.insert(name(META_SIZE), size.to_owned());
+        user.insert(name(META_TIER_ID), id.to_owned());
+        let mut b = MetadataBuilder::file(len);
+        b.etag("\"d41d8cd98f00b204e9800998ecf8427e\"");
+        b.last_modified(Timestamp::from_second(1_800_000_000).unwrap());
+        b.user_metadata(user);
+        b.build()
+    }
+
+    #[test]
+    fn a_stub_reads_as_the_object_it_stands_for() {
+        // The stub is an empty object written at another time; clients must see the cold
+        // object's size, ETag and time, also where the backend's own ETag is native (its empty
+        // MD5 would make every cold object look the same and empty).
+        let id = "0123456789abcdef0123456789abcdef";
+        for profile in [GATEWAY, NATIVE, ENCODED] {
+            let obj = resolve(&profile, &stub_metadata(&profile, 0, "12", id));
+            assert_eq!(obj.content_length, 12);
+            assert_eq!(obj.etag, "abc");
+            assert_eq!(obj.last_modified, Some(UNIX_EPOCH + Duration::from_secs(7)));
+            assert_eq!(
+                obj.tier,
+                Some(TierRef {
+                    name: "hdd".into(),
+                    id: Some(id.into())
+                })
+            );
+            assert_eq!(size(&profile, &stub_metadata(&profile, 0, "12", id)), 12);
+        }
+        // Filled with content by another tool, it is hot again, with what it now holds.
+        let rewritten = resolve(&GATEWAY, &stub_metadata(&GATEWAY, 3, "12", id));
+        assert_eq!((rewritten.content_length, rewritten.tier), (3, None));
+    }
+
+    #[test]
+    fn a_stub_without_a_valid_size_or_id_is_damaged() {
+        // A guessed size or a missing id would serve wrong bytes or nothing under a 200; a
+        // damaged stub is marked so reads fail instead.
+        let id = "0123456789abcdef0123456789abcdef";
+        for (size, tier_id) in [("x", id), ("12", "nothex"), ("12", "")] {
+            let obj = resolve(&GATEWAY, &stub_metadata(&GATEWAY, 0, size, tier_id));
+            let tier = obj.tier.expect("still a stub");
+            assert_eq!(tier.id, None, "{size} {tier_id}");
+            assert_eq!(obj.content_length, 0);
+        }
+    }
+
+    #[test]
+    fn a_copy_of_a_stub_is_a_stub_archived_or_promoted() {
+        // Archiving and promotion copy the stub within the primary; a copy without the stub
+        // keys would be an empty hot object, and on promotion its stored ETag and time would
+        // give way to the copy's own, an empty object's.
+        let id = "0123456789abcdef0123456789abcdef";
+        let obj = resolve(&NATIVE, &stub_metadata(&NATIVE, 0, "12", id));
+        for archived in [true, false] {
+            let opts = version_copy_options(&NATIVE, &obj, archived);
+            let mut b = MetadataBuilder::file(0);
+            b.etag("\"other\"");
+            b.last_modified(Timestamp::from_second(1_900_000_000).unwrap());
+            b.user_metadata(opts.user_metadata.unwrap());
+            let copied = resolve(&NATIVE, &b.build());
+            assert_eq!(copied, obj, "archived: {archived}");
+        }
     }
 
     #[test]

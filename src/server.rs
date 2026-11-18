@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::path::Path;
@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::task::{self, Poll, ready};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -50,22 +50,41 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::Instrument;
 
 use crate::S3Dal;
-use crate::access::Limit;
+use crate::access::{Expiry, Limit, reads};
 use crate::config::{KeyPair, check_key_pairs};
 use crate::console::{self, Console};
 use crate::live::Live;
+use crate::metrics::{self, Metrics, RequestMetrics, Scrape};
 
 /// The service, signing with `auth`'s key pairs. With `console`, it also answers the console's
 /// settings API, for requests that came through the console's listener only.
-pub fn build_service(dal: S3Dal, auth: &LiveAuth, console: Option<Arc<Live>>) -> S3Service {
-    let mut b = S3ServiceBuilder::new(dal);
+pub fn build_service(dal: S3Dal, auth: &LiveAuth, console: Option<Arc<Live>>) -> Service {
+    let mut b = S3ServiceBuilder::new(dal.clone());
     b.set_auth(KeyAuth(auth.clone()));
-    b.set_access(Access(auth.clone()));
+    b.set_access(Access {
+        auth: auth.clone(),
+        dal: dal.clone(),
+    });
     b.set_host(LiveHost(auth.clone()));
     if let Some(live) = console {
         b.set_route(console::AdminRoute::new(live));
     }
-    b.build()
+    Service::new(b.build(), dal)
+}
+
+/// What [`serve`] serves: the S3 API, and beside it the metrics of `dal`, the S3Dal behind it,
+/// which also counts its requests.
+#[derive(Clone)]
+pub struct Service {
+    s3: S3Service,
+    dal: S3Dal,
+}
+
+impl Service {
+    /// For an `s3` built by hand; [`build_service`] builds one as the binary does.
+    pub fn new(s3: S3Service, dal: S3Dal) -> Self {
+        Self { s3, dal }
+    }
 }
 
 /// The key pairs and virtual-host domains of a running service. A config reload replaces both
@@ -78,10 +97,10 @@ struct Auth {
     secrets: HashMap<String, SecretKey>,
     /// Only the pairs that have limits.
     limits: HashMap<String, Arc<Limit>>,
+    /// Only the pairs that have an expiry.
+    expires: HashMap<String, Expiry>,
     /// `None` without domains: s3s's MultiDomain refuses an empty list.
     domains: Option<MultiDomain>,
-    /// Buckets whose objects an unsigned request may read.
-    public: HashSet<String>,
 }
 
 impl LiveAuth {
@@ -106,6 +125,10 @@ impl LiveAuth {
                 limits.insert(pair.access_key.clone(), Arc::new(limit));
             }
         }
+        let expires = key_pairs
+            .iter()
+            .filter_map(|p| Some((p.access_key.clone(), p.expires?)))
+            .collect();
         let domains = if domains.is_empty() {
             None
         } else {
@@ -114,25 +137,13 @@ impl LiveAuth {
                     .context("invalid domain for virtual-hosted-style requests")?,
             )
         };
-        // The public buckets are kept: they are set on their own, by `set_public`.
-        let mut auth = self.0.write().unwrap_or_else(PoisonError::into_inner);
-        auth.secrets = secrets;
-        auth.limits = limits;
-        auth.domains = domains;
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = Auth {
+            secrets,
+            limits,
+            expires,
+            domains,
+        };
         Ok(())
-    }
-
-    /// The buckets whose objects anyone may download, without a key pair. Nothing else about
-    /// them is open: listing them, writing to them and their settings still need a signature.
-    pub fn set_public(&self, buckets: &[String]) {
-        self.0
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .public = buckets.iter().cloned().collect();
-    }
-
-    pub(crate) fn is_public(&self, bucket: &str) -> bool {
-        self.read().public.contains(bucket)
     }
 
     /// The limits of the pair that signed, `None` when it has none.
@@ -154,11 +165,19 @@ struct KeyAuth(LiveAuth);
 
 #[async_trait::async_trait]
 impl S3Auth for KeyAuth {
+    /// Asked on every signed request, presigned URLs and form uploads included, so an expiry
+    /// takes effect at its instant without a reload. An expired pair is answered as an unknown
+    /// one: SDKs do not retry `InvalidAccessKeyId`, where an `AccessDenied` reads as a missing
+    /// permission someone could grant.
     async fn get_secret_key(&self, access_key: &str) -> S3Result<SecretKey> {
-        self.0
-            .read()
-            .secrets
+        let auth = self.0.read();
+        let expired = auth
+            .expires
             .get(access_key)
+            .is_some_and(|e| e.passed(SystemTime::now()));
+        auth.secrets
+            .get(access_key)
+            .filter(|_| !expired)
             .cloned()
             .ok_or_else(|| {
                 s3_error!(
@@ -196,12 +215,10 @@ impl S3Host for LiveHost {
 /// limits are checked here on the request's path, and in the per-operation methods below on
 /// what only the parsed input names: a listing's prefix, the keys of a batch delete, a form
 /// upload's key and a copy's source.
-struct Access(LiveAuth);
-
-/// Operations that change nothing. Everything else writes, or manages a bucket, which a pair
-/// with limits never may.
-fn reads(op: &str) -> bool {
-    ["Get", "Head", "List"].iter().any(|p| op.starts_with(p)) || op == "SelectObjectContent"
+struct Access {
+    auth: LiveAuth,
+    /// Where a bucket's state says whether it is public.
+    dal: S3Dal,
 }
 
 fn denied() -> S3Error {
@@ -210,7 +227,7 @@ fn denied() -> S3Error {
 
 impl Access {
     fn limit<T>(&self, req: &S3Request<T>) -> Option<Arc<Limit>> {
-        self.0.limit(req.credentials.as_ref())
+        self.auth.limit(req.credentials.as_ref())
     }
 
     fn listing<T>(&self, req: &S3Request<T>, bucket: &str, prefix: Option<&str>) -> S3Result<()> {
@@ -225,7 +242,7 @@ impl Access {
             return Ok(());
         };
         match source {
-            CopySource::Bucket { bucket, key, .. } if limit.reaches_key(bucket, key) => Ok(()),
+            CopySource::Bucket { bucket, key, .. } if limit.reads_key(bucket, key) => Ok(()),
             _ => Err(denied()),
         }
     }
@@ -234,12 +251,24 @@ impl Access {
 #[async_trait::async_trait]
 impl S3Access for Access {
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
+        // The first place s3s names the operation; a request refused before it stays Unknown.
+        crate::metrics::note_operation(cx.s3_op().name());
         // What s3s's default check does, but for downloads from a public bucket; replacing the
         // check must open no other anonymous access. An object's ACL, tags and attributes are
         // other operations, so they stay closed.
         if cx.credentials().is_none() {
-            let download = matches!(cx.s3_op().name(), "GetObject" | "HeadObject")
-                && matches!(cx.s3_path(), S3Path::Object { bucket, .. } if self.0.is_public(bucket));
+            let bucket = match cx.s3_path() {
+                S3Path::Object { bucket, .. }
+                    if matches!(cx.s3_op().name(), "GetObject" | "HeadObject") =>
+                {
+                    Some(bucket.to_string())
+                }
+                _ => None,
+            };
+            let download = match bucket {
+                Some(bucket) => self.dal.opens_downloads(&bucket).await?,
+                None => false,
+            };
             if !download {
                 return Err(s3_error!(AccessDenied, "Signature is required"));
             }
@@ -253,25 +282,24 @@ impl S3Access for Access {
         if expected_owner.iter().any(|h| cx.headers().contains_key(*h)) {
             return Err(expected_owner_not_implemented());
         }
-        let Some(limit) = self.0.limit(cx.credentials()) else {
+        let Some(limit) = self.auth.limit(cx.credentials()) else {
             return Ok(());
         };
         let op = cx.s3_op().name();
         let read = reads(op);
-        let allowed = match cx.s3_path() {
-            // ListBuckets, whose answer leaves out the buckets the pair does not reach.
-            S3Path::Root => read,
-            // Listings check their prefix once it is parsed. A batch delete and a form upload
-            // write objects, whose keys are checked in the same way; any other write to a
-            // bucket manages the bucket itself.
-            S3Path::Bucket { bucket } => {
-                limit.reaches_bucket(bucket)
-                    && (read || (limit.may_write() && matches!(op, "DeleteObjects" | "PostObject")))
-            }
-            S3Path::Object { bucket, key } => {
-                limit.reaches_key(bucket, key) && (read || limit.may_write())
-            }
-        };
+        let allowed = limit.permits(op)
+            && match cx.s3_path() {
+                // ListBuckets, whose answer leaves out the buckets the pair does not reach.
+                S3Path::Root => read,
+                // Listings check their prefix once it is parsed. A batch delete and a form
+                // upload write objects, whose keys are checked in the same way; any other write
+                // to a bucket manages the bucket itself.
+                S3Path::Bucket { bucket } => {
+                    limit.reaches_bucket(bucket)
+                        && (read || matches!(op, "DeleteObjects" | "PostObject"))
+                }
+                S3Path::Object { bucket, key } => limit.reaches_key(bucket, key),
+            };
         if !allowed {
             return Err(denied());
         }
@@ -419,6 +447,11 @@ impl RequestId {
 #[derive(Clone, Copy)]
 pub(crate) struct Scheme(pub(crate) &'static str);
 
+/// The address the connection a request came on was made from, for the `sourceIPAddress` of the
+/// event notifications it causes. Behind a proxy it is the proxy's, as on AWS behind a NAT.
+#[derive(Clone, Copy)]
+pub(crate) struct Peer(pub(crate) std::net::IpAddr);
+
 /// HTTPS with a PEM certificate chain and its private key, and the handle that replaces them
 /// while the server runs. Both are read and matched here, so a wrong path or a key that does
 /// not belong to the certificate stops the server at startup rather than failing every
@@ -516,7 +549,7 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// without warning.
 pub async fn serve(
     listener: TcpListener,
-    service: S3Service,
+    service: Service,
     tls: Option<TlsAcceptor>,
     shutdown: impl Future<Output = ()>,
 ) {
@@ -527,7 +560,7 @@ pub async fn serve(
 /// API of `service`, for the requests the console signs in the browser.
 pub async fn serve_console(
     listener: TcpListener,
-    service: S3Service,
+    service: Service,
     console: Arc<Console>,
     tls: Option<TlsAcceptor>,
     shutdown: impl Future<Output = ()>,
@@ -538,8 +571,16 @@ pub async fn serve_console(
 /// What a listener serves.
 #[derive(Clone)]
 enum Front {
-    S3(S3Service),
-    Console(S3Service, Arc<Console>),
+    S3(Service),
+    Console(Service, Arc<Console>),
+}
+
+impl Front {
+    fn metrics(&self) -> &Arc<Metrics> {
+        match self {
+            Self::S3(s) | Self::Console(s, _) => s.dal.metrics(),
+        }
+    }
 }
 
 async fn serve_front(
@@ -548,6 +589,7 @@ async fn serve_front(
     tls: Option<TlsAcceptor>,
     shutdown: impl Future<Output = ()>,
 ) {
+    front.metrics().start_sampling();
     let mut http = ConnBuilder::new(TokioExecutor::new());
     // hyper enforces the header timeout only with a timer. It also closes a keep-alive
     // connection idle for that long, which clients reconnect from.
@@ -560,9 +602,9 @@ async fn serve_front(
     let mut shutdown = std::pin::pin!(shutdown);
 
     loop {
-        let socket = tokio::select! {
+        let (socket, peer) = tokio::select! {
             res = listener.accept() => match res {
-                Ok((socket, _)) => socket,
+                Ok((socket, peer)) => (socket, Peer(peer.ip())),
                 Err(err) => {
                     tracing::error!(error = %err, "cannot accept connection");
                     // A connection reset before it was taken fails only itself; waiting would
@@ -589,7 +631,7 @@ async fn serve_front(
         // hold up the accept loop.
         tokio::spawn(async move {
             match tls {
-                None => serve_connection(http, socket, s3, watcher, Scheme("http")).await,
+                None => serve_connection(http, socket, s3, watcher, Scheme("http"), peer).await,
                 Some(tls) => match tokio::time::timeout(STALL_TIMEOUT, tls.accept(socket)).await {
                     Ok(Ok(stream)) => {
                         // ALPN has already chosen the protocol, so the first bytes need not be
@@ -598,7 +640,7 @@ async fn serve_front(
                             Some(b"h2") => http.http2_only(),
                             _ => http.http1_only(),
                         };
-                        serve_connection(http, stream, s3, watcher, Scheme("https")).await
+                        serve_connection(http, stream, s3, watcher, Scheme("https"), peer).await
                     }
                     // Plaintext requests to the HTTPS port end here, as do port scanners.
                     Ok(Err(err)) => tracing::debug!(error = %err, "TLS handshake failed"),
@@ -649,6 +691,7 @@ async fn serve_connection<I>(
     front: Front,
     mut watcher: watch::Receiver<()>,
     scheme: Scheme,
+    peer: Peer,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -658,7 +701,10 @@ async fn serve_connection<I>(
     let mut idle = requests.subscribe();
     let gateway = {
         let requests = requests.clone();
-        service_fn(move |req| {
+        let connection = front.metrics().connection();
+        service_fn(move |mut req: Request<Incoming>| {
+            connection.speaks(req.version() == hyper::Version::HTTP_2);
+            req.extensions_mut().insert(peer);
             let in_flight = InFlight::new(&requests);
             let front = front.clone();
             async move {
@@ -749,7 +795,21 @@ struct ResponseBody {
     body: Body,
     /// `None` for health checks, which a container polls every few seconds.
     log: Option<AccessLog>,
+    /// `None` for what is not an S3 request: health checks, scrapes and console pages.
+    metrics: Option<RequestMetrics>,
     _in_flight: InFlight,
+}
+
+impl ResponseBody {
+    /// For what is neither logged nor counted.
+    fn bare(body: Body, in_flight: InFlight) -> Self {
+        Self {
+            body,
+            log: None,
+            metrics: None,
+            _in_flight: in_flight,
+        }
+    }
 }
 
 impl hyper::body::Body for ResponseBody {
@@ -762,13 +822,19 @@ impl hyper::body::Body for ResponseBody {
     ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
         let this = &mut *self;
         let frame = ready!(Pin::new(&mut this.body).poll_frame(cx));
+        let sent = match &frame {
+            Some(Ok(frame)) => frame.data_ref().map_or(0, Bytes::len),
+            _ => 0,
+        };
+        // Per frame rather than at the end, so a download of minutes shows in the throughput
+        // while it runs.
+        if let Some(metrics) = &this.metrics {
+            metrics.sent(sent);
+        }
         if let Some(log) = &mut this.log {
-            match &frame {
-                Some(Ok(frame)) => {
-                    log.sent += frame.data_ref().map_or(0, |d| d.len() as u64);
-                }
-                None => log.ended = true,
-                Some(Err(_)) => {}
+            log.sent += sent as u64;
+            if frame.is_none() {
+                log.ended = true;
             }
         }
         Poll::Ready(frame)
@@ -915,15 +981,17 @@ struct RequestBody<B> {
     stall: Pin<Box<Sleep>>,
     waiting: bool,
     timed_out: Arc<AtomicBool>,
+    metrics: Arc<Metrics>,
 }
 
 impl<B> RequestBody<B> {
-    fn new(body: B, timed_out: Arc<AtomicBool>) -> Self {
+    fn new(body: B, timed_out: Arc<AtomicBool>, metrics: Arc<Metrics>) -> Self {
         Self {
             body,
             stall: Box::pin(tokio::time::sleep(STALL_TIMEOUT)),
             waiting: false,
             timed_out,
+            metrics,
         }
     }
 }
@@ -947,6 +1015,10 @@ where
         }
         if let Poll::Ready(frame) = Pin::new(&mut this.body).poll_frame(cx) {
             this.waiting = false;
+            if let Some(Ok(frame)) = &frame {
+                this.metrics
+                    .received(frame.data_ref().map_or(0, Bytes::len));
+            }
             return Poll::Ready(frame.map(|frame| frame.map_err(Into::into)));
         }
         if !this.waiting {
@@ -1198,6 +1270,72 @@ fn is_health_check(req: &Request<Incoming>) -> bool {
         && !signed
 }
 
+/// Prometheus metrics, beside the S3 API as the health check is, and on the console's port.
+/// Who may read them is the `metrics` setting's to say.
+pub const METRICS_PATH: &str = "/_s3dal/metrics";
+
+/// As for the health check, a request signed for S3 is never a scrape; a scraper's bearer
+/// token is no S3 signature.
+fn is_scrape(req: &Request<Incoming>) -> bool {
+    let signed = req
+        .headers()
+        .get(hyper::header::AUTHORIZATION)
+        .is_some_and(|v| {
+            !v.as_bytes()
+                .get(..7)
+                .is_some_and(|s| s.eq_ignore_ascii_case(b"bearer "))
+        })
+        || req
+            .uri()
+            .query()
+            .is_some_and(|q| q.contains("X-Amz-Signature="));
+    matches!(*req.method(), Method::GET | Method::HEAD)
+        && req.uri().path() == METRICS_PATH
+        && !signed
+}
+
+fn scrape(dal: &S3Dal, req: &Request<Incoming>) -> HttpResponse {
+    let settings = dal.settings();
+    let authorization = req
+        .headers()
+        .get(hyper::header::AUTHORIZATION)
+        .map(HeaderValue::as_bytes);
+    let token = settings.metrics_token.as_deref();
+    let (status, body) = match metrics::authorize(settings.metrics, token, authorization) {
+        Scrape::Allowed => (hyper::StatusCode::OK, dal.metrics().render()),
+        Scrape::Off => (
+            hyper::StatusCode::NOT_FOUND,
+            "metrics are off (metrics = \"off\")\n".to_owned(),
+        ),
+        Scrape::NoToken => (
+            hyper::StatusCode::FORBIDDEN,
+            "metrics need a token, and none is set: set metrics-token, or metrics = \"public\"\n"
+                .to_owned(),
+        ),
+        Scrape::Unauthorized => (
+            hyper::StatusCode::UNAUTHORIZED,
+            "metrics need Authorization: Bearer <metrics-token>\n".to_owned(),
+        ),
+    };
+    let mut res = HttpResponse::new(Body::from(body));
+    *res.status_mut() = status;
+    let kind = if status.is_success() {
+        // The version of the text format, which Prometheus reads from the header.
+        "text/plain; version=0.0.4; charset=utf-8"
+    } else {
+        "text/plain; charset=utf-8"
+    };
+    res.headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(kind));
+    if status == hyper::StatusCode::UNAUTHORIZED {
+        res.headers_mut().insert(
+            hyper::header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"s3dal metrics\""),
+        );
+    }
+    res
+}
+
 /// The access key a request is signed with, from the header or a presigned URL's query. Only
 /// for the access log: s3s verifies the signature, this only reads the claim.
 fn claimed_access_key(headers: &HeaderMap, uri: &hyper::Uri) -> Option<String> {
@@ -1266,19 +1404,19 @@ impl AccessLog {
 /// The console's listener: the S3 API under its prefix, marked as the console's so the settings
 /// API answers it, and the pages everywhere else.
 async fn handle_console(
-    s3: S3Service,
+    s3: Service,
     console: &Console,
     mut req: Request<Incoming>,
     scheme: Scheme,
     in_flight: InFlight,
 ) -> Result<Response<ResponseBody>, HttpError> {
+    if is_scrape(&req) {
+        let res = scrape(&s3.dal, &req);
+        return Ok(res.map(|body| ResponseBody::bare(body, in_flight)));
+    }
     let Some(uri) = console::s3_uri(req.uri()) else {
         let res = console.page(req.method(), req.uri().path());
-        return Ok(res.map(|body| ResponseBody {
-            body,
-            log: None,
-            _in_flight: in_flight,
-        }));
+        return Ok(res.map(|body| ResponseBody::bare(body, in_flight)));
     };
     *req.uri_mut() = uri;
     req.extensions_mut().insert(console::ConsoleRequest);
@@ -1296,7 +1434,7 @@ async fn handle_console(
 }
 
 async fn handle(
-    s3: S3Service,
+    s3: Service,
     mut req: Request<Incoming>,
     scheme: Scheme,
     in_flight: InFlight,
@@ -1305,12 +1443,14 @@ async fn handle(
     if is_health_check(&req) {
         let mut res = HttpResponse::new(Body::empty());
         id.stamp(&mut res);
-        return Ok(res.map(|body| ResponseBody {
-            body,
-            log: None,
-            _in_flight: in_flight,
-        }));
+        return Ok(res.map(|body| ResponseBody::bare(body, in_flight)));
     }
+    if is_scrape(&req) {
+        let res = scrape(&s3.dal, &req);
+        return Ok(res.map(|body| ResponseBody::bare(body, in_flight)));
+    }
+    let metrics = s3.dal.metrics();
+    let mut counted = metrics.request();
     join_content_encoding(req.headers_mut());
     // For work that outlives this call: CompleteMultipartUpload finishes in the response body.
     req.extensions_mut().insert(id.clone());
@@ -1335,8 +1475,13 @@ async fn handle(
         ))
     } else {
         let timed_out = Arc::new(AtomicBool::new(false));
-        let req = req.map(|body| Body::http_body(RequestBody::new(body, timed_out.clone())));
-        let res = S3Service::call(&s3, req).instrument(span).await?;
+        let req = req.map(|body| {
+            Body::http_body(RequestBody::new(body, timed_out.clone(), metrics.clone()))
+        });
+        let (res, operation) =
+            metrics::with_operation(S3Service::call(&s3.s3, req).instrument(span)).await;
+        counted.operation = operation;
+        let res = res?;
         // The failed read reaches s3s or s3dal as one of many errors, each mapped by its own
         // reader (IncompleteBody, MalformedPOSTRequest, InternalError); the answer is decided
         // here once, as AWS gives it.
@@ -1353,9 +1498,11 @@ async fn handle(
     id.stamp(&mut res);
     log.status = res.status().as_u16();
     log.code = error_code(&res);
+    counted.status = log.status;
     Ok(res.map(|body| ResponseBody {
         body,
         log: Some(log),
+        metrics: Some(counted),
         _in_flight: in_flight,
     }))
 }
@@ -1490,7 +1637,7 @@ mod tests {
         // busy writing to the backend; a client that stops must not hold its request for good.
         let (client, sent) = mpsc::unbounded_channel();
         let timed_out = Arc::new(AtomicBool::new(false));
-        let mut body = RequestBody::new(Arriving(sent), timed_out.clone());
+        let mut body = RequestBody::new(Arriving(sent), timed_out.clone(), Arc::default());
         let pause = STALL_TIMEOUT - Duration::from_secs(1);
 
         // Slower than the timeout in all, but never silent for as long.

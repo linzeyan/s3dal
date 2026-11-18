@@ -11,7 +11,8 @@ use super::{S3Dal, naming, object, unsupported};
 /// key acts for the same tenant, so the owner must not change with the key that asks or when
 /// keys rotate, and access key ids do not belong in responses. It has the 64-hex-digit form of
 /// a canonical user ID (it is the SHA-256 of `s3dal`) for clients that expect one.
-const OWNER_ID: &str = "f79ceb84c3cb7f5b57f5e928103eabda70d4351387693ea4c7be9feec207ab34";
+pub(super) const OWNER_ID: &str =
+    "f79ceb84c3cb7f5b57f5e928103eabda70d4351387693ea4c7be9feec207ab34";
 const OWNER_NAME: &str = "s3dal";
 
 pub(super) fn owner() -> Owner {
@@ -101,8 +102,7 @@ pub(super) async fn get_object_acl(
     let input = req.input;
     naming::require_bucket(dal, &input.bucket).await?;
     naming::validate_key(&input.key)?;
-    naming::require_null_version(input.version_id.as_deref())?;
-    object::stat_object(dal, &input.bucket, &input.key).await?;
+    object::stat_version(dal, &input.bucket, &input.key, input.version_id.as_deref()).await?;
     Ok(S3Response::new(GetObjectAclOutput {
         owner: Some(owner()),
         grants: Some(grants()),
@@ -127,7 +127,6 @@ pub(super) async fn put_object_acl(
         granted,
         input.access_control_policy.as_ref(),
     )?;
-    naming::require_null_version(input.version_id.as_deref())?;
-    object::stat_object(dal, &input.bucket, &input.key).await?;
+    object::stat_version(dal, &input.bucket, &input.key, input.version_id.as_deref()).await?;
     Ok(S3Response::new(PutObjectAclOutput::default()))
 }

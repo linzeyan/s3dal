@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use bytes::Bytes;
-use http::header::{CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue};
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, StatusCode};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqsign_aws_v4::{Credential, RequestSigner};
@@ -480,6 +480,40 @@ impl S3 {
         )
         .await?;
         Ok(())
+    }
+
+    /// A request to an s3dal console's settings API, `/_s3dal/admin/<path>`, with a JSON body
+    /// or none; returns the JSON answer. The console answers it under `/s3` and checks the
+    /// signature for the path without that prefix, as its own pages sign, so the URL signed and
+    /// the URL sent differ by it.
+    pub async fn admin(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<String>,
+    ) -> anyhow::Result<String> {
+        let mut headers = HeaderMap::new();
+        if body.is_some() {
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        }
+        let signed = format!("{}/_s3dal/admin/{path}", self.endpoint);
+        let parts = self.sign(method, &signed, headers, None).await?;
+        let sent = format!("{}/s3/_s3dal/admin/{path}", self.endpoint);
+        let mut req = self.http.request(parts.method, sent).headers(parts.headers);
+        if let Some(body) = body {
+            req = req.body(body);
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("cannot reach {}", self.endpoint))?;
+        let status = resp.status();
+        let request_id = request_id(resp.headers());
+        let text = resp.text().await.context("cannot read the response")?;
+        if !status.is_success() {
+            return Err(error_from(status, request_id, &text).into());
+        }
+        Ok(text)
     }
 
     /// A URL that grants `method` on the object to whoever holds it, until `expires` passes.

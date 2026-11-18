@@ -7,6 +7,7 @@
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::io;
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -17,11 +18,16 @@ use s3s::dto::{ETag, ETagCondition, Timestamp};
 use s3s::{S3Error, S3Result, s3_error};
 use tokio::sync::{Mutex, MutexGuard};
 
+use super::tier::{self, Removals};
 use super::upload::{BodyCheck, Verified};
-use super::{S3Dal, naming, precondition};
+use super::version::{self, Versioning};
+use super::{S3Dal, bucket_state, naming, precondition};
 use crate::backend::without_stalling;
 use crate::error::{Ctx, io_kind, map};
-use crate::meta::{self, ObjectMeta};
+use crate::events::Usage;
+use crate::meta::{self, Attrs, Computed, ObjectMeta, Stub};
+use crate::metrics::{TierStats, WriteOrigin};
+use crate::tier::Tier;
 
 /// Serializes commits to the same key within this process.
 ///
@@ -107,12 +113,12 @@ pub(super) struct DeleteCondition<'a> {
 }
 
 impl DeleteCondition<'_> {
-    fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.if_match.is_none() && self.last_modified.is_none() && self.size.is_none()
     }
 
     /// `current` is the object the key holds now, `None` when it holds none.
-    fn check(&self, current: Option<&ObjectMeta>) -> S3Result<()> {
+    pub(super) fn check(&self, current: Option<&ObjectMeta>) -> S3Result<()> {
         let etag = Precondition {
             if_match: self.if_match,
             if_none_match: None,
@@ -186,7 +192,7 @@ impl Expected {
 }
 
 /// What `path` holds, `None` when nothing a key could name is there.
-async fn stat_existing(dal: &S3Dal, path: &str) -> S3Result<Option<Metadata>> {
+pub(super) async fn stat_existing(dal: &S3Dal, path: &str) -> S3Result<Option<Metadata>> {
     match dal.op.stat(path).await {
         Ok(m) => Ok(Some(m)),
         Err(err) => {
@@ -239,17 +245,142 @@ pub(super) struct Dest<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
     pub path: String,
+    /// The bucket's state when the write began, which decides both the new version's id and
+    /// what happens to the version it replaces.
+    pub versioning: Versioning,
+    /// The new version's id, chosen before the write opens and stored with it (C1). `None` for
+    /// the `null` version.
+    pub version_id: Option<String>,
+    /// The bucket's usage is counted (it has a quota), so the commit finds out what it replaces.
+    pub tracked: bool,
+    /// What the commit replaced, found under the key's lock (see [`Self::archive`]).
+    replaced: std::sync::Mutex<Usage>,
+    /// The tier objects of the cold objects the commit replaced, removed once it committed.
+    removals: Removals,
 }
 
 impl<'a> Dest<'a> {
     /// The bucket must already be known to exist and the key to be valid.
-    pub(super) fn new(dal: &'a S3Dal, bucket: &'a str, key: &'a str) -> Self {
+    pub(super) fn versioned(
+        dal: &'a S3Dal,
+        bucket: &'a str,
+        key: &'a str,
+        versioning: Versioning,
+        version_id: Option<String>,
+        tracked: bool,
+    ) -> Self {
         Self {
             dal,
             bucket,
             key,
             path: naming::object_path(bucket, key),
+            versioning,
+            version_id,
+            tracked,
+            replaced: std::sync::Mutex::default(),
+            removals: Removals::default(),
         }
+    }
+
+    /// The destination of a write, with the bucket's versioning state read and, where it is
+    /// enabled, the new version's id chosen. Folder markers have no versions.
+    pub(super) async fn for_write(dal: &'a S3Dal, bucket: &'a str, key: &'a str) -> S3Result<Self> {
+        let versioning = version::state(dal, bucket).await?;
+        let tracked = bucket_state::tracked(dal, bucket).await?;
+        if versioning == Versioning::Unversioned || key.ends_with('/') {
+            return Ok(Self::versioned(dal, bucket, key, versioning, None, tracked));
+        }
+        version::check_archivable(dal, bucket, key)?;
+        let version_id = (versioning == Versioning::Enabled).then(version::new_id);
+        Ok(Self::versioned(
+            dal, bucket, key, versioning, version_id, tracked,
+        ))
+    }
+
+    /// What the committed write of `size` bytes changed in the bucket's usage, where it is
+    /// counted: a new object, less whatever the commit replaced. A folder marker holds nothing.
+    pub(super) fn usage(&self, size: u64) -> Option<Usage> {
+        if !self.tracked {
+            return None;
+        }
+        if self.key.ends_with('/') {
+            return Some(Usage::default());
+        }
+        let replaced = *self.replaced.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(Usage::object(size).minus(replaced))
+    }
+
+    /// The version the write made, as an event names it: `null` in a suspended bucket, none in
+    /// one that never had versioning.
+    pub(super) fn event_version(&self) -> Option<String> {
+        match self.versioning {
+            Versioning::Unversioned => None,
+            _ => Some(
+                self.version_id
+                    .clone()
+                    .unwrap_or_else(|| version::NULL.to_owned()),
+            ),
+        }
+    }
+
+    /// Stores the new version's id with what `opts` writes.
+    pub(super) fn stamp(&self, opts: &mut WriteOptions) {
+        if let Some(id) = &self.version_id {
+            meta::set_version_id(&self.dal.profile, opts, id);
+        }
+    }
+
+    /// `x-amz-version-id` for the response: only a new version's id. A write in a Suspended
+    /// bucket replaces the `null` version and, as on AWS (ceph's
+    /// `test_versioning_bucket_atomic_upload_return_version_id`), names no version.
+    pub(super) fn response_version_id(&self) -> Option<String> {
+        self.version_id.clone()
+    }
+
+    /// Keeps the version the write is about to replace (see [`version::archive`]). Called under
+    /// the key's lock, right before the commit. In a counted bucket it also notes what the write
+    /// replaces: in an unversioned one the current object, which takes a stat here, the only
+    /// place where the answer cannot change before the commit. With tiers configured that stat
+    /// is taken in every bucket, since a replaced cold object leaves a tier object to remove; a
+    /// server without tiers pays nothing more.
+    pub(super) async fn archive(&self) -> S3Result<()> {
+        // A commit that failed after an earlier archive must not remove what it then kept.
+        self.removals.clear();
+        let replaced = if self.versioning != Versioning::Unversioned {
+            version::archive(
+                self.dal,
+                self.bucket,
+                self.key,
+                &self.path,
+                self.versioning,
+                self.tracked,
+                &self.removals,
+            )
+            .await?
+        } else if (self.tracked || self.dal.has_tiers()) && !self.key.ends_with('/') {
+            match stat_existing(self.dal, &self.path)
+                .await?
+                .filter(Metadata::is_file)
+            {
+                Some(m) => {
+                    let obj = meta::resolve(&self.dal.profile, &m);
+                    self.removals.note(self.bucket, self.key, &obj);
+                    Usage::object(obj.content_length)
+                }
+                None => Usage::default(),
+            }
+        } else {
+            Usage::default()
+        };
+        *self.replaced.lock().unwrap_or_else(PoisonError::into_inner) = replaced;
+        Ok(())
+    }
+
+    /// Removes the tier objects of the cold objects the committed write replaced: after the
+    /// commit, so a crash in between leaves an orphan, never a stub naming nothing. Commits that
+    /// do not go through [`Self::commit`] call it once they succeeded.
+    pub(super) async fn remove_replaced(&self) {
+        self.removals.run(self.dal).await;
     }
 
     /// With `native_etag` the backend computes the ETag, and S3 computes an MD5 only for a body
@@ -272,6 +403,7 @@ impl<'a> Dest<'a> {
         mut opts: WriteOptions,
         cond: Precondition<'_>,
     ) -> S3Result<Writer> {
+        self.stamp(&mut opts);
         if let Some(expected) = self.expected(cond).await? {
             expected.apply(&mut opts);
         }
@@ -282,9 +414,12 @@ impl<'a> Dest<'a> {
             .map_err(write_err)
     }
 
-    /// Whether the write carries `cond` to the backend, which checks it where the write lands.
+    /// Whether the write carries a condition to the backend, which checks it where the write
+    /// lands: the client's, and for a version always one, so that a version another instance
+    /// commits in between is not replaced before it was archived (versioning.md "V2").
     fn backend_checks(&self, cond: Precondition<'_>) -> bool {
-        !cond.is_empty() && self.dal.profile.conditional_writes
+        let versioned = self.versioning != Versioning::Unversioned && !self.key.ends_with('/');
+        (!cond.is_empty() || versioned) && self.dal.profile.conditional_writes
     }
 
     /// Where the backend checks conditions, checks `cond` against what the key holds now and
@@ -332,15 +467,24 @@ impl<'a> Dest<'a> {
     pub(super) async fn commit(&self, mut w: Writer, cond: Precondition<'_>) -> S3Result<Metadata> {
         let result = {
             let _guard = self.dal.locks.lock(&self.path).await;
-            match self.check(cond).await {
+            // A close that fails after the archive leaves the version both current and
+            // archived; readers drop such a duplicate, and the next archive finds it there.
+            match async {
+                self.check(cond).await?;
+                self.archive().await
+            }
+            .await
+            {
                 Ok(()) => without_stalling(&self.dal.op, w.close())
                     .await
-                    .map_err(write_err),
+                    .map_err(|err| commit_err(err, cond)),
                 Err(err) => Err(err),
             }
         };
         if result.is_err() {
             self.abandon(&mut w).await;
+        } else {
+            self.remove_replaced().await;
         }
         result
     }
@@ -393,6 +537,202 @@ impl<'a> Dest<'a> {
         }
     }
 
+    /// Streams `body` into a new object in `tier` and commits a stub naming it at the key
+    /// (cold-tier.md "Writes into a tier"), verified with `check`, which must hash the MD5: the
+    /// stub stores it as the ETag. The tier object is closed before the key's lock is taken, so
+    /// a large body never holds it; the stub is the commit. A body that fails a check, a refused
+    /// condition or a failed stub removes the tier object again and leaves the key as it was.
+    /// Returns what was verified, the ETag and the Last-Modified the stub stores.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn write_cold<S>(
+        &self,
+        tier: &Tier,
+        attrs: Attrs,
+        mut body: S,
+        check: &mut BodyCheck,
+        trailer: impl Fn(&str) -> Option<String>,
+        cond: Precondition<'_>,
+        size: Option<u64>,
+    ) -> S3Result<(Verified, String, SystemTime)>
+    where
+        S: Stream<Item = S3Result<Bytes>> + Unpin,
+    {
+        // Held to the state found now, as a hot write's condition is from its open.
+        let expected = self.expected(cond).await?;
+        // What is known before the body: the tier object describes itself as far as C1 lets it.
+        let known = Computed {
+            md5_hex: check.content_md5().map(str::to_owned),
+            checksum: check.declared_checksum(),
+            parts: None,
+        };
+        let opts = meta::write_options(&tier.profile, attrs.clone(), known);
+        let mut w = self.open_cold(tier, opts, size).await?;
+        let streamed = async {
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk?;
+                check.update(&chunk)?;
+                w.write(chunk).await?;
+            }
+            check.finish(trailer)
+        }
+        .await;
+        let verified = match streamed {
+            Ok(verified) => verified,
+            Err(err) => {
+                w.abort().await;
+                return Err(err);
+            }
+        };
+        let closed = w.close().await?;
+
+        let etag = verified.md5_hex.clone().unwrap_or_default();
+        let computed = Computed {
+            md5_hex: Some(etag.clone()),
+            checksum: verified.checksum.clone(),
+            parts: None,
+        };
+        let size = check.received();
+        let modified = self
+            .commit_cold(closed, attrs, computed, size, &etag, expected, cond)
+            .await?;
+        Ok((verified, etag, modified))
+    }
+
+    /// Opens a writer for a new object in `tier` that will hold the key's bytes, `opts`
+    /// describing it under the tier's Profile. Every write gets a new id, so a tier object is
+    /// written once and never changes.
+    pub(super) async fn open_cold<'t>(
+        &self,
+        tier: &'t Tier,
+        mut opts: WriteOptions,
+        size: Option<u64>,
+    ) -> S3Result<ColdWriter<'t>> {
+        let holder = tier::holder(self.bucket, self.key);
+        version::check_fits(&tier.op, &holder, "to keep in its tier")?;
+        let id = tier::new_id();
+        let path = format!("{holder}{id}");
+        if let Some(version) = &self.version_id {
+            meta::set_version_id(&tier.profile, &mut opts, version);
+        }
+        opts.chunk = size.and_then(|n| chunk_for(&tier.op, n));
+        let stats = self.dal.metrics().tier(&tier.name);
+        let w = match tier.op.writer_options(&path, chunked(&tier.op, opts)).await {
+            Ok(w) => w,
+            Err(err) => {
+                stats.failed("write", err.kind().into_static());
+                return Err(write_err(err));
+            }
+        };
+        Ok(ColdWriter {
+            object: ColdObject { tier, id, path },
+            w,
+            stats,
+        })
+    }
+
+    /// Commits a stub naming `closed` at the key, as [`Self::commit`] commits a write: the
+    /// object of `size` bytes, with `attrs` and `computed`, under `etag`. A stub that does not
+    /// commit removes the tier object again, so the key stays as it was; one whose failure is
+    /// ambiguous keeps it (see [`remove_unless_named`]). Returns the Last-Modified the stub
+    /// stores.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn commit_cold(
+        &self,
+        closed: ColdObject<'_>,
+        attrs: Attrs,
+        computed: Computed,
+        size: u64,
+        etag: &str,
+        expected: Option<Expected>,
+        cond: Precondition<'_>,
+    ) -> S3Result<SystemTime> {
+        let ColdObject { tier, id, path } = closed;
+        let modified = SystemTime::now();
+        let mut opts = meta::write_options(&self.dal.profile, attrs, computed);
+        meta::set_stub(
+            &self.dal.profile,
+            &mut opts,
+            &Stub {
+                tier: &tier.name,
+                id: &id,
+                size,
+                etag,
+                last_modified: modified,
+            },
+        );
+        self.stamp(&mut opts);
+        if let Err(err) = self.commit_stub(opts, expected, cond).await {
+            remove_unless_named(self.dal, &self.path, tier, &id, &path).await;
+            return Err(err);
+        }
+        self.dal
+            .metrics()
+            .tier(&tier.name)
+            .wrote(WriteOrigin::Request, size);
+        Ok(modified)
+    }
+
+    /// Writes the stub `opts` describes at the key, as [`Self::commit`] commits a write.
+    async fn commit_stub(
+        &self,
+        mut opts: WriteOptions,
+        expected: Option<Expected>,
+        cond: Precondition<'_>,
+    ) -> S3Result<()> {
+        #[cfg(unix)]
+        if super::fs::is_fs(&self.dal.op) {
+            return self.commit_stub_on_fs(&opts, cond).await;
+        }
+        if let Some(expected) = expected {
+            expected.apply(&mut opts);
+        }
+        let w = self
+            .dal
+            .op
+            .writer_options(&self.path, opts)
+            .await
+            .map_err(write_err)?;
+        self.commit(w, cond).await.map(drop)
+    }
+
+    /// The stub on fs: an empty file given its xattrs and an fsync in `.s3dal/tmp/`, renamed
+    /// into place under the key's lock, as Complete commits on fs. OpenDAL's fs writer renames
+    /// first and sets the xattrs after, and a GET in between would answer an empty 200.
+    #[cfg(unix)]
+    async fn commit_stub_on_fs(&self, opts: &WriteOptions, cond: Precondition<'_>) -> S3Result<()> {
+        use super::fs;
+
+        let (tmp, target) = stub_paths(self.dal, &self.path);
+        let made = make_stub_file(&tmp, &target, opts).await;
+        let committed = match made {
+            Ok(()) => {
+                let _guard = self.dal.locks.lock(&self.path).await;
+                match async {
+                    self.check(cond).await?;
+                    self.archive().await
+                }
+                .await
+                {
+                    Ok(()) => {
+                        let tmp = tmp.clone();
+                        fs::blocking(move || fs::rename_into_place(&tmp, &target))
+                            .await
+                            .map_err(write_err)
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            Err(err) => Err(err),
+        };
+        if let Err(err) = committed {
+            let _ = fs::blocking(move || Ok(std::fs::remove_file(&tmp))).await;
+            prune_empty_parents(self.dal, self.bucket, self.key).await;
+            return Err(err);
+        }
+        self.remove_replaced().await;
+        Ok(())
+    }
+
     /// Discards a write that failed or did not verify, so nothing of it becomes visible.
     /// `abort` (never `close`) removes the temporary file; creating the writer may already have
     /// made the key's parent directories, which are pruned like after a delete.
@@ -430,27 +770,34 @@ impl<'a> Dest<'a> {
 }
 
 /// Deletes what `key` names, as DeleteObject does: a key that names nothing is deleted
-/// successfully. The bucket must already be known to exist.
+/// successfully. The bucket must already be known to exist. What was removed, `None` when
+/// nothing was (see [`delete_unpruned`]).
 pub(super) async fn delete_key(
     dal: &S3Dal,
     bucket: &str,
     key: &str,
     cond: DeleteCondition<'_>,
-) -> S3Result<()> {
-    if delete_unpruned(dal, bucket, key, cond).await? {
+) -> S3Result<Option<Usage>> {
+    let removals = Removals::default();
+    let removed = delete_unpruned(dal, bucket, key, cond, &removals).await?;
+    if removed.is_some() {
+        removals.run(dal).await;
         prune_empty_parents(dal, bucket, key).await;
     }
-    Ok(())
+    Ok(removed)
 }
 
-/// [`delete_key`] without pruning the parents: whether anything was deleted, so a caller
-/// deleting many keys prunes each directory once (see [`prune_empty_parents`]).
+/// [`delete_key`] without pruning the parents, so a caller deleting many keys prunes each
+/// directory once (see [`prune_empty_parents`]). What was deleted: an object, or a folder
+/// marker, which holds nothing; `None` when nothing was. A cold object's tier object is noted
+/// in `removals`, for the caller to remove once the stub is gone.
 pub(super) async fn delete_unpruned(
     dal: &S3Dal,
     bucket: &str,
     key: &str,
     cond: DeleteCondition<'_>,
-) -> S3Result<bool> {
+    removals: &Removals,
+) -> S3Result<Option<Usage>> {
     naming::validate_key(key)?;
     let path = naming::object_path(bucket, key);
     let deleted = {
@@ -468,16 +815,20 @@ pub(super) async fn delete_unpruned(
             // Only an object can meet a condition. A folder marker is none, as for GET, so a
             // condition that held because no object is there must not remove the marker.
             if current.is_none() {
-                return Ok(false);
+                return Ok(None);
             }
         }
         match found {
-            Some(m) if key.ends_with('/') => m.is_dir() && remove_empty_dir(dal, &path).await?,
+            Some(m) if key.ends_with('/') => {
+                (m.is_dir() && remove_empty_dir(dal, &path).await?).then(Usage::default)
+            }
             Some(m) if m.is_file() => {
                 dal.op.delete(&path).await.map_err(|e| map(e, Ctx::Other))?;
-                true
+                let obj = meta::resolve(&dal.profile, &m);
+                removals.note(bucket, key, &obj);
+                Some(Usage::object(obj.content_length))
             }
-            _ => false,
+            _ => None,
         }
     };
     Ok(deleted)
@@ -523,8 +874,165 @@ pub(super) async fn prune_empty_parents(dal: &S3Dal, bucket: &str, key: &str) {
     }
 }
 
+/// Where a stub for `path` is made on fs, a fresh file in `.s3dal/tmp/`, and where it is renamed
+/// to.
+#[cfg(unix)]
+pub(super) fn stub_paths(dal: &S3Dal, path: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = std::path::PathBuf::from(dal.op.info().root());
+    let tmp = root
+        .join(crate::backend::RESERVED_ROOT)
+        .join("tmp")
+        .join(uuid::Uuid::new_v4().to_string());
+    (tmp, root.join(path))
+}
+
+/// Makes a stub on fs at `tmp`: an empty file given the xattrs `opts` describes and an fsync, so
+/// that renamed to `target`, whose parents this makes, it never shows there without them.
+#[cfg(unix)]
+pub(super) async fn make_stub_file(
+    tmp: &std::path::Path,
+    target: &std::path::Path,
+    opts: &WriteOptions,
+) -> S3Result<()> {
+    use super::fs;
+
+    let user_metadata = opts.user_metadata.clone().unwrap_or_default();
+    let (tmp, target) = (tmp.to_owned(), target.to_owned());
+    fs::blocking(move || {
+        fs::make_parents(&tmp)?;
+        fs::make_parents(&target)?;
+        fs::assemble(&tmp, &[], &user_metadata).map_err(|err| match err {
+            fs::AssembleError::Source(_, err) | fs::AssembleError::Write(err) => err,
+        })
+    })
+    .await
+    .map(drop)
+    .map_err(write_err)
+}
+
+/// A new tier object being written; see [`Dest::open_cold`]. Ends in [`Self::close`] or
+/// [`Self::abort`].
+pub(super) struct ColdWriter<'t> {
+    object: ColdObject<'t>,
+    w: Writer,
+    stats: Arc<TierStats>,
+}
+
+/// A closed tier object that no stub names yet; [`Dest::commit_cold`] makes one name it.
+pub(super) struct ColdObject<'t> {
+    pub tier: &'t Tier,
+    pub id: String,
+    pub path: String,
+}
+
+impl<'t> ColdWriter<'t> {
+    pub(super) async fn write(&mut self, chunk: impl Into<Buffer>) -> S3Result<()> {
+        self.w.write(chunk).await.map_err(write_err)
+    }
+
+    /// Discards a write that failed or did not verify.
+    pub(super) async fn abort(mut self) {
+        if let Err(err) = self.w.abort().await {
+            tracing::warn!(
+                tier = self.object.tier.name,
+                path = self.object.path,
+                error = %err,
+                "cannot abort a tier write; the sweep removes what remains"
+            );
+        }
+    }
+
+    /// Closes the tier object, outside any key lock: a large body never holds one. A close that
+    /// fails removes what it may have left.
+    pub(super) async fn close(mut self) -> S3Result<ColdObject<'t>> {
+        let tier = self.object.tier;
+        if let Err(err) = without_stalling(&tier.op, self.w.close()).await {
+            self.stats.failed("write", err.kind().into_static());
+            remove_tier_object(tier, &self.object.path).await;
+            return Err(write_err(err));
+        }
+        Ok(self.object)
+    }
+}
+
+/// Whether the object at `stub` is a stub naming the tier object `id` of `tier`.
+pub(super) async fn stub_names(dal: &S3Dal, stub: &str, tier: &Tier, id: &str) -> S3Result<bool> {
+    Ok(stat_existing(dal, stub)
+        .await?
+        .filter(Metadata::is_file)
+        .is_some_and(|m| {
+            meta::resolve(&dal.profile, &m)
+                .tier
+                .is_some_and(|t| t.name == tier.name && t.id.as_deref() == Some(id))
+        }))
+}
+
+/// After a stub write at `stub` that failed, removes the tier object `id` at `path` unless the
+/// stub landed after all. The error does not say: a close that timed out or a reply lost on the
+/// way may follow a write the backend kept, and removing the tier object then would leave the
+/// key naming bytes that are gone, the object it replaced included. A stat that fails cannot
+/// tell either, so the tier object stays; if no stub names it, the sweep removes it.
+pub(super) async fn remove_unless_named(
+    dal: &S3Dal,
+    stub: &str,
+    tier: &Tier,
+    id: &str,
+    path: &str,
+) {
+    match stub_names(dal, stub, tier, id).await {
+        Ok(false) => remove_tier_object(tier, path).await,
+        Ok(true) => tracing::warn!(
+            stub,
+            tier = tier.name,
+            path,
+            "a stub write reported a failure but landed; its tier object stays"
+        ),
+        Err(err) => tracing::warn!(
+            stub,
+            tier = tier.name,
+            path,
+            error = %err,
+            "cannot tell whether a failed stub write landed; its tier object stays for the sweep"
+        ),
+    }
+}
+
+/// Removes a tier object no stub names, after a write into a tier failed. Best effort: what
+/// remains is an orphan, which the sweep removes.
+pub(super) async fn remove_tier_object(tier: &Tier, path: &str) {
+    if let Err(err) = tier.op.delete(path).await {
+        tracing::warn!(
+            tier = tier.name,
+            path,
+            error = %err,
+            "cannot remove a tier object no stub names; the sweep will"
+        );
+    }
+}
+
 pub(super) fn write_err(err: opendal::Error) -> S3Error {
     map(err, Ctx::ObjectWrite)
+}
+
+/// The error of a commit the backend refused. A refused condition the client did not send is
+/// the one a versioned write carries (see `Dest::backend_checks`): another instance replaced
+/// the key meanwhile. Nothing was lost and a retry will archive that version first, so it is
+/// answered as a retryable conflict, which SDKs repeat on their own, instead of a 412 the
+/// client could not explain.
+pub(super) fn commit_err(err: opendal::Error, cond: Precondition<'_>) -> S3Error {
+    if err.kind() == opendal::ErrorKind::ConditionNotMatch && cond.is_empty() {
+        conflict()
+    } else {
+        write_err(err)
+    }
+}
+
+/// Another instance sharing the backend changed the key while this one was writing it.
+pub(super) fn conflict() -> S3Error {
+    s3_error!(
+        SlowDown,
+        "Another write to this key landed at the same time; please retry"
+    )
 }
 
 #[cfg(test)]
@@ -630,6 +1138,8 @@ mod tests {
             attrs: meta::Attrs::default(),
             checksum: s3s::dto::Checksum::default(),
             parts: None,
+            version_id: None,
+            tier: None,
         }
     }
 
@@ -731,7 +1241,7 @@ mod tests {
             if_none_match: Some(&ETagCondition::Any),
             ..Default::default()
         };
-        let err = Dest::new(&dal, "b", "k")
+        let err = Dest::versioned(&dal, "b", "k", Versioning::Unversioned, None, false)
             .write_all(WriteOptions::default(), Buffer::from("mine"), create)
             .await
             .unwrap_err();

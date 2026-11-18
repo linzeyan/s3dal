@@ -17,27 +17,27 @@ How to read it:
 
 | backend | passed / total | pass rate | failed | error | skipped | s3dal source |
 |---|--:|--:|--:|--:|--:|---|
-| azblob-azurite | 283 / 1042 | 27.1% | 601 | 0 | 158 | `cd15f63` |
-| fs | 281 / 1042 | 26.9% | 603 | 0 | 158 | `cd15f63` |
-| gcs-fake | 283 / 1042 | 27.1% | 601 | 0 | 158 | `cd15f63` |
-| s3-rustfs | 283 / 1042 | 27.1% | 601 | 0 | 158 | `cd15f63` |
+| azblob-azurite | 338 / 1042 | 32.4% | 546 | 0 | 158 | `235ea48` |
+| fs | 336 / 1042 | 32.2% | 548 | 0 | 158 | `235ea48` |
+| gcs-fake | 338 / 1042 | 32.4% | 546 | 0 | 158 | `235ea48` |
+| s3-rustfs | 338 / 1042 | 32.4% | 546 | 0 | 158 | `235ea48` |
 
 ## Pass rate by category
 
 | category | tests | azblob-azurite | fs | gcs-fake | s3-rustfs |
 |---|--:|--:|--:|--:|--:|
-| acl | 72 | 1.3% (1) | 1.3% (1) | 1.3% (1) | 1.3% (1) |
+| acl | 72 | 2.7% (2) | 2.7% (2) | 2.7% (2) | 2.7% (2) |
 | bucket | 47 | 68.0% (32) | 68.0% (32) | 68.0% (32) | 68.0% (32) |
 | copy | 63 | 25.3% (16) | 25.3% (16) | 25.3% (16) | 25.3% (16) |
 | cors | 4 | 0.0% (0) | 0.0% (0) | 0.0% (0) | 0.0% (0) |
-| delete | 28 | 46.4% (13) | 46.4% (13) | 46.4% (13) | 46.4% (13) |
+| delete | 28 | 67.8% (19) | 67.8% (19) | 67.8% (19) | 67.8% (19) |
 | encryption | 89 | 10.1% (9) | 10.1% (9) | 10.1% (9) | 10.1% (9) |
 | headers | 48 | 56.2% (27) | 56.2% (27) | 56.2% (27) | 56.2% (27) |
 | iam | 90 | 0.0% (0) | 0.0% (0) | 0.0% (0) | 0.0% (0) |
-| lifecycle | 40 | 0.0% (0) | 0.0% (0) | 0.0% (0) | 0.0% (0) |
+| lifecycle | 40 | 42.5% (17) | 42.5% (17) | 42.5% (17) | 42.5% (17) |
 | list-objects | 83 | 91.5% (76) | 89.1% (74) | 91.5% (76) | 91.5% (76) |
 | logging | 97 | 0.0% (0) | 0.0% (0) | 0.0% (0) | 0.0% (0) |
-| multipart | 58 | 39.6% (23) | 39.6% (23) | 39.6% (23) | 39.6% (23) |
+| multipart | 58 | 48.2% (28) | 48.2% (28) | 48.2% (28) | 48.2% (28) |
 | object | 70 | 65.7% (46) | 65.7% (46) | 65.7% (46) | 65.7% (46) |
 | object-lock | 39 | 2.5% (1) | 2.5% (1) | 2.5% (1) | 2.5% (1) |
 | policy | 21 | 0.0% (0) | 0.0% (0) | 0.0% (0) | 0.0% (0) |
@@ -50,14 +50,14 @@ How to read it:
 | sts | 36 | 0.0% (0) | 0.0% (0) | 0.0% (0) | 0.0% (0) |
 | tagging | 19 | 0.0% (0) | 0.0% (0) | 0.0% (0) | 0.0% (0) |
 | utils | 1 | 100.0% (1) | 100.0% (1) | 100.0% (1) | 100.0% (1) |
-| versioning | 42 | 0.0% (0) | 0.0% (0) | 0.0% (0) | 0.0% (0) |
+| versioning | 42 | 61.9% (26) | 61.9% (26) | 61.9% (26) | 61.9% (26) |
 
 ## Tests that do not pass, by category
 
 Each list holds the tests that do not pass on at least one backend, with every backend's outcome; *missing* means that run did not collect the test.
 
 <details>
-<summary>acl, 72 tests; not passing: azblob-azurite 71, fs 71, gcs-fake 71, s3-rustfs 71</summary>
+<summary>acl, 72 tests; not passing: azblob-azurite 70, fs 70, gcs-fake 70, s3-rustfs 70</summary>
 
 | test | azblob-azurite | fs | gcs-fake | s3-rustfs |
 |---|---|---|---|---|
@@ -124,7 +124,6 @@ Each list holds the tests that do not pass on at least one backend, with every b
 | `test_s3.py::test_object_acl_writeacp` | failed | failed | failed | failed |
 | `test_s3.py::test_object_copy_canned_acl` | failed | failed | failed | failed |
 | `test_s3.py::test_object_header_acl_grants` | failed | failed | failed | failed |
-| `test_s3.py::test_object_put_acl_mtime` | failed | failed | failed | failed |
 | `test_s3.py::test_object_raw_authenticated_bucket_acl` | failed | failed | failed | failed |
 | `test_s3.py::test_object_raw_authenticated_object_acl` | failed | failed | failed | failed |
 | `test_s3.py::test_object_raw_get_bucket_acl` | failed | failed | failed | failed |
@@ -226,7 +225,7 @@ Each list holds the tests that do not pass on at least one backend, with every b
 </details>
 
 <details>
-<summary>delete, 28 tests; not passing: azblob-azurite 15, fs 15, gcs-fake 15, s3-rustfs 15</summary>
+<summary>delete, 28 tests; not passing: azblob-azurite 9, fs 9, gcs-fake 9, s3-rustfs 9</summary>
 
 | test | azblob-azurite | fs | gcs-fake | s3-rustfs |
 |---|---|---|---|---|
@@ -235,15 +234,9 @@ Each list holds the tests that do not pass on at least one backend, with every b
 | `test_s3.py::test_delete_object_current_if_match_last_modified_time` | failed | failed | failed | failed |
 | `test_s3.py::test_delete_object_current_if_match_size` | failed | failed | failed | failed |
 | `test_s3.py::test_delete_object_if_match` | failed | failed | failed | failed |
-| `test_s3.py::test_delete_object_version_if_match` | failed | failed | failed | failed |
-| `test_s3.py::test_delete_object_version_if_match_last_modified_time` | failed | failed | failed | failed |
-| `test_s3.py::test_delete_object_version_if_match_size` | failed | failed | failed | failed |
 | `test_s3.py::test_delete_objects_current_if_match` | failed | failed | failed | failed |
 | `test_s3.py::test_delete_objects_current_if_match_last_modified_time` | failed | failed | failed | failed |
 | `test_s3.py::test_delete_objects_current_if_match_size` | failed | failed | failed | failed |
-| `test_s3.py::test_delete_objects_version_if_match` | failed | failed | failed | failed |
-| `test_s3.py::test_delete_objects_version_if_match_last_modified_time` | failed | failed | failed | failed |
-| `test_s3.py::test_delete_objects_version_if_match_size` | failed | failed | failed | failed |
 | `test_s3.py::test_object_delete_key_bucket_gone` | failed | failed | failed | failed |
 
 </details>
@@ -464,22 +457,18 @@ Each list holds the tests that do not pass on at least one backend, with every b
 </details>
 
 <details>
-<summary>lifecycle, 40 tests; not passing: azblob-azurite 40, fs 40, gcs-fake 40, s3-rustfs 40</summary>
+<summary>lifecycle, 40 tests; not passing: azblob-azurite 23, fs 23, gcs-fake 23, s3-rustfs 23</summary>
 
 | test | azblob-azurite | fs | gcs-fake | s3-rustfs |
 |---|---|---|---|---|
 | `test_s3.py::test_lifecycle_cloud_multiple_transition` | skipped | skipped | skipped | skipped |
 | `test_s3.py::test_lifecycle_cloud_transition` | skipped | skipped | skipped | skipped |
 | `test_s3.py::test_lifecycle_cloud_transition_large_obj` | skipped | skipped | skipped | skipped |
-| `test_s3.py::test_lifecycle_delete` | failed | failed | failed | failed |
 | `test_s3.py::test_lifecycle_deletemarker_expiration` | failed | failed | failed | failed |
 | `test_s3.py::test_lifecycle_deletemarker_expiration_with_days_tag` | failed | failed | failed | failed |
 | `test_s3.py::test_lifecycle_expiration` | failed | failed | failed | failed |
 | `test_s3.py::test_lifecycle_expiration_date` | failed | failed | failed | failed |
-| `test_s3.py::test_lifecycle_expiration_days0` | failed | failed | failed | failed |
 | `test_s3.py::test_lifecycle_expiration_header_and_tags_head` | failed | failed | failed | failed |
-| `test_s3.py::test_lifecycle_expiration_header_head` | failed | failed | failed | failed |
-| `test_s3.py::test_lifecycle_expiration_header_put` | failed | failed | failed | failed |
 | `test_s3.py::test_lifecycle_expiration_header_tags_head` | failed | failed | failed | failed |
 | `test_s3.py::test_lifecycle_expiration_newer_noncurrent` | failed | failed | failed | failed |
 | `test_s3.py::test_lifecycle_expiration_noncur_tags1` | failed | failed | failed | failed |
@@ -487,25 +476,12 @@ Each list holds the tests that do not pass on at least one backend, with every b
 | `test_s3.py::test_lifecycle_expiration_size_lt` | failed | failed | failed | failed |
 | `test_s3.py::test_lifecycle_expiration_tags1` | failed | failed | failed | failed |
 | `test_s3.py::test_lifecycle_expiration_tags2` | failed | failed | failed | failed |
-| `test_s3.py::test_lifecycle_get` | failed | failed | failed | failed |
-| `test_s3.py::test_lifecycle_get_no_id` | failed | failed | failed | failed |
-| `test_s3.py::test_lifecycle_id_too_long` | failed | failed | failed | failed |
-| `test_s3.py::test_lifecycle_invalid_status` | failed | failed | failed | failed |
 | `test_s3.py::test_lifecycle_noncur_cloud_transition` | skipped | skipped | skipped | skipped |
 | `test_s3.py::test_lifecycle_noncur_expiration` | failed | failed | failed | failed |
 | `test_s3.py::test_lifecycle_noncur_transition` | skipped | skipped | skipped | skipped |
 | `test_s3.py::test_lifecycle_plain_null_version_current_transition` | skipped | skipped | skipped | skipped |
-| `test_s3.py::test_lifecycle_same_id` | failed | failed | failed | failed |
-| `test_s3.py::test_lifecycle_set` | failed | failed | failed | failed |
-| `test_s3.py::test_lifecycle_set_date` | failed | failed | failed | failed |
-| `test_s3.py::test_lifecycle_set_deletemarker` | failed | failed | failed | failed |
-| `test_s3.py::test_lifecycle_set_empty_filter` | failed | failed | failed | failed |
-| `test_s3.py::test_lifecycle_set_filter` | failed | failed | failed | failed |
-| `test_s3.py::test_lifecycle_set_invalid_date` | failed | failed | failed | failed |
-| `test_s3.py::test_lifecycle_set_noncurrent` | failed | failed | failed | failed |
 | `test_s3.py::test_lifecycle_set_noncurrent_transition` | skipped | skipped | skipped | skipped |
 | `test_s3.py::test_lifecycle_transition` | skipped | skipped | skipped | skipped |
-| `test_s3.py::test_lifecycle_transition_set_invalid_date` | failed | failed | failed | failed |
 | `test_s3.py::test_lifecycle_transition_single_rule_multi_trans` | skipped | skipped | skipped | skipped |
 | `test_s3.py::test_lifecyclev2_expiration` | failed | failed | failed | failed |
 
@@ -634,7 +610,7 @@ Each list holds the tests that do not pass on at least one backend, with every b
 </details>
 
 <details>
-<summary>multipart, 58 tests; not passing: azblob-azurite 35, fs 35, gcs-fake 35, s3-rustfs 35</summary>
+<summary>multipart, 58 tests; not passing: azblob-azurite 30, fs 30, gcs-fake 30, s3-rustfs 30</summary>
 
 | test | azblob-azurite | fs | gcs-fake | s3-rustfs |
 |---|---|---|---|---|
@@ -646,10 +622,8 @@ Each list holds the tests that do not pass on at least one backend, with every b
 | `test_s3.py::test_encryption_sse_c_unaligned_multipart_upload` | failed | failed | failed | failed |
 | `test_s3.py::test_get_multipart_checksum_object_attributes` | failed | failed | failed | failed |
 | `test_s3.py::test_lifecycle_multipart_expiration` | failed | failed | failed | failed |
-| `test_s3.py::test_lifecycle_set_multipart` | failed | failed | failed | failed |
 | `test_s3.py::test_list_multipart_upload_owner` | failed | failed | failed | failed |
 | `test_s3.py::test_multipart_copy_special_names` | failed | failed | failed | failed |
-| `test_s3.py::test_multipart_copy_versioned` | failed | failed | failed | failed |
 | `test_s3.py::test_multipart_get_part` | failed | failed | failed | failed |
 | `test_s3.py::test_multipart_put_current_object_if_match` | failed | failed | failed | failed |
 | `test_s3.py::test_multipart_put_current_object_if_none_match` | failed | failed | failed | failed |
@@ -665,14 +639,11 @@ Each list holds the tests that do not pass on at least one backend, with every b
 | `test_s3.py::test_multipart_use_cksum_helper_sha256` | failed | failed | failed | failed |
 | `test_s3.py::test_non_multipart_get_part` | failed | failed | failed | failed |
 | `test_s3.py::test_non_multipart_sse_c_get_part` | failed | failed | failed | failed |
-| `test_s3.py::test_object_copy_versioning_multipart_upload` | failed | failed | failed | failed |
 | `test_s3.py::test_set_multipart_tagging` | failed | failed | failed | failed |
 | `test_s3.py::test_sse_kms_multipart_invalid_chunks_1` | failed | failed | failed | failed |
 | `test_s3.py::test_sse_kms_multipart_invalid_chunks_2` | failed | failed | failed | failed |
 | `test_s3.py::test_sse_kms_multipart_upload` | failed | failed | failed | failed |
 | `test_s3.py::test_sse_s3_default_multipart_upload` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_bucket_multipart_upload_return_version_id` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_obj_create_overwrite_multipart` | failed | failed | failed | failed |
 
 </details>
 
@@ -952,11 +923,10 @@ Each list holds the tests that do not pass on at least one backend, with every b
 </details>
 
 <details>
-<summary>versioning, 42 tests; not passing: azblob-azurite 42, fs 42, gcs-fake 42, s3-rustfs 42</summary>
+<summary>versioning, 42 tests; not passing: azblob-azurite 16, fs 16, gcs-fake 16, s3-rustfs 16</summary>
 
 | test | azblob-azurite | fs | gcs-fake | s3-rustfs |
 |---|---|---|---|---|
-| `test_s3.py::test_bucket_list_return_data_versioning` | failed | failed | failed | failed |
 | `test_s3.py::test_bucket_logging_copy_objects_bucket_versioned` | failed | failed | failed | failed |
 | `test_s3.py::test_bucket_logging_copy_objects_versioned` | failed | failed | failed | failed |
 | `test_s3.py::test_bucket_logging_delete_objects_versioned` | failed | failed | failed | failed |
@@ -969,34 +939,9 @@ Each list holds the tests that do not pass on at least one backend, with every b
 | `test_s3.py::test_bucket_logging_put_objects_versioned` | failed | failed | failed | failed |
 | `test_s3.py::test_delete_marker_expiration` | failed | failed | failed | failed |
 | `test_s3.py::test_delete_marker_nonversioned` | failed | failed | failed | failed |
-| `test_s3.py::test_delete_marker_suspended` | failed | failed | failed | failed |
-| `test_s3.py::test_delete_marker_versioned` | failed | failed | failed | failed |
-| `test_s3.py::test_get_versioned_object_attributes` | failed | failed | failed | failed |
 | `test_s3.py::test_lifecycle_expiration_versioned_tags2` | failed | failed | failed | failed |
-| `test_s3.py::test_lifecycle_expiration_versioning_enabled` | failed | failed | failed | failed |
-| `test_s3.py::test_object_copy_versioned_bucket` | failed | failed | failed | failed |
-| `test_s3.py::test_object_copy_versioned_url_encoding` | failed | failed | failed | failed |
-| `test_s3.py::test_versioned_concurrent_object_create_and_remove` | failed | failed | failed | failed |
-| `test_s3.py::test_versioned_concurrent_object_create_concurrent_remove` | failed | failed | failed | failed |
 | `test_s3.py::test_versioned_object_acl` | failed | failed | failed | failed |
 | `test_s3.py::test_versioned_object_acl_no_version_specified` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_bucket_atomic_upload_return_version_id` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_bucket_create_suspend` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_concurrent_multi_object_delete` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_copy_obj_version` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_multi_object_delete` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_multi_object_delete_with_marker` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_multi_object_delete_with_marker_create` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_obj_create_read_remove` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_obj_create_read_remove_head` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_obj_create_versions_remove_all` | failed | failed | failed | failed |
 | `test_s3.py::test_versioning_obj_create_versions_remove_special_names` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_obj_list_marker` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_obj_plain_null_version_overwrite` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_obj_plain_null_version_overwrite_suspended` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_obj_plain_null_version_removal` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_obj_suspend_versions` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_obj_suspended_copy` | failed | failed | failed | failed |
-| `test_s3.py::test_versioning_stack_delete_merkers` | failed | failed | failed | failed |
 
 </details>

@@ -3,6 +3,158 @@
 All notable changes to s3dal are listed here, in the format of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-11-18
+
+### Added
+
+- S3 versioning on every backend: PutBucketVersioning/GetBucketVersioning, version ids on
+  writes, delete markers, reads, copies and deletes by version, ListObjectVersions, Suspended
+  buckets and the `null` version. Old versions are kept under `.s3dal/versions/`: hard links on
+  fs, server-side copies on S3 upstreams, streamed copies on Azure Blob and GCS. Several
+  instances sharing an S3 upstream with conditional writes lose no version to concurrent
+  overwrites; a write that loses such a race answers `503 SlowDown`, which SDKs retry.
+- Key pairs: `access = "write-only"`, a drop box that uploads and nothing else (no GET, HEAD,
+  listing, delete or copy), and `expires = "<RFC 3339>"`, after which the pair is refused as
+  unknown (`InvalidAccessKeyId`). The console's key pair editor sets both.
+- Console: versioning. Buckets show and switch their versioning state; "Show versions" lists
+  each object's versions and delete markers; an object's details download, restore or delete
+  any version, and undelete a deleted object; deleting a bucket that still holds anything offers
+  to empty it first, versions included.
+- Prometheus metrics at `GET /_s3dal/metrics`, on the S3 and console ports: requests by
+  operation and status class, their duration, bytes in and out, requests in flight, connections
+  by protocol, backend operation latency and errors, open multipart uploads, dropped log lines,
+  and the process's memory, CPU and file descriptors. `--metrics token|public|off` (default
+  `token`, with `--metrics-token`) says who may read them, and changes without a restart; with
+  no token set, the default refuses every scrape. See
+  [Metrics](guide/operations.md#metrics).
+- Console: a Dashboard of the last hour at 10-second resolution (requests per second by kind of
+  operation, error rate, p50 and p99 latency, throughput, memory), each chart with a crosshair
+  and a table view. The Server page adds when the backend was probed, whether the log collector
+  takes the log and how many lines it dropped, and who may read the metrics; Settings edits
+  `metrics` and `metrics-token`.
+- `s3dal public s3://bucket [on|off]` shows or switches whether a bucket is public, through the
+  console's address (`--endpoint`).
+- Background jobs run on one instance of those sharing a backend, the holder of the job's
+  lease (`.s3dal/leases/<job>.json`), which another instance takes over within about 80 seconds
+  of its holder stopping. The stale-upload sweep is the first such job. Metrics
+  `s3dal_job_duration_seconds` (runs by job and outcome) and `s3dal_job_lease_held`. See
+  [Background jobs](guide/operations.md#background-jobs).
+- Object events, for embedders (`S3Dal::subscribe`) and for the features built on them: one per
+  change to a key that took effect (PUT, POST, CopyObject, CompleteMultipartUpload,
+  DeleteObject, each key DeleteObjects removed), with the bucket, key, size, ETag, version,
+  request id and access key. A consumer that falls behind loses events, counted in
+  `s3dal_events_dropped_total`; requests never wait for one.
+- Bucket quotas: a largest size and optionally a most number of objects per bucket, every
+  version counted. A PUT, form upload, copy or CompleteMultipartUpload that would take the
+  bucket past it gets `403 QuotaExceeded` before its body is read; CreateMultipartUpload is
+  refused in a bucket already past it. Set on the console's bucket page, which shows a usage
+  bar, through the settings API (`quota` of `/_s3dal/admin/buckets/<bucket>`), or with
+  `s3dal quota s3://bucket --max-bytes 10GiB [--max-objects N] | --clear`. What a bucket holds
+  is counted by a new background job, `usage-scan`, every `--usage-scan-interval` (default
+  `5m`), plus each instance's own writes since. Metrics `s3dal_bucket_objects`,
+  `s3dal_bucket_bytes`, `s3dal_bucket_quota_bytes` and `s3dal_bucket_quota_objects`; the
+  Dashboard lists each bucket's usage against its quota. See
+  [Bucket quotas](README.md#bucket-quotas).
+- Bucket lifecycle rules: PutBucketLifecycleConfiguration, GetBucketLifecycleConfiguration and
+  DeleteBucketLifecycle, with Expiration (`Days`, `Date`, `ExpiredObjectDeleteMarker`),
+  NoncurrentVersionExpiration (`NoncurrentDays`, `NewerNoncurrentVersions`) and
+  AbortIncompleteMultipartUpload, filtered by prefix and object size. Tag filters are refused
+  with `NotImplemented`, as are transitions on a server without cold tiers (with tiers, see
+  Cold tiers below). A new background job, `lifecycle`, applies each
+  bucket's rules once a day and within the hour of a change, at AWS's times (the first
+  midnight UTC after the days are up); in a versioned bucket an expired object gets a delete
+  marker. Each expiry is an object event (`s3:LifecycleExpiration:Delete`,
+  `s3:LifecycleExpiration:DeleteMarkerCreated`), so quotas follow. PUT, GET and HEAD send
+  `x-amz-expiration`. An abort rule replaces `--stale-upload-age` for the uploads it covers.
+  The console's bucket page lists, adds, edits and removes rules. Metric
+  `s3dal_lifecycle_expired_total{kind}`. See [Lifecycle rules](README.md#lifecycle-rules).
+- Bucket event notifications to webhooks: PutBucketNotificationConfiguration and
+  GetBucketNotificationConfiguration, with AWS's event names (`s3:ObjectCreated:*`,
+  `s3:ObjectRemoved:*`, `s3:LifecycleExpiration:*` and each specific one) and prefix and suffix
+  filters. The operator configures the webhooks as `[[notify]]` tables (`id`, `url`, optional
+  `hmac-secret`, `auth-token`, `queue-size`, `retry-for`), applied without a restart; a
+  configuration names one by `arn:s3dal:sqs:<region>:<id>:webhook`, and an unknown one is
+  refused. Each event is POSTed as an AWS S3 event message (`eventVersion` 2.1), signed with
+  `X-S3dal-Signature: sha256=<hex HMAC-SHA256 of the body>` when the target has a secret. Each
+  target has a queue in memory of its own and retries a failing webhook with a growing pause,
+  then drops the event: nothing is kept on disk. Metrics
+  `s3dal_notify_deliveries_total{target,outcome}`, `s3dal_notify_dropped_total{target,reason}`
+  and `s3dal_notify_queue_depth{target}`. The console's bucket page lists, adds, edits and
+  removes the rules, and shows each target's last delivery. See
+  [Event notifications](README.md#event-notifications).
+- Image thumbnails on the S3 port: `GET /<bucket>/<key>?x-s3dal-thumbnail=128|256|512|1024`
+  answers with the image fitted into that square, as JPEG, or PNG when it has transparent
+  pixels, from JPEG, PNG, GIF (first frame) and WebP. It is GetObject, so a presigned URL signs
+  the size, and a write-only pair or an unsigned request outside a public bucket gets none.
+  Made on the first request and kept in the backend under `.s3dal/thumbs/`, named by the
+  object's ETag, so instances share them and an overwrite is never shown as before; a new
+  background job, `thumbnail-sweep`, removes stale ones daily. Sources over 64 MiB or 50
+  megapixels get `400 EntityTooLarge`, other formats `501 NotImplemented`, undecodable ones
+  `400 InvalidRequest`, and a thumbnail not made within 20 seconds `503 ServiceUnavailable`;
+  half the cores decode at once. Cargo feature `thumbnail`, on by default. The console's object
+  browser has a grid view of thumbnails, and an image's details preview its thumbnail instead
+  of the original. See [Thumbnails](README.md#thumbnails).
+- A read cache in memory for remote backends: `--cache-size` (`S3DAL_CACHE_SIZE`, config key
+  `cache-size`, default `0`, off) gives it a budget, and GetObject then keeps objects up to
+  1 MiB, evicting the least recently used. An entry answers only a GET whose stat finds the ETag
+  it was read with, so an object changed by another instance or another tool is never served
+  stale; Range and partNumber are cut from the cached object. Refused on fs, whose files the OS
+  page cache already holds; takes a restart to change, and the console's Settings save it for
+  the next restart as they do the backend. Metrics `s3dal_cache_hits_total`,
+  `s3dal_cache_misses_total`, `s3dal_cache_evictions_total` and `s3dal_cache_bytes`. See
+  [Read cache](guide/operations.md#read-cache).
+- Cold tiers: `[[tier]]` tables in the config file (`name`, `storage-class`, `backend`,
+  `[tier.backend-opt]`) add backends that hold only the bytes of the objects written to them. A
+  PutObject or form upload naming a tier's storage class streams its body there and leaves an
+  empty stub at the key in the primary, whose metadata names the tier object
+  (`.s3dal/tier/<bucket>/<E(key)>!!/<id>` in the tier). GET (ranges, `partNumber`, conditions),
+  copies, UploadPartCopy and thumbnails read cold objects through their tier; GET, HEAD,
+  GetObjectAttributes and listings report the tier's class; quotas and usage count their size,
+  and the usage count records the cold part (`cold_objects`, `cold_bytes`). Deletes and
+  overwrites remove the tier copy in unversioned buckets; in versioned ones it goes with its
+  version. A tier that cannot be reached, or that another s3dal's primary claimed
+  (`.s3dal/tier/owner.json`, against the primary's new `.s3dal/id`), stops startup; a changed
+  `[[tier]]` takes a restart. A stub whose tier object is gone answers `500 InternalError`,
+  never `404`; a GET racing an overwrite of a cold object answers `503 SlowDown`. A class no
+  tier has stays advisory, as before. Other tools reading the primary see cold objects as empty
+  files, so back up every tier with the primary. CopyObject and multipart uploads
+  (CreateMultipartUpload's class, recorded and reported by ListParts and ListMultipartUploads)
+  write into a tier too. A CopyObject of an object onto itself with another class moves it,
+  bytes, headers and metadata kept: into a tier, between tiers, or back to the primary with
+  `STANDARD` (the class a copy naming none gets), which removes the tier copy; before tiers such
+  a self-copy was `InvalidRequest` without `REPLACE`, and it still is where the class it would
+  get is the one it has. Lifecycle rules take `Transition` (`Days` or `Date`) and
+  `NoncurrentVersionTransition` (`NoncurrentDays`, `NewerNoncurrentVersions`) to a tier's
+  class, and a class no tier has is refused with `InvalidStorageClass`. The `lifecycle` job
+  moves an object in place, at AWS's times: its ETag, Last-Modified, version id, headers and
+  metadata stay, only its bytes go to the tier (or on to the next tier, the transition due last
+  winning); an expiration due the same day wins, and size filters and expiry see a cold
+  object's own size. An object changed while it moves is left as the client wrote it and tried
+  again on the next run. Each move is an `s3:LifecycleTransition` event. A new background job,
+  `tier-sweep`, runs daily with tiers: it removes tier objects no stub names once they are a
+  day old, and reports stubs whose tier object is gone. Metrics `s3dal_tier_reads_total`,
+  `s3dal_tier_read_bytes_total`, `s3dal_tier_writes_total{origin}`,
+  `s3dal_tier_written_bytes_total{origin}`, `s3dal_tier_errors_total`,
+  `s3dal_tier_transition_skipped_total{reason}`, `s3dal_tier_orphans_removed_total`,
+  `s3dal_tier_objects`, `s3dal_tier_bytes` and `s3dal_tier_dangling`. The console marks
+  objects of another class than `STANDARD` in the browser, shows an object's class in its
+  details with "Change storage class" (the self-copy above), uploads to a tier's class when
+  tiers exist, edits the transitions of lifecycle rules, offers `s3:LifecycleTransition` among
+  the event kinds, lists the tiers on the Server page with what the last sweep counted, and
+  splits each bucket's usage hot and cold; its restart first checks that every tier answers and
+  is still this server's. See [Cold tiers](guide/backends.md#cold-tiers).
+
+### Changed
+
+- **Breaking:** whether a bucket is public is now a setting of the bucket, kept in the backend
+  (`.s3dal/buckets/<bucket>.json`) with its versioning state, so every instance sharing the
+  backend serves it (within 5 seconds), and a bucket deleted and created again starts private.
+  `--public-bucket`, `S3DAL_PUBLIC_BUCKETS` and the config key `public-bucket` are removed: a
+  config file that still has the key, or a command line with the flag, is refused at startup
+  (`unknown key`); the variable is no longer read, so a bucket it named is private until set
+  again. To migrate, remove the setting and make each bucket public again, on the console's
+  Buckets page or with `s3dal public s3://<bucket> on --endpoint <console address>`.
+
 ## [0.3.2] - 2026-11-10
 
 ### Added
