@@ -12,6 +12,11 @@
 .DEFAULT_GOAL := help
 .PHONY: help bump check compat tag push publish
 
+# CI's lint job pins its toolchain because each Rust release adds lints; lint with the same
+# one, read from the workflow, or the local gate passes what CI rejects (0.4.0's first push:
+# local 1.97, CI 1.99). The lint job's pin must stay the file's first `@1.x`.
+LINT_RUST := $(shell sed -n 's|.*dtolnay/rust-toolchain@\(1\.[0-9]*\).*|\1|p' .github/workflows/ci.yml | head -1)
+
 help:
 	@sed -n 's/^#   //p' $(firstword $(MAKEFILE_LIST))
 
@@ -19,8 +24,8 @@ bump:
 	@scripts/release.sh bump "$(VERSION)"
 
 check:
-	cargo fmt --check
-	cargo clippy --locked --all-targets -- -D warnings
+	cargo +$(LINT_RUST) fmt --check
+	cargo +$(LINT_RUST) clippy --locked --all-targets -- -D warnings
 	cargo test --locked
 
 compat:
