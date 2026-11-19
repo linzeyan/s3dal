@@ -604,4 +604,11 @@ pub fn client_config(endpoint: &str, access_key: &str, secret_key: &str) -> conf
             "s3dal-tests",
         ))
         .force_path_style(true)
+        // The SDK's 3.1 s, even retried, is shorter than a firewall that vets each new process
+        // (LuLu does) holds its first connections when several test binaries start at once.
+        .timeout_config(
+            config::timeout::TimeoutConfig::builder()
+                .connect_timeout(std::time::Duration::from_secs(60))
+                .build(),
+        )
 }

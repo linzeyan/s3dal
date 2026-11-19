@@ -129,8 +129,12 @@ fn no_retry_client(server: &TestServer) -> Client {
     )
 }
 
-fn status<E>(err: &SdkError<E, HttpResponse>) -> u16 {
-    err.raw_response().unwrap().status().as_u16()
+fn status<E: std::fmt::Debug>(err: &SdkError<E, HttpResponse>) -> u16 {
+    // A failure before any response (connect, dispatch, timeout) says why only in its Debug.
+    err.raw_response()
+        .unwrap_or_else(|| panic!("no HTTP response: {err:?}"))
+        .status()
+        .as_u16()
 }
 
 fn quoted(etag: &str) -> String {

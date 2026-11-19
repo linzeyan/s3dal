@@ -1145,6 +1145,11 @@ fn hostname() -> String {
 mod tests {
     use super::*;
 
+    /// How long a test waits for what must come: a guard against hanging for good, not a claim
+    /// about speed. A firewall that vets each new process before its first connection (LuLu
+    /// does) holds that connection for seconds when several test binaries start at once.
+    const PATIENCE: Duration = Duration::from_secs(60);
+
     #[test]
     fn collector_urls_are_checked_when_read() {
         // A typo found at startup is fixed in a minute; one found when the logs are needed is
@@ -1434,32 +1439,40 @@ mod tests {
     #[cfg(feature = "log-forward")]
     fn take_request(listener: &std::net::TcpListener, answer: &str) -> (Vec<String>, String) {
         use std::io::{BufRead, BufReader, Read};
-        let (conn, _) = listener.accept().unwrap();
-        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut reader = BufReader::new(conn.try_clone().unwrap());
-        let mut head = Vec::new();
-        loop {
-            let mut l = String::new();
-            reader.read_line(&mut l).unwrap();
-            if l == "\r\n" {
-                break;
+        // A request held past the forwarder's `TIMEOUT` is sent again on a new connection; the
+        // one it gave up on ends without a whole request, or without taking the answer.
+        'conn: loop {
+            let (conn, _) = listener.accept().unwrap();
+            conn.set_read_timeout(Some(PATIENCE)).unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut head = Vec::new();
+            loop {
+                let mut l = String::new();
+                if reader.read_line(&mut l).unwrap() == 0 {
+                    continue 'conn;
+                }
+                if l == "\r\n" {
+                    break;
+                }
+                head.push(l.trim_end().to_ascii_lowercase());
             }
-            head.push(l.trim_end().to_ascii_lowercase());
+            let len: usize = head
+                .iter()
+                .find_map(|h| h.strip_prefix("content-length: "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut body = vec![0; len];
+            reader.read_exact(&mut body).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{answer}",
+                answer.len()
+            );
+            if (&conn).write_all(response.as_bytes()).is_err() {
+                continue 'conn;
+            }
+            return (head, String::from_utf8(body).unwrap());
         }
-        let len: usize = head
-            .iter()
-            .find_map(|h| h.strip_prefix("content-length: "))
-            .unwrap()
-            .parse()
-            .unwrap();
-        let mut body = vec![0; len];
-        reader.read_exact(&mut body).unwrap();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{answer}",
-            answer.len()
-        );
-        (&conn).write_all(response.as_bytes()).unwrap();
-        (head, String::from_utf8(body).unwrap())
     }
 
     #[cfg(feature = "log-forward")]
@@ -1525,7 +1538,7 @@ mod tests {
             let line = format!(r#"{{"message":"line {n}"}}"#);
             forwarder.make_writer().write_all(line.as_bytes()).unwrap();
         }
-        assert!(flush.wait(Duration::from_secs(10)));
+        assert!(flush.wait(PATIENCE));
         // Closing the connection, as exiting does, ends the reader with everything sent.
         drop(forwarder);
         assert_eq!(reader.join().unwrap(), 2_000);
@@ -1553,7 +1566,7 @@ mod tests {
             forwarder.make_writer().write_all(line.as_bytes()).unwrap();
         }
         let (mut conn, _) = listener.accept().unwrap();
-        assert!(flush.wait(Duration::from_secs(10)));
+        assert!(flush.wait(PATIENCE));
         drop(forwarder);
         let mut all = String::new();
         conn.read_to_string(&mut all).unwrap();
@@ -1602,7 +1615,7 @@ mod tests {
             .write_all(br#"{"level":"INFO","message":"hello"}"#)
             .unwrap();
         let (mut conn, _) = listener.accept().unwrap();
-        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        conn.set_read_timeout(Some(PATIENCE)).unwrap();
         let mut got = Vec::new();
         let mut byte = [0];
         while conn.read(&mut byte).unwrap() == 1 && byte[0] != 0 {
