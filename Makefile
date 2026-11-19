@@ -24,6 +24,7 @@ bump:
 	@scripts/release.sh bump "$(VERSION)"
 
 check:
+	@test -n "$(LINT_RUST)" || { echo "no dtolnay/rust-toolchain@1.x pin in .github/workflows/ci.yml" >&2; exit 2; }
 	cargo +$(LINT_RUST) fmt --check
 	cargo +$(LINT_RUST) clippy --locked --all-targets -- -D warnings
 	cargo test --locked
